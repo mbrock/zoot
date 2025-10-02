@@ -43,6 +43,31 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zoot", .module = mod },
+        },
+    });
+
+    const bench = b.addExecutable(.{
+        .name = "zoot-bench",
+        .root_module = bench_mod,
+    });
+
+    b.installArtifact(bench);
+
+    const bench_step = b.step("bench", "Run the benchmark");
+    const bench_cmd = b.addRunArtifact(bench);
+    bench_step.dependOn(&bench_cmd.step);
+    bench_cmd.step.dependOn(b.getInstallStep());
+
+    if (b.args) |args| {
+        bench_cmd.addArgs(args);
+    }
+
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
