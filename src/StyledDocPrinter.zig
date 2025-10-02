@@ -1,5 +1,95 @@
-// Jean-Philippe Bernardy published the basis for this whole concept
-// and algorithm in a 2017 "Functional Pearl" called *A Pretty But Not Greedy Printer*.
+// Jean-Philippe Bernardy published the basis for this concept and
+// algorithm in a 2017 paper called "A Pretty But Not Greedy Printer."
+//
+// He constructs a pretty printing system in the "algebraic"
+// tradition.  This tradition goes back to an influential 1995 pretty
+// printing paper by John Hughes.  Dozens of pretty printing libraries
+// to this day are based on Philip Wadler's 2002 paper that improved
+// Hughes's algebra by making it even more algebraic.
+//
+// These papers tend to use associative binary combinators defined on
+// an abstract "document" family of types, defining A <> B as, for
+// example, the document formed by horizontal concatenation of
+// documents A and B, in turn composed of smaller subdocuments
+// combined in various ways.  Like compositional DSLs designed to
+// capture the formal essence of how to specify the formatting of
+// source code.
+//
+// The algebraic tradition thinks carefully about meanings and
+// interpretations of such algebraic languages, tries to formulate
+// laws that help reason about those meanings and help guide
+// implementation.  You get to see a variety of "implementations" of
+// the same algebra, different ways of assigning meaning to the
+// syntactic forms, often a sequence of increasingly concrete or
+// efficient interpretations.
+//
+// The document algebra is abstract, an open family of `Doc` types for
+// which you can define the <> operator, etc.  In Haskell the algebra
+// is a type class with laws, often extending some truly abstract
+// algebraic pattern, especially the good old monoid.  If the algebra
+// is sufficiently meaningful and well-specified, you can more or less
+// instantiate `Doc` as some concrete type, like "list of strings",
+// and just fiddle with your operator definitions until they satisfy
+// the laws, and derive a concrete implementation that's "correct by
+// construction."  This is the pattern of Hughes, Wadler, and so on.
+//
+// Bernardy does it just like this, too, but with one principal
+// difference: instead of correctness laws that guide an efficient &
+// unambiguous implementation, where the concrete meaning of the
+// combinators is locally well-defined, his algebra is flexible, so
+// that A <> B can denote either a vertical or a horizontal layout,
+// and the interpretation he wants to concretize efficiently is one
+// where the final layout is not just correct but optimal in a global
+// sense, or at least "not suboptimal."
+//
+// It's very similar to like how Knuth's TeX paragraph justification
+// algorithm does a branching search in layout space to find a
+// solution that adequately minimizes some measure of badness.
+// Bernardy wants his pretty printing semantics to crown a dominant
+// layout from a combinatorial set of layouts.  The measure of quality
+// is quite clear: forbid exceeding a column limit (80 chars, say),
+// and minimize line count.  If two candidates have the same line
+// count, the narrower one wins.  Additional constraints are embedded
+// in the combinators, like a choice operator that groups any number
+// of documents such that they're either all in a row, or all stacked
+// vertically.
+//
+// Sitting down and trying to implement that with a bunch of strings
+// and arrays would be messy, inefficient, and confusing.  The
+// algebraic approach leads Bernardy to an elegant construction based
+// on interpreting documents not as concrete strings but as numeric
+// measures.  Ignoring the contents, he maps each document to a
+// triplet of integers: number of lines, widest line, and width of
+// last line.  That's enough to characterize the document insofar as
+// his layout algebra is concerned.  Formally the measurement
+// interpretation is a homomorphism; all the algebra's operations are
+// well-defined on integer triples in a "structure-preserving" way,
+// such that, if m maps documents to measurements, then
+//
+//   m(A <> B) = m(A) <> m(B)
+//
+// for all documents A and B, and so on for all the layout
+// combinators.
+//
+// Bernardy defines the document-as-measurement interpretation and
+// proves that it's a structure-preserving homomorphism.  This is
+// enough to straightforwardly do a combinatorial search for optimal
+// layouts without doing any string manipulation, just simple integer
+// arithmetic.  But the search tree grows, well, combinatorially, so
+// Bernardy turns to showing, basically, that if you prune choice sets
+// eagerly by Pareto dominance, you never sacrifice the optimal
+// layout, and the state space stays tightly bounded and roughly
+// proportional to the wiggle room allowed by the max column width.
+//
+// What follows here is a stupid but working implementation of the
+// layout search algorithm in Zig that follows Bernardy's "product
+// algebra" approach, using the measurement triples to do the actual
+// Pareto frontier comparisons while simultaneously also recording the
+// corresponding concrete document layout choices, except that instead
+// of building lightweight "layout trees" and only later buffering up
+// the actual byte contents of the winning layout, this code just does
+// all kinds of allocating string concatenation all over the place,
+// for some reason that I don't remember anymore.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
