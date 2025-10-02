@@ -12,9 +12,9 @@ pub const Box = struct {
     /// Text lines (length = lines + 1, last line is "final")
     txt: std.ArrayList(std.ArrayList(u8)),
     /// Number of complete lines (not counting final)
-    lines: u16,
+    len: u16,
     /// Length of final incomplete line
-    final: u16,
+    fin: u16,
     /// Maximum line length across all lines
     max: u16,
 
@@ -27,8 +27,8 @@ pub const Box = struct {
 
         return .{
             .txt = txt,
-            .lines = 0,
-            .final = @intCast(bytes.len),
+            .len = 0,
+            .fin = @intCast(bytes.len),
             .max = @intCast(bytes.len),
         };
     }
@@ -42,8 +42,8 @@ pub const Box = struct {
     pub fn indent(self: Box, n: u16, alloc: Allocator) !Box {
         var result = Box{
             .txt = std.ArrayList(std.ArrayList(u8)){},
-            .lines = self.lines,
-            .final = self.final + n,
+            .len = self.len,
+            .fin = self.fin + n,
             .max = self.max + n,
         };
 
@@ -61,9 +61,9 @@ pub const Box = struct {
     pub fn flush(self: Box, alloc: Allocator) !Box {
         var result = Box{
             .txt = std.ArrayList(std.ArrayList(u8)){},
-            .lines = self.lines + 1,
+            .len = self.len + 1,
             .max = self.max,
-            .final = 0,
+            .fin = 0,
         };
 
         try result.txt.appendSlice(alloc, self.txt.items);
@@ -76,20 +76,20 @@ pub const Box = struct {
     pub fn hcat(a: Box, b: Box, alloc: Allocator) !Box {
         var result = Box{
             .txt = std.ArrayList(std.ArrayList(u8)){},
-            .lines = a.lines + b.lines,
-            .final = a.final + b.final,
-            .max = @max(a.max, b.max + a.final),
+            .len = a.len + b.len,
+            .fin = a.fin + b.fin,
+            .max = @max(a.max, b.max + a.fin),
         };
 
         // Copy a's complete lines
-        for (a.txt.items[0..a.lines]) |line| {
+        for (a.txt.items[0..a.len]) |line| {
             var new_line = std.ArrayList(u8){};
             try new_line.appendSlice(alloc, line.items);
             try result.txt.append(alloc, new_line);
         }
 
         // Merge a's final with b's first
-        const last_a = a.txt.items[a.lines];
+        const last_a = a.txt.items[a.len];
         const first_b = b.txt.items[0];
 
         var merged = std.ArrayList(u8){};
@@ -98,9 +98,9 @@ pub const Box = struct {
         try result.txt.append(alloc, merged);
 
         // Copy b's remaining lines, indented by a's final width
-        for (b.txt.items[1 .. b.lines + 1]) |line| {
+        for (b.txt.items[1 .. b.len + 1]) |line| {
             var new_line = std.ArrayList(u8){};
-            try new_line.appendNTimes(alloc, ' ', a.final);
+            try new_line.appendNTimes(alloc, ' ', a.fin);
             try new_line.appendSlice(alloc, line.items);
             try result.txt.append(alloc, new_line);
         }
@@ -116,7 +116,7 @@ pub const Box = struct {
 
     /// Check if this box dominates another (better or equal on all metrics)
     pub fn beats(a: Box, b: Box) bool {
-        return a.lines <= b.lines and a.max <= b.max and a.final <= b.final;
+        return a.len <= b.len and a.max <= b.max and a.fin <= b.fin;
     }
 
     /// Render to string
@@ -245,7 +245,7 @@ pub fn join(max_width: u16, docs: []const Doc, alloc: Allocator) !Doc {
 
 /// Select best layout (fewest lines)
 fn selectBest(_: void, a: Box, b: Box) bool {
-    return a.lines < b.lines;
+    return a.len < b.len;
 }
 
 /// Render document to string (picks best layout)
@@ -293,15 +293,15 @@ test "pareto" {
     const alloc = std.testing.allocator;
 
     var boxes = [_]Box{
-        .{ .txt = undefined, .lines = 0, .final = 0, .max = 0 },
-        .{ .txt = undefined, .lines = 1, .final = 0, .max = 0 },
+        .{ .txt = undefined, .len = 0, .fin = 0, .max = 0 },
+        .{ .txt = undefined, .len = 1, .fin = 0, .max = 0 },
     };
 
     const result = try pareto(&boxes, alloc);
     defer alloc.free(result);
 
     try std.testing.expectEqual(@as(usize, 1), result.len);
-    try std.testing.expectEqual(@as(u16, 0), result[0].lines);
+    try std.testing.expectEqual(@as(u16, 0), result[0].len);
 }
 
 test "simple doc" {
