@@ -1,8 +1,8 @@
-levels: Bits = @splat(false),
+levels: Bits = @splat(0),
 len: std.math.IntFittingRange(0, N) = 0,
 
 const N = 32;
-const Bits = @Vector(N, bool);
+const Bits = @Vector(N, u8);
 
 const std = @import("std");
 const Writer = std.Io.Writer;
@@ -18,10 +18,11 @@ const bb: @Vector(N, u32) = @splat(bu);
 
 pub fn writeUtf8Prefix(
     w: *Writer,
-    bits: @Vector(N, bool),
+    bits: @Vector(N, u8),
     len: std.math.IntFittingRange(0, N),
 ) !void {
-    const sv = @select(u32, bits, bb, aa);
+    const mask: @Vector(N, bool) = bits != @as(@Vector(N, u8), @splat(0));
+    const sv = @select(u32, mask, bb, aa);
     const bytes: [4 * N]u8 = @bitCast(sv);
     try w.writeAll(bytes[0 .. len * 4]);
 }
@@ -35,7 +36,7 @@ pub fn show(self: @This(), writer: *Writer, more: bool) !void {
 
 pub fn push(self: *@This(), more: bool) !void {
     if (self.len + 1 >= N) return error.OutOfMemory; // lol
-    self.levels[self.len] = more;
+    self.levels[self.len] = @intFromBool(more);
     self.len += 1;
 }
 
@@ -46,9 +47,9 @@ pub fn pop(self: *@This()) void {
 test "hehe" {
     var buffer: [1024]u8 = undefined;
     var w = std.Io.Writer.fixed(&buffer);
-    var bits: Bits = @splat(false);
-    bits[0] = true;
-    bits[3] = true;
+    var bits: Bits = @splat(0);
+    bits[0] = 1;
+    bits[3] = 1;
 
     try writeUtf8Prefix(&w, bits, 4);
     try std.testing.expectEqualStrings("│     │ ", w.buffered());
