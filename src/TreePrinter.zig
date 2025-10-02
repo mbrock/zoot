@@ -24,7 +24,8 @@ pub fn writeUtf8Prefix(
     const mask: @Vector(N, bool) = bits != @as(@Vector(N, u8), @splat(0));
     const sv = @select(u32, mask, bb, aa);
     const bytes: [4 * N]u8 = @bitCast(sv);
-    try w.writeAll(bytes[0 .. len * 4]);
+    const byte_len: usize = @as(usize, len) * 4;
+    try w.writeAll(bytes[0..byte_len]);
 }
 
 pub fn show(self: @This(), writer: *Writer, more: bool) !void {
@@ -68,22 +69,3 @@ test "hehe 2" {
 
     try std.testing.expectEqualStrings("│     │ ├─", w.buffered());
 }
-
-// pub fn print(self: @This(), writer: *Writer, last: bool) !void {
-//     var level: usize = 0;
-//     while (level + 1 < self.len) : (level += 1) {
-//         const bit = self.levels.isSet(level);
-//         try writer.writeAll(if (bit) "│ " else "  ");
-//     }
-//     if (depth > 0) {
-//         try writer.writeAll(if (last) "└─" else "├─");
-//     }
-// }
-//
-// pub fn push(self: *TreePrinter, has_more: bool) !void {
-//     try self.prefix.push(@intFromBool(has_more));
-// }
-//
-// pub fn pop(self: *TreePrinter) void {
-//     _ = self.prefix.pop();
-// }
