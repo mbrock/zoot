@@ -1,5 +1,5 @@
-// Optimal pretty printing with styling support
-// Based on Bernardy 2017 but with styled text segments
+// Jean-Philippe Bernardy published the basis for this whole concept
+// and algorithm in a 2017 "Functional Pearl" called *A Pretty But Not Greedy Printer*.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -15,11 +15,11 @@ pub fn StyledDocPrinter(comptime Style: type) type {
         /// A layout candidate with metrics and styled content
         pub const Box = struct {
             /// Text lines, each line is a list of styled segments
-            txt: std.ArrayList(std.ArrayList(Segment)),
+            txt: std.ArrayList(std.ArrayList(Segment)) = .empty,
             /// Number of complete lines (not counting final)
-            lines: u16,
+            len: u16 = 0,
             /// Length of final incomplete line
-            final: u16,
+            fin: u16,
             /// Maximum line length across all lines
             max: u16,
 
@@ -32,8 +32,7 @@ pub fn StyledDocPrinter(comptime Style: type) type {
 
                 return .{
                     .txt = txt,
-                    .lines = 0,
-                    .final = @intCast(bytes.len),
+                    .fin = @intCast(bytes.len),
                     .max = @intCast(bytes.len),
                 };
             }
@@ -46,8 +45,8 @@ pub fn StyledDocPrinter(comptime Style: type) type {
             pub fn indent(self: Box, n: u16, alloc: Allocator) !Box {
                 var result = Box{
                     .txt = std.ArrayList(std.ArrayList(Segment)){},
-                    .lines = self.lines,
-                    .final = self.final + n,
+                    .len = self.len,
+                    .fin = self.fin + n,
                     .max = self.max + n,
                 };
 
@@ -69,10 +68,9 @@ pub fn StyledDocPrinter(comptime Style: type) type {
 
             pub fn flush(self: Box, alloc: Allocator) !Box {
                 var result = Box{
-                    .txt = std.ArrayList(std.ArrayList(Segment)){},
-                    .lines = self.lines + 1,
+                    .len = self.len + 1,
                     .max = self.max,
-                    .final = 0,
+                    .fin = 0,
                 };
 
                 try result.txt.appendSlice(alloc, self.txt.items);
@@ -83,21 +81,20 @@ pub fn StyledDocPrinter(comptime Style: type) type {
 
             pub fn hcat(a: Box, b: Box, alloc: Allocator) !Box {
                 var result = Box{
-                    .txt = std.ArrayList(std.ArrayList(Segment)){},
-                    .lines = a.lines + b.lines,
-                    .final = a.final + b.final,
-                    .max = @max(a.max, b.max + a.final),
+                    .len = a.len + b.len,
+                    .fin = a.fin + b.fin,
+                    .max = @max(a.max, b.max + a.fin),
                 };
 
                 // Copy a's complete lines
-                for (a.txt.items[0..a.lines]) |line| {
+                for (a.txt.items[0..a.len]) |line| {
                     var new_line = std.ArrayList(Segment){};
                     try new_line.appendSlice(alloc, line.items);
                     try result.txt.append(alloc, new_line);
                 }
 
                 // Merge a's final with b's first
-                const last_a = a.txt.items[a.lines];
+                const last_a = a.txt.items[a.len];
                 const first_b = b.txt.items[0];
 
                 var merged = std.ArrayList(Segment){};
@@ -106,11 +103,11 @@ pub fn StyledDocPrinter(comptime Style: type) type {
                 try result.txt.append(alloc, merged);
 
                 // Copy b's remaining lines, indented by a's final width
-                for (b.txt.items[1 .. b.lines + 1]) |line| {
+                for (b.txt.items[1 .. b.len + 1]) |line| {
                     var new_line = std.ArrayList(Segment){};
                     // Add indent
-                    if (a.final > 0) {
-                        const spaces = try alloc.alloc(u8, a.final);
+                    if (a.fin > 0) {
+                        const spaces = try alloc.alloc(u8, a.fin);
                         @memset(spaces, ' ');
                         try new_line.append(alloc, Segment{ .text = spaces, .style = .normal });
                     }
@@ -127,7 +124,7 @@ pub fn StyledDocPrinter(comptime Style: type) type {
             }
 
             pub fn beats(a: Box, b: Box) bool {
-                return a.lines <= b.lines and a.max <= b.max and a.final <= b.final;
+                return a.len <= b.len and a.max <= b.max and a.fin <= b.fin;
             }
 
             /// Render to segments (for styled output)
@@ -241,7 +238,7 @@ pub fn StyledDocPrinter(comptime Style: type) type {
             if (b_fits and !a_fits) return false;
 
             if (a_fits and b_fits) {
-                return a.lines < b.lines;
+                return a.len < b.len;
             } else {
                 return a.max < b.max;
             }
