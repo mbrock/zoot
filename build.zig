@@ -43,6 +43,27 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
+    const demo_styled_mod = b.createModule(.{
+        .root_source_file = b.path("src/demo-styled.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zoot", .module = mod },
+        },
+    });
+
+    const demo_styled = b.addExecutable(.{
+        .name = "zoot-demo-styled",
+        .root_module = demo_styled_mod,
+    });
+
+    b.installArtifact(demo_styled);
+
+    const run_styled_step = b.step("run-styled", "Run the styled demo");
+    const run_styled_cmd = b.addRunArtifact(demo_styled);
+    run_styled_step.dependOn(&run_styled_cmd.step);
+    run_styled_cmd.step.dependOn(b.getInstallStep());
+
     const bench_mod = b.createModule(.{
         .root_source_file = b.path("src/bench.zig"),
         .target = target,
