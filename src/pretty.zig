@@ -521,6 +521,36 @@ pub const Tree = struct {
         }
     }
 
+    /// This is the *align* combinator.
+    ///
+    /// If the head is at column 3, `warp(D)` looks like:
+    ///
+    ///        v
+    ///        DDDDDD
+    ///     ...DDDDDD
+    ///     ...DDD
+    pub fn warp(tree: *Tree, doc: Node) !Node {
+        switch (doc.kind) {
+            .oper => {
+                var new = doc;
+                new.data.oper.frob.warp = 1;
+                return new;
+            },
+            .text => if (doc.isEmptyText())
+                return doc
+            else {
+                const oper = try tree.plus(doc, try tree.text(""));
+
+                // We need an `oper` to carry the `frob`.
+                // If `plus` learns to fuse tiny texts,
+                // we'll need to fix this path.
+                std.debug.assert(oper.kind == .oper);
+
+                return try tree.warp(oper);
+            },
+        }
+    }
+
     pub fn plus(tree: *Tree, lhs: Node, rhs: Node) !Node {
         const nl_repr = Node.nl.repr();
 
@@ -867,4 +897,23 @@ test "flatten('a' <> nl <> 'b')" {
             ),
         ),
     );
+}
+
+test "warp aligns after NL; nest adds indent" {
+    var t = Tree.init(std.testing.allocator);
+    defer t.deinit();
+
+    // doc = "AAA" <> NL <> "B"
+    const doc0 =
+        try t.plus(
+            try t.plus(try t.text("AAA"), Node.nl),
+            try t.text("B"),
+        );
+
+    // apply warp first (align base to current column = 3), then add nest(+2)
+    const doc1 = try t.warp(doc0);
+    const doc2 = try t.nest(2, doc1);
+
+    // result: "AAA\n" + 3 (warp) + 2 (nest) spaces + "B"
+    try expectEmitString(&t, "AAA\n     B", doc2);
 }
