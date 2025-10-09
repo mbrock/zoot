@@ -63,14 +63,21 @@ pub const Text = packed struct {
             /// index into the string pool
             text: u21,
 
+            fn emitSidekick(char: u7, sink: *Sink) !void {
+                if (char == '\n')
+                    try sink.newline()
+                else
+                    try sink.out.writeByte(char);
+            }
+
             pub fn emit(this: @This(), sink: *Sink) !void {
                 if (this.char != 0 and this.side == .l)
-                    try sink.out.writeByte(this.char);
+                    try emitSidekick(this.char, sink);
 
                 try sink.writeString(this.text);
 
                 if (this.char != 0 and this.side == .r)
-                    try sink.out.writeByte(this.char);
+                    try emitSidekick(this.char, sink);
             }
         },
 
@@ -192,6 +199,15 @@ pub const Oper = packed struct {
                 defer sink.flat = saveflat;
                 sink.flat |= this.frob.flat == 1;
 
+                const save_base = sink.base;
+                defer sink.base = save_base;
+                if (this.frob.nest != 0) {
+                    const addend: u16 = @intCast(this.frob.nest);
+                    const widened = @as(u32, save_base) + @as(u32, addend);
+                    const limit = @as(u32, std.math.maxInt(u16));
+                    sink.base = @intCast(@min(widened, limit));
+                }
+
                 const args = sink.tree.heap.plus.items[this.what];
                 try args.a.emit(sink);
                 try args.b.emit(sink);
@@ -285,10 +301,34 @@ pub const Tree = struct {
     }
 
     pub fn flat(tree: *Tree, lhs: Node) !Node {
+        _ = tree;
         switch (lhs.kind) {
             .text => {
-                _ = tree;
-                return error.Unimplemented;
+                var new = lhs;
+                switch (new.data.text.kind) {
+                    .pool => {
+                        var pooled = &new.data.text.data.pool;
+                        if (pooled.char == '\n')
+                            pooled.char = @as(u7, ' ');
+                    },
+                    .tiny => {
+                        var tiny = &new.data.text.data.tiny;
+                        switch (tiny.kind) {
+                            .splat => {
+                                var splat = &tiny.data.splat;
+                                switch (splat.kind) {
+                                    .utf8 => {},
+                                    .rune => {
+                                        if (splat.data.rune.code == '\n')
+                                            splat.data.rune.code = ' ';
+                                    },
+                                }
+                            },
+                            .ascii => {},
+                        }
+                    },
+                }
+                return new;
             },
             .oper => {
                 var new = lhs;
@@ -298,7 +338,51 @@ pub const Tree = struct {
         }
     }
 
+    pub fn nest(tree: *Tree, indent: u6, doc: Node) !Node {
+        _ = tree;
+        if (indent == 0)
+            return doc;
+
+        switch (doc.kind) {
+            .text => return doc,
+            .oper => {
+                var new = doc;
+                const limit: u16 = std.math.maxInt(u6);
+                const sum = @as(u16, new.data.oper.frob.nest) + @as(u16, indent);
+                const clamped: u6 = @intCast(if (sum > limit) limit else sum);
+                new.data.oper.frob.nest = clamped;
+                return new;
+            },
+        }
+    }
+
     pub fn plus(tree: *Tree, lhs: Node, rhs: Node) !Node {
+        const nl_repr = Node.nl.repr();
+
+        if (rhs.repr() == nl_repr and lhs.kind == .text) {
+            var fused = lhs;
+            if (fused.data.text.kind == .pool) {
+                var pool = &fused.data.text.data.pool;
+                if (pool.char == 0) {
+                    pool.side = .r;
+                    pool.char = '\n';
+                    return fused;
+                }
+            }
+        }
+
+        if (lhs.repr() == nl_repr and rhs.kind == .text) {
+            var fused = rhs;
+            if (fused.data.text.kind == .pool) {
+                var pool = &fused.data.text.data.pool;
+                if (pool.char == 0) {
+                    pool.side = .l;
+                    pool.char = '\n';
+                    return fused;
+                }
+            }
+        }
+
         // TODO: the dense node representation allows shortcuts.
         //
         // When A and B are tiny texts, A + B is often also a tiny text.
@@ -481,6 +565,66 @@ test "'a' <> nl <> 'b'" {
             try t.text("B"),
         ),
     );
+}
+
+test "fuse text <> nl" {
+    var t = Tree.init(std.testing.allocator);
+    defer t.deinit();
+
+    const text_node = try t.text("Hello, world!");
+    const fused = try t.plus(text_node, .nl);
+
+    try expect(fused.kind == .text);
+    const pool = fused.data.text.data.pool;
+    try expectEqual(pool.side, .r);
+    try expectEqual(pool.char, '\n');
+    try expectEqual(0, t.heap.plus.items.len);
+    try expectEmitString(&t, "Hello, world!\n", fused);
+}
+
+test "fuse nl <> text" {
+    var t = Tree.init(std.testing.allocator);
+    defer t.deinit();
+
+    const text_node = try t.text("Hello, world!");
+    const fused = try t.plus(.nl, text_node);
+
+    try expect(fused.kind == .text);
+    const pool = fused.data.text.data.pool;
+    try expectEqual(pool.side, .l);
+    try expectEqual(pool.char, '\n');
+    try expectEqual(0, t.heap.plus.items.len);
+    try expectEmitString(&t, "\nHello, world!", fused);
+}
+
+test "flatten fused text <> nl" {
+    var t = Tree.init(std.testing.allocator);
+    defer t.deinit();
+
+    const fused = try t.plus(try t.text("A"), .nl);
+    try expectEmitString(&t, "A ", try t.flat(fused));
+}
+
+test "nest braces emit" {
+    var t = Tree.init(std.testing.allocator);
+    defer t.deinit();
+
+    const doc = try t.plus(
+        try t.plus(
+            try t.text("foo {"),
+            try t.nest(
+                4,
+                try t.plus(.nl, try t.text("bar")),
+            ),
+        ),
+        try t.plus(.nl, try t.text("}")),
+    );
+
+    try expectEmitString(&t,
+        \\foo {
+        \\    bar
+        \\}
+    , doc);
 }
 
 test "flatten('a' <> nl <> 'b')" {
