@@ -29,7 +29,7 @@ pub fn toJson(t1: *Tree, buffer: []u8, node: Node) ![]const u8 {
 
 fn jsonNode(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
     const id = node.repr();
-    const form = node.classify();
+    const form = node.look();
 
     const kind_str = switch (form) {
         .cons => "plus",
@@ -112,7 +112,7 @@ pub fn graphviz(t1: *Tree, buffer: []u8, node: Node) ![]const u8 {
 
 fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
     const id = node.repr();
-    const form = node.classify();
+    const form = node.look();
 
     const label = switch (form) {
         .span, .quad, .trip, .rune => try formatTextNode(t2, t1, node),
@@ -198,9 +198,9 @@ fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
 }
 
 fn formatTextNode(doc_tree: *Tree, data_tree: *Tree, node: Node) !Node {
-    return switch (node.classify()) {
+    return switch (node.look()) {
         .span => blk: {
-            const span_node = node.asTextPool();
+            const span_node = node.asSpan();
             const tail = data_tree.byte.items[span_node.text..];
             const slice = std.mem.sliceTo(tail, 0);
 
@@ -217,7 +217,7 @@ fn formatTextNode(doc_tree: *Tree, data_tree: *Tree, node: Node) !Node {
             });
         },
         .quad => blk: {
-            const quad = node.asTinyAscii();
+            const quad = node.asQuad();
             var bytes = [_]u8{
                 @as(u8, quad.ch0),
                 @as(u8, quad.ch1),
@@ -229,7 +229,7 @@ fn formatTextNode(doc_tree: *Tree, data_tree: *Tree, node: Node) !Node {
         },
         .trip => try doc_tree.text("(utf8)"),
         .rune => blk: {
-            const rune = node.asTinyRune();
+            const rune = node.asRune();
             if (rune.reps == 0) {
                 break :blk try doc_tree.text("(empty)");
             } else {

@@ -54,14 +54,14 @@ pub const Show = struct {
 pub fn Gist(Cost: type) type {
     return struct {
         head: u16 = 0,
-        cost: Cost.Rank,
-        conf: Cost,
+        rank: Cost.Rank,
+        cost: Cost,
         sink: std.Io.Writer,
 
-        pub fn init(buffer: []u8, conf: Cost) @This() {
+        pub fn init(buffer: []u8, cost: Cost) @This() {
             return .{
-                .conf = conf,
-                .cost = conf.text(0, 0),
+                .cost = cost,
+                .rank = cost.text(0, 0),
                 .sink = .{
                     .buffer = buffer,
                     .vtable = &.{
@@ -72,22 +72,30 @@ pub fn Gist(Cost: type) type {
             };
         }
 
-        pub fn rank(conf: Cost, tree: *Tree, node: Node) !Cost.Rank {
+        pub fn eval(cost: Cost, tree: *Tree, node: Node) !Cost.Rank {
             var note: [256]u8 = undefined;
-            var this = init(&note, conf);
+            var this = init(&note, cost);
             var work = Show{ .tree = tree, .sink = &this.sink };
             try node.emit(&work);
             try this.sink.flush();
-            return this.cost;
+            return this.rank;
         }
 
         pub fn scan(this: *@This(), data: []const u8) !void {
             for (data) |c| {
+                // Since the cost plus must be homomorphic or whatever,
+                // the only terminal costs we need are
+                //
+                //   (1) cost of `nl` and
+                //   (2) cost of `text(c, 1)`
+                //
+                // and we can always calculate it character by character,
+                // dispatching only on `nl` vs anything else.
                 if (c == '\n') {
-                    this.cost = this.conf.plus(this.cost, this.conf.line());
+                    this.rank = this.cost.plus(this.rank, this.cost.line());
                     this.head = 0;
                 } else {
-                    this.cost = this.conf.plus(this.cost, this.conf.text(this.head, 1));
+                    this.rank = this.cost.plus(this.rank, this.cost.text(this.head, 1));
                     this.head += 1;
                 }
             }
@@ -235,18 +243,20 @@ const F2 = struct {
 /// whether as the "ASCII sidekick" or a standalone rune.
 ///
 /// TODO: Allow ␤ as the first or last `u7` in an ASCII quad.
-pub const NodeKind = enum(u1) { text, oper };
-pub const TextKind = enum(u1) { pool, tiny };
-pub const TinyKind = enum(u1) { reps, quad };
-pub const RepsKind = enum(u1) { utf8, rune };
-pub const PoolSide = enum(u1) { lchr, rchr };
-pub const OperKind = enum(u1) { plus, fork };
+pub const Tag = enum(u3) {
+    span = 0b000,
+    quad = 0b001,
+    trip = 0b010,
+    rune = 0b011,
+    cons = 0b100,
+    fork = 0b101,
+};
+
+pub const Side = enum(u1) { lchr, rchr };
 
 pub const Span = packed struct {
-    kind: NodeKind = .text,
-    spam: u1 = 0,
-    text_kind: TextKind = .pool,
-    side: PoolSide = .lchr,
+    tag: Tag = .span,
+    side: Side = .lchr,
     char: u7 = 0,
     text: u21 = 0,
 
@@ -271,10 +281,8 @@ pub const Span = packed struct {
 };
 
 pub const Quad = packed struct {
-    kind: NodeKind = .text,
-    spam: u1 = 0,
-    text_kind: TextKind = .tiny,
-    tiny_kind: TinyKind = .quad,
+    tag: Tag = .quad,
+    pad: u1 = 0,
     ch0: u7 = 0,
     ch1: u7 = 0,
     ch2: u7 = 0,
@@ -291,11 +299,8 @@ pub const Quad = packed struct {
 };
 
 pub const Trip = packed struct {
-    kind: NodeKind = .text,
-    spam: u1 = 0,
-    text_kind: TextKind = .tiny,
-    tiny_kind: TinyKind = .reps,
-    splat_kind: RepsKind = .utf8,
+    tag: Tag = .trip,
+    pad: u2 = 0,
     reps: u3 = 0,
     byte0: u8 = 0,
     byte1: u8 = 0,
@@ -309,11 +314,8 @@ pub const Trip = packed struct {
 };
 
 pub const Rune = packed struct {
-    kind: NodeKind = .text,
-    spam: u1 = 0,
-    text_kind: TextKind = .tiny,
-    tiny_kind: TinyKind = .reps,
-    splat_kind: RepsKind = .rune,
+    tag: Tag = .rune,
+    pad: u2 = 0,
     reps: u6 = 0,
     code: u21 = 0,
 
@@ -348,15 +350,13 @@ pub const Frob = packed struct {
 };
 
 pub const Oper = packed struct {
-    kind: NodeKind = .oper,
-    spam: u1 = 0,
-    oper: OperKind,
+    tag: Tag = .cons,
     frob: Frob = .{},
-    item: u21,
+    item: u21 = 0,
 
     pub fn emit(this: Oper, show: *Show) !void {
-        switch (this.oper) {
-            .plus => {
+        switch (this.tag) {
+            .cons => {
                 const saveflat = show.flat;
                 defer show.flat = saveflat;
                 show.flat |= this.frob.flat == 1;
@@ -379,6 +379,7 @@ pub const Oper = packed struct {
                 try args.b.emit(show);
             },
             .fork => return error.Unimplemented,
+            else => return error.Unimplemented,
         }
     }
 };
@@ -386,40 +387,10 @@ pub const Oper = packed struct {
 /// 32-bit handle to either terminal or operation; implicitly indexes
 /// into some `Tree` aggregate.
 pub const Node = packed struct {
-    kind: NodeKind,
-    spam: u1 = 0,
-    bits: u30 = 0,
+    tag: Tag,
+    payload: u29 = 0,
 
-    pub const Form = enum {
-        /// slab skip, 1x C string offset + 1x ASCII prefix/postfix
-        span,
-        /// text word, 4x ASCII characters
-        quad,
-        /// text word, 3x UTF-8 bytes * u3 repeat
-        trip,
-        /// text word, 1x U21 codepoint * u6 repeat
-        rune,
-        /// heap cell, 2x nodes, append semantics
-        cons,
-        /// heap cell, 2x nodes, choice semantics
-        fork,
-    };
-
-    const TextDiscriminants = packed struct {
-        kind: NodeKind,
-        spam: u1,
-        text: TextKind,
-        tiny: TinyKind,
-        reps: RepsKind,
-        rest: u27 = 0,
-    };
-
-    const OperDiscriminants = packed struct {
-        kind: NodeKind,
-        spam: u1,
-        oper: OperKind,
-        rest: u29 = 0,
-    };
+    pub const Form = Tag;
 
     fn viewConst(comptime T: type, this: Node) T {
         return @bitCast(this);
@@ -429,50 +400,46 @@ pub const Node = packed struct {
         return @ptrCast(@alignCast(this));
     }
 
-    pub fn classify(this: Node) Form {
-        return switch (this.kind) {
-            .text => blk: {
-                const d = viewConst(TextDiscriminants, this);
-                if (d.text == .pool) break :blk .span;
-                if (d.tiny == .quad) break :blk .quad;
-                break :blk if (d.reps == .utf8) .trip else .rune;
-            },
-            .oper => blk: {
-                const d = viewConst(OperDiscriminants, this);
-                break :blk if (d.oper == .plus) .cons else .fork;
-            },
+    pub fn look(this: Node) Form {
+        return this.tag;
+    }
+
+    pub fn isText(this: Node) bool {
+        return switch (this.tag) {
+            .span, .quad, .trip, .rune => true,
+            else => false,
         };
     }
 
-    pub fn asTextPool(this: Node) Span {
+    pub fn asSpan(this: Node) Span {
         return viewConst(Span, this);
     }
 
-    pub fn asTextPoolMut(this: *Node) *Span {
+    pub fn asSpanPtr(this: *Node) *Span {
         return viewMut(Span, this);
     }
 
-    pub fn asTinyAscii(this: Node) Quad {
+    pub fn asQuad(this: Node) Quad {
         return viewConst(Quad, this);
     }
 
-    pub fn asTinyAsciiMut(this: *Node) *Quad {
+    pub fn asQuadPtr(this: *Node) *Quad {
         return viewMut(Quad, this);
     }
 
-    pub fn asTinyUtf8(this: Node) Trip {
+    pub fn asTrip(this: Node) Trip {
         return viewConst(Trip, this);
     }
 
-    pub fn asTinyUtf8Mut(this: *Node) *Trip {
+    pub fn asTripPtr(this: *Node) *Trip {
         return viewMut(Trip, this);
     }
 
-    pub fn asTinyRune(this: Node) Rune {
+    pub fn asRune(this: Node) Rune {
         return viewConst(Rune, this);
     }
 
-    pub fn asTinyRuneMut(this: *Node) *Rune {
+    pub fn asRunePtr(this: *Node) *Rune {
         return viewMut(Rune, this);
     }
 
@@ -480,13 +447,13 @@ pub const Node = packed struct {
         return viewConst(Oper, this);
     }
 
-    pub fn asOperMut(this: *Node) *Oper {
+    pub fn asOperPtr(this: *Node) *Oper {
         return viewMut(Oper, this);
     }
 
     pub fn isEmptyText(this: Node) bool {
-        return switch (this.classify()) {
-            .rune => this.asTinyRune().isEmpty(),
+        return switch (this.look()) {
+            .rune => this.asRune().isEmpty(),
             else => false,
         };
     }
@@ -495,11 +462,11 @@ pub const Node = packed struct {
         WriteFailed,
         Unimplemented,
     }!void {
-        switch (this.classify()) {
-            .span => try this.asTextPool().emit(show),
-            .quad => try this.asTinyAscii().emit(show),
-            .trip => try this.asTinyUtf8().emit(show),
-            .rune => try this.asTinyRune().emit(show),
+        switch (this.look()) {
+            .span => try this.asSpan().emit(show),
+            .quad => try this.asQuad().emit(show),
+            .trip => try this.asTrip().emit(show),
+            .rune => try this.asRune().emit(show),
             .cons => try this.asOper().emit(show),
             .fork => try this.asOper().emit(show),
         }
@@ -509,7 +476,7 @@ pub const Node = packed struct {
         return @bitCast(this);
     }
 
-    pub fn fromTextPool(side: PoolSide, char: u7, text: u21) Node {
+    pub fn fromSpan(side: Side, char: u7, text: u21) Node {
         const view: Span = .{
             .side = side,
             .char = char,
@@ -520,6 +487,7 @@ pub const Node = packed struct {
 
     pub fn fromTinyAscii(chars: [4]u7) Node {
         const view: Quad = .{
+            .pad = 0,
             .ch0 = chars[0],
             .ch1 = chars[1],
             .ch2 = chars[2],
@@ -530,6 +498,7 @@ pub const Node = packed struct {
 
     pub fn fromTinyUtf8(reps: u3, bytes: [3]u8) Node {
         const view: Trip = .{
+            .pad = 0,
             .reps = reps,
             .byte0 = bytes[0],
             .byte1 = bytes[1],
@@ -540,15 +509,16 @@ pub const Node = packed struct {
 
     pub fn fromTinyRune(reps: u6, code: u21) Node {
         const view: Rune = .{
+            .pad = 0,
             .reps = reps,
             .code = code,
         };
         return @bitCast(view);
     }
 
-    pub fn fromOper(kind: OperKind, frob: Frob, what: u21) Node {
+    pub fn fromOper(kind: Tag, frob: Frob, what: u21) Node {
         const view: Oper = .{
-            .oper = kind,
+            .tag = kind,
             .frob = frob,
             .item = what,
         };
@@ -595,15 +565,15 @@ pub const Tree = struct {
     }
 
     pub fn rank(tree: *Tree, conf: anytype, node: Node) !@TypeOf(conf).Rank {
-        return try Gist(@TypeOf(conf)).rank(conf, tree, node);
+        return try Gist(@TypeOf(conf)).eval(conf, tree, node);
     }
 
     pub fn flat(tree: *Tree, lhs: Node) !Node {
         _ = tree;
         var new = lhs;
-        switch (new.classify()) {
+        switch (new.look()) {
             .span => {
-                var pool = new.asTextPoolMut();
+                var pool = new.asSpanPtr();
                 if (pool.char == '\n')
                     pool.char = ' ';
                 return new;
@@ -611,13 +581,13 @@ pub const Tree = struct {
             .quad => return new,
             .trip => return new,
             .rune => {
-                var rune = new.asTinyRuneMut();
+                var rune = new.asRunePtr();
                 if (rune.code == '\n')
                     rune.code = ' ';
                 return new;
             },
             .cons, .fork => {
-                var oper = new.asOperMut();
+                var oper = new.asOperPtr();
                 oper.frob.flat = 1;
                 return new;
             },
@@ -637,9 +607,9 @@ pub const Tree = struct {
             return doc;
 
         var new = doc;
-        switch (new.classify()) {
+        switch (new.look()) {
             .cons, .fork => {
-                var oper = new.asOperMut();
+                var oper = new.asOperPtr();
                 oper.frob.nest +|= indent;
                 return new;
             },
@@ -656,10 +626,10 @@ pub const Tree = struct {
     ///     ...DDDDDD
     ///     ...DDD
     pub fn warp(tree: *Tree, doc: Node) !Node {
-        switch (doc.classify()) {
+        switch (doc.look()) {
             .cons, .fork => {
                 var new = doc;
-                new.asOperMut().frob.warp = 1;
+                new.asOperPtr().frob.warp = 1;
                 return new;
             },
             .span, .quad, .trip, .rune => if (doc.isEmptyText())
@@ -670,7 +640,7 @@ pub const Tree = struct {
                 // We need an `oper` to carry the `frob`.
                 // If `plus` learns to fuse tiny texts,
                 // we'll need to fix this path.
-                std.debug.assert(oper.kind == .oper);
+                std.debug.assert(oper.look() == .cons);
 
                 return try tree.warp(oper);
             },
@@ -678,12 +648,10 @@ pub const Tree = struct {
     }
 
     pub fn plus(tree: *Tree, lhs: Node, rhs: Node) !Node {
-        const nl_repr = Node.nl.repr();
-
-        if (rhs.repr() == nl_repr and lhs.kind == .text) {
+        if (rhs == Node.nl and lhs.isText()) {
             var fused = lhs;
-            if (fused.classify() == .span) {
-                var pool = fused.asTextPoolMut();
+            if (fused.look() == .span) {
+                var pool = fused.asSpanPtr();
                 if (pool.char == 0) {
                     pool.side = .rchr;
                     pool.char = '\n';
@@ -692,10 +660,10 @@ pub const Tree = struct {
             }
         }
 
-        if (lhs.repr() == nl_repr and rhs.kind == .text) {
+        if (lhs == Node.nl and rhs.isText()) {
             var fused = rhs;
-            if (fused.classify() == .span) {
-                var pool = fused.asTextPoolMut();
+            if (fused.look() == .span) {
+                var pool = fused.asSpanPtr();
                 if (pool.char == 0) {
                     pool.side = .lchr;
                     pool.char = '\n';
@@ -710,7 +678,7 @@ pub const Tree = struct {
 
         const next: u21 = @intCast(tree.heap.plus.items.len);
         try tree.heap.plus.append(tree.alloc, .{ .a = lhs, .b = rhs });
-        return Node.fromOper(.plus, .{}, next);
+        return Node.fromOper(.cons, .{}, next);
     }
 
     pub fn fork(tree: *Tree, lhs: Node, rhs: Node) !Node {
@@ -782,8 +750,8 @@ pub const Tree = struct {
         // If text() didn't point to our new string, rewind the slab
         // (either it found a duplicate, or it made a tiny immediate node)
         const start_index: u21 = @intCast(start_len);
-        const should_rewind = switch (node.classify()) {
-            .span => node.asTextPool().text != start_index,
+        const should_rewind = switch (node.look()) {
+            .span => node.asSpan().text != start_index,
             .quad, .trip, .rune => true,
             else => false,
         };
@@ -880,7 +848,7 @@ pub const Tree = struct {
             },
         );
 
-        return Node.fromTextPool(.lchr, 0, spot);
+        return Node.fromSpan(.lchr, 0, spot);
     }
 };
 
@@ -962,8 +930,8 @@ test "fuse text <> nl" {
     const text_node = try t.text("Hello, world!");
     const fused = try t.plus(text_node, .nl);
 
-    try expect(fused.classify() == .span);
-    const pool = fused.asTextPool();
+    try expect(fused.look() == .span);
+    const pool = fused.asSpan();
     try expectEqual(pool.side, .rchr);
     try expectEqual(pool.char, '\n');
     try expectEqual(0, t.heap.plus.items.len);
@@ -977,8 +945,8 @@ test "fuse nl <> text" {
     const text_node = try t.text("Hello, world!");
     const fused = try t.plus(.nl, text_node);
 
-    try expect(fused.classify() == .span);
-    const pool = fused.asTextPool();
+    try expect(fused.look() == .span);
+    const pool = fused.asSpan();
     try expectEqual(pool.side, .lchr);
     try expectEqual(pool.char, '\n');
     try expectEqual(0, t.heap.plus.items.len);
