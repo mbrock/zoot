@@ -1,14 +1,35 @@
 const std = @import("std");
 
 pub const Sink = struct {
-    t: *Tree,
-    w: *std.Io.Writer,
-    c: u16 = 0,
+    tree: *Tree,
+    out: *std.Io.Writer,
+
+    /// current column
+    head: u16 = 0,
+    /// indent column
+    base: u16 = 0,
+    /// treat ␤ as ␠?
+    flat: bool = false,
 
     pub fn writeString(sink: @This(), what: u21) !void {
-        const tail = sink.t.heap.byte.items[what..];
+        const tail = sink.tree.heap.byte.items[what..];
         const span = std.mem.sliceTo(tail, 0);
-        try sink.w.writeAll(span);
+        try sink.out.writeAll(span);
+    }
+
+    pub fn newline(sink: *@This()) !void {
+        if (sink.flat)
+            try sink.out.writeByte(' ')
+        else {
+            try sink.out.writeByte('\n');
+            try sink.out.splatByteAll(' ', sink.base);
+        }
+    }
+
+    pub fn setFlat(sink: *@This(), flat: bool) bool {
+        const old = sink.flat;
+        sink.flat = flat;
+        return old;
     }
 };
 
@@ -44,12 +65,12 @@ pub const Text = packed struct {
 
             pub fn emit(this: @This(), sink: *Sink) !void {
                 if (this.char != 0 and this.side == .l)
-                    try sink.w.writeByte(this.char);
+                    try sink.out.writeByte(this.char);
 
                 try sink.writeString(this.text);
 
                 if (this.char != 0 and this.side == .r)
-                    try sink.w.writeByte(this.char);
+                    try sink.out.writeByte(this.char);
             }
         },
 
@@ -82,11 +103,14 @@ pub const Text = packed struct {
                             pub fn emit(this: @This(), sink: *Sink) !void {
                                 if (this.reps == 0)
                                     return
-                                else {
+                                else if (this.code == '\n') {
+                                    for (0..this.reps) |_|
+                                        try sink.newline();
+                                } else {
                                     var buffer: [4]u8 = undefined;
                                     const n = std.unicode.utf8Encode(this.code, &buffer) catch 0;
                                     var data = [1][]const u8{buffer[0..n]};
-                                    try sink.w.writeSplatAll(&data, this.reps);
+                                    try sink.out.writeSplatAll(&data, this.reps);
                                 }
                             }
                         },
@@ -111,7 +135,7 @@ pub const Text = packed struct {
                     pub fn emit(this: @This(), sink: *Sink) !void {
                         for (0..4) |i| {
                             const c = this.chrs[i];
-                            if (c == 0) break else try sink.w.writeByte(c);
+                            if (c == 0) break else try sink.out.writeByte(c);
                         }
                     }
                 },
@@ -164,7 +188,11 @@ pub const Oper = packed struct {
     pub fn emit(this: @This(), sink: *Sink) !void {
         switch (this.kind) {
             .plus => {
-                const args = sink.t.heap.plus.items[this.what];
+                const saveflat = sink.flat;
+                defer sink.flat = saveflat;
+                sink.flat |= this.frob.flat == 1;
+
+                const args = sink.tree.heap.plus.items[this.what];
                 try args.a.emit(sink);
                 try args.b.emit(sink);
             },
@@ -199,6 +227,31 @@ pub const Node = packed struct {
     pub fn repr(this: @This()) u32 {
         return @bitCast(this);
     }
+
+    pub const nl: Node = .{
+        .kind = .text,
+        .data = .{
+            .text = .{
+                .kind = .tiny,
+                .data = .{
+                    .tiny = .{
+                        .kind = .splat,
+                        .data = .{
+                            .splat = .{
+                                .kind = .rune,
+                                .data = .{
+                                    .rune = .{
+                                        .reps = 1,
+                                        .code = '\n',
+                                    },
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+        },
+    };
 };
 
 /// two node handles; 64 bits
@@ -226,9 +279,23 @@ pub const Tree = struct {
 
     pub fn show(tree: *Tree, buffer: []u8, node: Node) ![]const u8 {
         var w = std.Io.Writer.fixed(buffer);
-        var sink = Sink{ .t = tree, .w = &w };
+        var sink = Sink{ .tree = tree, .out = &w };
         try node.emit(&sink);
-        return sink.w.buffered();
+        return sink.out.buffered();
+    }
+
+    pub fn flat(tree: *Tree, lhs: Node) !Node {
+        switch (lhs.kind) {
+            .text => {
+                _ = tree;
+                return error.Unimplemented;
+            },
+            .oper => {
+                var new = lhs;
+                new.data.oper.frob.flat = 1;
+                return new;
+            },
+        }
     }
 
     pub fn plus(tree: *Tree, lhs: Node, rhs: Node) !Node {
@@ -399,5 +466,35 @@ test "emit plus node" {
         &tree,
         "Hello,world!",
         try tree.plus(n1, n2),
+    );
+}
+
+test "'a' <> nl <> 'b'" {
+    var t = Tree.init(std.testing.allocator);
+    defer t.deinit();
+
+    try expectEmitString(
+        &t,
+        "A\nB",
+        try t.plus(
+            try t.plus(try t.text("A"), .nl),
+            try t.text("B"),
+        ),
+    );
+}
+
+test "flatten('a' <> nl <> 'b')" {
+    var t = Tree.init(std.testing.allocator);
+    defer t.deinit();
+
+    try expectEmitString(
+        &t,
+        "A B",
+        try t.flat(
+            try t.plus(
+                try t.plus(try t.text("A"), .nl),
+                try t.text("B"),
+            ),
+        ),
     );
 }
