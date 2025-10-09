@@ -110,6 +110,10 @@ pub fn build(b: *std.Build) void {
     graphviz_step.dependOn(&graphviz_cmd.step);
     graphviz_cmd.step.dependOn(b.getInstallStep());
 
+    const serve_step = b.step("serve", "Start HTTP server for visualization");
+    const serve_cmd = b.addSystemCommand(&.{ "python3", "-m", "http.server", "8000" });
+    serve_step.dependOn(&serve_cmd.step);
+
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });

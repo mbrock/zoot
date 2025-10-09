@@ -58,14 +58,21 @@ pub fn main() !void {
         })),
     });
 
-    var buffer2: [65536]u8 = undefined;
-    const dot2 = try tree.graphviz(&buffer2, if_stmt);
+    // Generate graphviz
+    var dot_buffer: [65536]u8 = undefined;
+    const dot = try tree.graphviz(&dot_buffer, if_stmt);
+    const dot_file = try std.fs.cwd().createFile("graphviz.dot", .{});
+    defer dot_file.close();
+    try dot_file.writeAll(dot);
 
-    // Write to file
-    const file = try std.fs.cwd().createFile("graphviz.dot", .{});
-    defer file.close();
-    try file.writeAll(dot2);
+    // Generate JSON
+    var json_buffer: [65536]u8 = undefined;
+    const json = try tree.toJson(&json_buffer, if_stmt);
+    const json_file = try std.fs.cwd().createFile("tree.json", .{});
+    defer json_file.close();
+    try json_file.writeAll(json);
 
-    std.debug.print("Generated graphviz.dot with {d} bytes\n", .{dot2.len});
+    std.debug.print("Generated graphviz.dot with {d} bytes\n", .{dot.len});
+    std.debug.print("Generated tree.json with {d} bytes\n", .{json.len});
     std.debug.print("Run: dot -Tpdf graphviz.dot -o graphviz.pdf\n", .{});
 }

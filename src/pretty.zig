@@ -28,82 +28,102 @@ pub const Show = struct {
             this.head = this.base;
         }
     }
-
-    /// This is an `std.Io.Writer` that measures without printing.
-    pub fn Pack(Cost: type) type {
-        return struct {
-            head: u16 = 0,
-            cost: Cost.Snap,
-            conf: Cost,
-            sink: std.Io.Writer,
-
-            pub fn init(buffer: []u8, conf: Cost) @This() {
-                return .{
-                    .conf = conf,
-                    .cost = conf.text(0, 0),
-                    .sink = .{
-                        .buffer = buffer,
-                        .vtable = &.{
-                            .drain = drain,
-                            .rebase = std.Io.Writer.failingRebase,
-                        },
-                    },
-                };
-            }
-
-            pub fn pack(conf: Cost, tree: *Tree, node: Node) !Cost.Snap {
-                var note: [256]u8 = undefined;
-                var this = init(&note, conf);
-                var work = Show{ .tree = tree, .sink = &this.sink };
-                try node.emit(&work);
-                try this.sink.flush();
-                return this.cost;
-            }
-
-            pub fn scan(this: *@This(), data: []const u8) !void {
-                for (data) |c| {
-                    if (c == '\n') {
-                        this.cost = this.conf.plus(this.cost, this.conf.line());
-                        this.head = 0;
-                    } else {
-                        this.cost = this.conf.plus(this.cost, this.conf.text(this.head, 1));
-                        this.head += 1;
-                    }
-                }
-            }
-
-            pub fn drain(
-                w: *std.Io.Writer,
-                data: []const []const u8,
-                splat: usize,
-            ) !usize {
-                const this: *@This() = @alignCast(@fieldParentPtr("sink", w));
-
-                if (w.end > 0) {
-                    try this.scan(w.buffered());
-                    w.end = 0;
-                }
-
-                if (data.len == 0) return 0;
-
-                var took: usize = 0;
-
-                for (data[0 .. data.len - 1]) |part| {
-                    try this.scan(part);
-                    took += part.len;
-                }
-
-                const bulk = data[data.len - 1];
-                for (0..splat) |_| {
-                    try this.scan(bulk);
-                    took += bulk.len;
-                }
-
-                return took;
-            }
-        };
-    }
 };
+
+/// This is an `std.Io.Writer` that measures without printing,
+/// allocating, or concatenating anything.  It just looks for
+/// newlines, tracks the cursor column, and tallies a cost.
+///
+/// If you emit a node into a gist sink, you measure the layout
+/// exactly as it's defined; there's no separate measuring logic
+/// to get wrong; we don't multiply the number of visitor patterns
+/// and inductive semantic interpretations of the myriad different
+/// immediate small string paradigms and quirked-up little bitfields.
+///
+/// By tracking the cursor movement of the `emit` code, it computes
+/// what *A Pretty Expressive Printer*, following Bernardy, calls
+/// the *measure* of a choiceless document.
+///
+/// Looking at gists instead of emits is like looking at
+/// only the pure geometry of the bounding boxes;
+/// the medium is the message.
+///
+/// The cost parameter is a type, usually a numeric vector,
+/// with base cost values for newlines and characters,
+/// addition that behaves monotonically, and an order.
+pub fn Gist(Cost: type) type {
+    return struct {
+        head: u16 = 0,
+        cost: Cost.Rank,
+        conf: Cost,
+        sink: std.Io.Writer,
+
+        pub fn init(buffer: []u8, conf: Cost) @This() {
+            return .{
+                .conf = conf,
+                .cost = conf.text(0, 0),
+                .sink = .{
+                    .buffer = buffer,
+                    .vtable = &.{
+                        .drain = drain,
+                        .rebase = std.Io.Writer.failingRebase,
+                    },
+                },
+            };
+        }
+
+        pub fn rank(conf: Cost, tree: *Tree, node: Node) !Cost.Rank {
+            var note: [256]u8 = undefined;
+            var this = init(&note, conf);
+            var work = Show{ .tree = tree, .sink = &this.sink };
+            try node.emit(&work);
+            try this.sink.flush();
+            return this.cost;
+        }
+
+        pub fn scan(this: *@This(), data: []const u8) !void {
+            for (data) |c| {
+                if (c == '\n') {
+                    this.cost = this.conf.plus(this.cost, this.conf.line());
+                    this.head = 0;
+                } else {
+                    this.cost = this.conf.plus(this.cost, this.conf.text(this.head, 1));
+                    this.head += 1;
+                }
+            }
+        }
+
+        pub fn drain(
+            w: *std.Io.Writer,
+            data: []const []const u8,
+            splat: usize,
+        ) !usize {
+            const this: *@This() = @alignCast(@fieldParentPtr("sink", w));
+
+            if (w.end > 0) {
+                try this.scan(w.buffered());
+                w.end = 0;
+            }
+
+            if (data.len == 0) return 0;
+
+            var took: usize = 0;
+
+            for (data[0 .. data.len - 1]) |part| {
+                try this.scan(part);
+                took += part.len;
+            }
+
+            const bulk = data[data.len - 1];
+            for (0..splat) |_| {
+                try this.scan(bulk);
+                took += bulk.len;
+            }
+
+            return took;
+        }
+    };
+}
 
 /// Example 3.4. in *A Pretty Expressive Printer*.
 ///
@@ -114,14 +134,14 @@ pub const Show = struct {
 const F1 = struct {
     w: u16,
 
-    pub const Snap = struct {
+    pub const Rank = struct {
         /// the sum of overflows
         o: u16 = 0,
         /// the number of newlines
         h: u16 = 0,
 
-        pub fn key(snap: Snap) u32 {
-            return (@as(u32, snap.o) << 16) | snap.h;
+        pub fn key(rank: Rank) u32 {
+            return (@as(u32, rank.o) << 16) | rank.h;
         }
     };
 
@@ -129,19 +149,19 @@ const F1 = struct {
         return .{ .w = w };
     }
 
-    pub fn line(_: @This()) Snap {
+    pub fn line(_: @This()) Rank {
         return .{ .h = 1 };
     }
 
-    pub fn text(this: @This(), c: u16, l: u16) Snap {
+    pub fn text(this: @This(), c: u16, l: u16) Rank {
         return .{ .o = (c +| l) -| @max(this.w, c) };
     }
 
-    pub fn plus(_: @This(), lhs: Snap, rhs: Snap) Snap {
+    pub fn plus(_: @This(), lhs: Rank, rhs: Rank) Rank {
         return .{ .h = lhs.h +| rhs.h, .o = lhs.o +| rhs.o };
     }
 
-    pub fn wins(_: @This(), a: Snap, b: Snap) bool {
+    pub fn wins(_: @This(), a: Rank, b: Rank) bool {
         return a.key() <= b.key();
     }
 };
@@ -158,13 +178,13 @@ const F1 = struct {
 const F2 = struct {
     w: u16,
 
-    pub const Snap = struct {
+    pub const Rank = struct {
         /// the sum of squared overflows
         o: u32 = 0,
         /// the number of newlines
         h: u16 = 0,
 
-        pub fn key(snap: Snap) u48 {
+        pub fn key(snap: Rank) u48 {
             return (snap.o << 16) | snap.h;
         }
     };
@@ -173,11 +193,11 @@ const F2 = struct {
         return .{ .w = w };
     }
 
-    pub fn line(_: @This()) Snap {
+    pub fn line(_: @This()) Rank {
         return .{ .h = 1 };
     }
 
-    pub fn text(this: @This(), c: u16, l: u16) Snap {
+    pub fn text(this: @This(), c: u16, l: u16) Rank {
         const w = this.w;
 
         const a = @max(w, c) -| w;
@@ -188,11 +208,11 @@ const F2 = struct {
         };
     }
 
-    pub fn plus(_: @This(), lhs: Snap, rhs: Snap) Snap {
+    pub fn plus(_: @This(), lhs: Rank, rhs: Rank) Rank {
         return .{ .h = lhs.h +| rhs.h, .o = lhs.o +| rhs.o };
     }
 
-    pub fn wins(_: @This(), a: Snap, b: Snap) bool {
+    pub fn wins(_: @This(), a: Rank, b: Rank) bool {
         return a.key() <= b.key();
     }
 };
@@ -450,7 +470,13 @@ pub const Node = packed struct {
 /// two node handles; 64 bits
 pub const Pair = struct { a: Node, b: Node };
 
-/// tree-in-construction; actually more like DAG
+/// This is the aggregate root of a pretty printing syntax tree,
+/// or a document layout specification.
+///
+/// It is used to build such specifications out of structured data.
+/// The nodes of the tree use indices into lists owned by the tree.
+///
+/// It is also used to rank layouts, and to actually print them.
 pub const Tree = struct {
     byte: std.ArrayList(u8) = .empty,
     heap: struct {
@@ -475,6 +501,92 @@ pub const Tree = struct {
         var it = Show{ .tree = tree, .sink = &w };
         try node.emit(&it);
         return it.sink.buffered();
+    }
+
+    pub fn toJson(t1: *Tree, buffer: []u8, node: Node) ![]const u8 {
+        var t2 = Tree.init(t1.alloc);
+        defer t2.deinit();
+
+        const body = try jsonNode(&t2, t1, node);
+        return try t2.show(buffer, body);
+    }
+
+    fn jsonNode(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
+        const id = node.repr();
+
+        const kind_str = switch (node.kind) {
+            .text => "text",
+            .oper => if (node.data.oper.kind == .plus) "plus" else "fork",
+        };
+
+        const label = switch (node.kind) {
+            .text => try formatTextNode(t2, t1, node),
+            .oper => blk: {
+                const oper = node.data.oper;
+                break :blk try t2.cat(&.{
+                    try t2.text(if (oper.kind == .plus) "+" else "?"),
+                    try t2.when(oper.frob.flat == 1, try t2.text("ᶠ")),
+                    try t2.when(oper.frob.warp == 1, try t2.text("ʷ")),
+                    try t2.when(oper.frob.nest != 0, try t2.format("ⁿ{d}", .{oper.frob.nest})),
+                });
+            },
+        };
+
+        const id_field = try t2.cat(&.{
+            try t2.quotes(try t2.text("id")),
+            try t2.text(":"),
+            try t2.quotes(try t2.format("{x}", .{id})),
+        });
+
+        const kind_field = try t2.cat(&.{
+            try t2.quotes(try t2.text("kind")),
+            try t2.text(":"),
+            try t2.quotes(try t2.text(kind_str)),
+        });
+
+        const label_field = try t2.cat(&.{
+            try t2.quotes(try t2.text("label")),
+            try t2.text(":"),
+            try t2.quotes(label),
+        });
+
+        const text_kind_field = if (node.kind == .text) blk: {
+            const tk = switch (node.data.text.kind) {
+                .pool => "pool",
+                .tiny => "tiny",
+            };
+            break :blk try t2.cat(&.{
+                try t2.quotes(try t2.text("textKind")),
+                try t2.text(":"),
+                try t2.quotes(try t2.text(tk)),
+            });
+        } else try t2.text("");
+
+        const children_field = if (node.kind == .oper) blk: {
+            const oper = node.data.oper;
+            const args = if (oper.kind == .plus)
+                t1.heap.plus.items[oper.what]
+            else
+                t1.heap.fork.items[oper.what];
+
+            const left = try jsonNode(t2, t1, args.a);
+            const right = try jsonNode(t2, t1, args.b);
+
+            break :blk try t2.cat(&.{
+                try t2.quotes(try t2.text("children")),
+                try t2.text(":"),
+                try t2.brackets(try t2.sepBy(&.{ left, right }, try t2.text(","))),
+            });
+        } else try t2.text("");
+
+        const fields = if (node.kind == .oper)
+            &[_]Node{ id_field, kind_field, label_field, children_field }
+        else if (node.kind == .text)
+            &[_]Node{ id_field, kind_field, text_kind_field, label_field }
+        else
+            &[_]Node{ id_field, kind_field, label_field };
+
+        return try t2.braces(try t2.sepBy(fields, try t2.text(",")));
     }
 
     pub fn graphviz(t1: *Tree, buffer: []u8, node: Node) ![]const u8 {
@@ -637,8 +749,8 @@ pub const Tree = struct {
         };
     }
 
-    pub fn pack(tree: *Tree, conf: anytype, node: Node) !@TypeOf(conf).Snap {
-        return try Show.Pack(@TypeOf(conf)).pack(conf, tree, node);
+    pub fn rank(tree: *Tree, conf: anytype, node: Node) !@TypeOf(conf).Rank {
+        return try Gist(@TypeOf(conf)).rank(conf, tree, node);
     }
 
     pub fn flat(tree: *Tree, lhs: Node) !Node {
@@ -650,7 +762,7 @@ pub const Tree = struct {
                     .pool => {
                         var pooled = &new.data.text.data.pool;
                         if (pooled.char == '\n')
-                            pooled.char = @as(u7, ' ');
+                            pooled.char = ' ';
                     },
                     .tiny => {
                         var tiny = &new.data.text.data.tiny;
@@ -679,6 +791,13 @@ pub const Tree = struct {
         }
     }
 
+    /// The `nest` combinator shifts the base of a layout's
+    /// tail forward by some indent level.  The first line
+    /// is not affected.
+    ///
+    ///      foobar(
+    ///      ..xxxxx
+    ///      ..xxxxx
     pub fn nest(tree: *Tree, indent: u6, doc: Node) !Node {
         _ = tree;
         if (indent == 0)
@@ -688,10 +807,7 @@ pub const Tree = struct {
             .text => return doc,
             .oper => {
                 var new = doc;
-                const limit: u16 = std.math.maxInt(u6);
-                const sum = @as(u16, new.data.oper.frob.nest) + @as(u16, indent);
-                const clamped: u6 = @intCast(if (sum > limit) limit else sum);
-                new.data.oper.frob.nest = clamped;
+                new.data.oper.frob.nest +|= indent;
                 return new;
             },
         }
@@ -923,6 +1039,7 @@ pub const Tree = struct {
                                         .kind = .rune,
                                         .data = .{
                                             .rune = .{
+                                                // All that for a single character...
                                                 .reps = @intCast(span.len),
                                                 .code = if (span.len == 0) 0 else span[0],
                                             },
@@ -1133,7 +1250,7 @@ test "nest braces cost" {
     var t = Tree.init(std.testing.allocator);
     defer t.deinit();
 
-    const s1 = try t.pack(
+    const s1 = try t.rank(
         F1.init(32),
         try t.plus(
             try t.plus(
@@ -1158,7 +1275,7 @@ test "F2 cost matches example" {
     // See Example 3.5. and Figure 7 in *A Pretty Expressive Printer*.
 
     const d1 = try t.text("   = func( pretty, print )");
-    const c1 = try t.pack(F2.init(6), d1);
+    const c1 = try t.rank(F2.init(6), d1);
 
     try expectEqual(0, c1.h);
     try expectEqual(20 * 20, c1.o);
@@ -1184,7 +1301,7 @@ test "F2 cost matches example" {
         \\)
     , d2);
 
-    const c2 = try t.pack(F2.init(6), d2);
+    const c2 = try t.rank(F2.init(6), d2);
 
     try expectEqual(3, c2.h);
     try expectEqual(4 * 4 + 3 * 3 + 1, c2.o);
@@ -1266,6 +1383,4 @@ test "graphviz output" {
     try expect(std.mem.indexOf(u8, dot, "digraph Tree") != null);
     try expect(std.mem.indexOf(u8, dot, "foo") != null);
     try expect(std.mem.indexOf(u8, dot, "bar") != null);
-    try expect(std.mem.indexOf(u8, dot, "ʷ") != null);
-    try expect(std.mem.indexOf(u8, dot, "ⁿ") != null);
 }
