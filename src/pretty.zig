@@ -25,6 +25,97 @@ pub const Show = struct {
             try this.sink.splatByteAll(' ', this.base);
         }
     }
+
+    /// This is an `std.Io.Writer` that measures without printing.
+    pub const Cost = struct {
+        pub const Data = struct {
+            /// total number of rows
+            rows: u16 = 0,
+            /// width of longest row
+            long: u8 = 0,
+            /// width of last row
+            last: u8 = 0,
+            /// overflow quantity
+            debt: u8 = 0,
+            /// number of newlines softened
+            soft: u8 = 0,
+        };
+
+        /// accumulated cost vector
+        data: Data = .{},
+
+        /// buffered interface
+        sink: std.Io.Writer,
+
+        /// page width, or target line width
+        page: u8,
+
+        pub fn init(buffer: []u8, width: u8) Cost {
+            return .{
+                .page = width,
+                .sink = .{
+                    .buffer = buffer,
+                    .vtable = &.{
+                        .drain = Cost.drain,
+                        .rebase = std.Io.Writer.failingRebase,
+                    },
+                },
+            };
+        }
+
+        pub fn scan(this: *@This(), data: []const u8) !void {
+            var m = &this.data;
+            if (m.rows == 0) m.rows = 1;
+
+            var head = m.last;
+            var long = m.long;
+
+            for (data) |c| {
+                if (c == '\n') {
+                    if (head > long) long = head;
+                    m.rows += 1;
+                    head = 0; // indent will be space-splatted
+                } else {
+                    head += 1;
+                }
+            }
+
+            m.last = head;
+            m.long = @max(long, head);
+            if (m.long > this.page)
+                m.debt = m.long - this.page;
+        }
+
+        pub fn drain(
+            w: *std.Io.Writer,
+            data: []const []const u8,
+            splat: usize,
+        ) !usize {
+            const this: *Cost = @alignCast(@fieldParentPtr("sink", w));
+
+            if (w.end > 0) {
+                try this.scan(w.buffered());
+                w.end = 0;
+            }
+
+            if (data.len == 0) return 0;
+
+            var took: usize = 0;
+
+            for (data[0 .. data.len - 1]) |part| {
+                try this.scan(part);
+                took += part.len;
+            }
+
+            const bulk = data[data.len - 1];
+            for (0..splat) |_| {
+                try this.scan(bulk);
+                took += bulk.len;
+            }
+
+            return took;
+        }
+    };
 };
 
 /// Pooled or immediate text; 30 bits.
@@ -292,6 +383,15 @@ pub const Tree = struct {
         var it = Show{ .tree = tree, .sink = &w };
         try node.emit(&it);
         return it.sink.buffered();
+    }
+
+    pub fn cost(tree: *Tree, page: u8, node: Node) !Show.Cost.Data {
+        var note: [256]u8 = undefined;
+        var sink = Show.Cost.init(&note, page);
+        var work = Show{ .tree = tree, .sink = &sink.sink };
+        try node.emit(&work);
+        try sink.sink.flush();
+        return sink.data;
     }
 
     pub fn flat(tree: *Tree, lhs: Node) !Node {
@@ -619,6 +719,29 @@ test "nest braces emit" {
         \\    bar
         \\}
     , doc);
+}
+
+test "nest braces cost" {
+    var t = Tree.init(std.testing.allocator);
+    defer t.deinit();
+
+    const doc = try t.plus(
+        try t.plus(
+            try t.text("foo {"),
+            try t.nest(
+                4,
+                try t.plus(.nl, try t.text("bar")),
+            ),
+        ),
+        try t.plus(.nl, try t.text("}")),
+    );
+
+    const m: Show.Cost.Data = try t.cost(32, doc);
+    try expectEqual(3, m.rows);
+    try expectEqual(1, m.last);
+    try expectEqual(7, m.long);
+    try expectEqual(0, m.debt);
+    try expectEqual(0, m.soft);
 }
 
 test "flatten('a' <> nl <> 'b')" {
