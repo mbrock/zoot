@@ -16,8 +16,8 @@ pub const Style = enum {
     punctuation,
 };
 
-const StyledDocPrinter = @import("StyledDocPrinter.zig");
-const Doc = StyledDocPrinter.Doc;
+const P = @import("StyledDocPrinter.zig");
+const Doc = P.Doc;
 
 pub const Options = struct {
     max_width: u16 = 80,
@@ -51,48 +51,48 @@ fn prettyDepth(
     depth: u32,
 ) !Doc {
     if (depth >= opts.max_depth) {
-        return StyledDocPrinter.text("...", Style.normal, alloc);
+        return P.text("...", Style.normal, alloc);
     }
 
     switch (@typeInfo(T)) {
         .int, .comptime_int => {
             const str = try std.fmt.allocPrint(alloc, "{d}", .{value});
-            return StyledDocPrinter.text(str, Style.number, alloc);
+            return P.text(str, Style.number, alloc);
         },
         .float, .comptime_float => {
             const str = try std.fmt.allocPrint(alloc, "{d}", .{value});
-            return StyledDocPrinter.text(str, Style.number, alloc);
+            return P.text(str, Style.number, alloc);
         },
         .bool => {
-            return StyledDocPrinter.text(if (value) "true" else "false", Style.keyword, alloc);
+            return P.text(if (value) "true" else "false", Style.keyword, alloc);
         },
         .void => {
-            return StyledDocPrinter.text("void", Style.keyword, alloc);
+            return P.text("void", Style.keyword, alloc);
         },
         .type => {
-            return StyledDocPrinter.text(@typeName(value), Style.type_name, alloc);
+            return P.text(@typeName(value), Style.type_name, alloc);
         },
         .@"enum" => {
             const str = try std.fmt.allocPrint(alloc, ".{s}", .{@tagName(value)});
-            return StyledDocPrinter.text(str, Style.keyword, alloc);
+            return P.text(str, Style.keyword, alloc);
         },
         .enum_literal => {
             const str = try std.fmt.allocPrint(alloc, ".{s}", .{@tagName(value)});
-            return StyledDocPrinter.text(str, Style.keyword, alloc);
+            return P.text(str, Style.keyword, alloc);
         },
         .null => {
-            return StyledDocPrinter.text("null", Style.keyword, alloc);
+            return P.text("null", Style.keyword, alloc);
         },
         .optional => {
             if (value) |payload| {
                 return prettyDepth(is_comptime, @TypeOf(payload), payload, alloc, opts, depth);
             } else {
-                return StyledDocPrinter.text("null", Style.keyword, alloc);
+                return P.text("null", Style.keyword, alloc);
             }
         },
         .error_set => {
             const str = try std.fmt.allocPrint(alloc, "error.{s}", .{@errorName(value)});
-            return StyledDocPrinter.text(str, Style.keyword, alloc);
+            return P.text(str, Style.keyword, alloc);
         },
         .error_union => {
             if (value) |payload| {
@@ -113,8 +113,8 @@ fn prettyDepth(
                 const tag = std.meta.activeTag(value);
                 const tag_name = @tagName(tag);
                 const tag_str = try std.fmt.allocPrint(alloc, ".{{ .{s} = ", .{tag_name});
-                const open = try StyledDocPrinter.text(tag_str, Style.field_name, alloc);
-                const close = try StyledDocPrinter.text(" }", Style.punctuation, alloc);
+                const open = try P.text(tag_str, Style.field_name, alloc);
+                const close = try P.text(" }", Style.punctuation, alloc);
 
                 const field_doc = switch (value) {
                     inline else => |field_value| try prettyDepth(
@@ -127,24 +127,24 @@ fn prettyDepth(
                     ),
                 };
 
-                const tmp = try StyledDocPrinter.hcat(opts.max_width, open, field_doc, alloc);
-                return StyledDocPrinter.hcat(opts.max_width, tmp, close, alloc);
+                const tmp = try P.hcat(opts.max_width, open, field_doc, alloc);
+                return P.hcat(opts.max_width, tmp, close, alloc);
             } else switch (info.layout) {
                 .auto => {
-                    return StyledDocPrinter.text(".{ ... }", Style.punctuation, alloc);
+                    return P.text(".{ ... }", Style.punctuation, alloc);
                 },
                 .@"extern", .@"packed" => {
                     if (info.fields.len == 0) {
-                        return StyledDocPrinter.text(".{}", Style.punctuation, alloc);
+                        return P.text(".{}", Style.punctuation, alloc);
                     }
 
                     var fields = std.ArrayList(Doc){};
                     inline for (info.fields) |field| {
                         const field_name = try std.fmt.allocPrint(alloc, ".{s} = ", .{field.name});
-                        const name_box = try StyledDocPrinter.Box.text(field_name, Style.field_name, alloc);
+                        const name_box = try P.Box.text(field_name, Style.field_name, alloc);
                         const value_doc = try prettyDepth(is_comptime, field.type, @field(value, field.name), alloc, opts, depth + 1);
 
-                        var field_boxes = std.ArrayList(StyledDocPrinter.Box){};
+                        var field_boxes = std.ArrayList(P.Box){};
                         for (value_doc) |value_box| {
                             const field_box = try name_box.hcat(value_box, alloc);
                             try field_boxes.append(alloc, field_box);
@@ -152,11 +152,11 @@ fn prettyDepth(
                         try fields.append(alloc, try field_boxes.toOwnedSlice(alloc));
                     }
 
-                    const open_box = try StyledDocPrinter.Box.text(".{ ", Style.punctuation, alloc);
-                    const close_box = try StyledDocPrinter.Box.text(" }", Style.punctuation, alloc);
+                    const open_box = try P.Box.text(".{ ", Style.punctuation, alloc);
+                    const close_box = try P.Box.text(" }", Style.punctuation, alloc);
                     const joined = try joinWithCommas(opts.max_width, fields.items, alloc);
 
-                    var result = std.ArrayList(StyledDocPrinter.Box){};
+                    var result = std.ArrayList(P.Box){};
                     for (joined) |joined_box| {
                         var tmp1 = try open_box.hcat(joined_box, alloc);
                         const tmp2 = try tmp1.hcat(close_box, alloc);
@@ -185,17 +185,17 @@ fn prettyDepth(
                 .@"struct", .@"union", .@"enum" => return prettyDepth(is_comptime, @TypeOf(value.*), value.*, alloc, opts, depth),
                 else => {
                     const str = try std.fmt.allocPrint(alloc, "*{s}@{x}", .{ @typeName(ptr_info.child), @intFromPtr(value) });
-                    return StyledDocPrinter.text(str, Style.normal, alloc);
+                    return P.text(str, Style.normal, alloc);
                 },
             },
             else => {
                 const str = try std.fmt.allocPrint(alloc, "@{x}", .{@intFromPtr(value)});
-                return StyledDocPrinter.text(str, Style.normal, alloc);
+                return P.text(str, Style.normal, alloc);
             },
         },
         else => {
             const str = try std.fmt.allocPrint(alloc, "<{s}>", .{@typeName(T)});
-            return StyledDocPrinter.text(str, Style.type_name, alloc);
+            return P.text(str, Style.type_name, alloc);
         },
     }
 }
@@ -215,20 +215,20 @@ fn prettyString(value: []const u8, alloc: Allocator) !Doc {
         }
     }
     try buf.append(alloc, '"');
-    return StyledDocPrinter.text(try buf.toOwnedSlice(alloc), Style.string, alloc);
+    return P.text(try buf.toOwnedSlice(alloc), Style.string, alloc);
 }
 
 fn joinWithCommas(max_width: u16, docs: []const Doc, alloc: Allocator) !Doc {
     _ = max_width;
-    if (docs.len == 0) return StyledDocPrinter.text("", Style.normal, alloc);
+    if (docs.len == 0) return P.text("", Style.normal, alloc);
     if (docs.len == 1) return docs[0];
 
-    const comma_doc = try StyledDocPrinter.text(", ", Style.punctuation, alloc);
+    const comma_doc = try P.text(", ", Style.punctuation, alloc);
 
     // Build horizontal: elem1, elem2, elem3
     var h = docs[0];
     for (docs[1..]) |doc| {
-        var tmp = std.ArrayList(StyledDocPrinter.Box){};
+        var tmp = std.ArrayList(P.Box){};
         for (h) |h_box| {
             for (comma_doc) |comma_box| {
                 for (doc) |doc_box| {
@@ -242,10 +242,10 @@ fn joinWithCommas(max_width: u16, docs: []const Doc, alloc: Allocator) !Doc {
     }
 
     // Build vertical: elem1,\nelem2,\nelem3
-    const comma_only = try StyledDocPrinter.text(",", Style.punctuation, alloc);
+    const comma_only = try P.text(",", Style.punctuation, alloc);
     var v = docs[0];
     for (docs[1..]) |doc| {
-        var tmp = std.ArrayList(StyledDocPrinter.Box){};
+        var tmp = std.ArrayList(P.Box){};
         for (v) |v_box| {
             for (comma_only) |comma_box| {
                 for (doc) |doc_box| {
@@ -259,11 +259,11 @@ fn joinWithCommas(max_width: u16, docs: []const Doc, alloc: Allocator) !Doc {
     }
 
     // Combine candidates
-    var all = std.ArrayList(StyledDocPrinter.Box){};
+    var all = std.ArrayList(P.Box){};
     try all.appendSlice(alloc, h);
     try all.appendSlice(alloc, v);
 
-    return StyledDocPrinter.pareto(all.items, alloc);
+    return P.pareto(all.items, alloc);
 }
 
 fn prettyStruct(
@@ -276,17 +276,17 @@ fn prettyStruct(
     comptime info: std.builtin.Type.Struct,
 ) !Doc {
     if (info.fields.len == 0) {
-        return StyledDocPrinter.text(".{}", Style.punctuation, alloc);
+        return P.text(".{}", Style.punctuation, alloc);
     }
 
     var fields = std.ArrayList(Doc){};
 
     inline for (info.fields) |field| {
         const field_name = try std.fmt.allocPrint(alloc, ".{s} = ", .{field.name});
-        const name_box = try StyledDocPrinter.Box.text(field_name, @intFromEnum(Style.field_name), alloc);
+        const name_box = try P.Box.text(field_name, @intFromEnum(Style.field_name), alloc);
         const value_doc = try prettyDepth(is_comptime, field.type, @field(value, field.name), alloc, opts, depth + 1);
 
-        var field_boxes = std.ArrayList(StyledDocPrinter.Box){};
+        var field_boxes = std.ArrayList(P.Box){};
         for (value_doc) |value_box| {
             const field_box = try name_box.hcat(value_box, alloc);
             try field_boxes.append(alloc, field_box);
@@ -294,11 +294,11 @@ fn prettyStruct(
         try fields.append(alloc, try field_boxes.toOwnedSlice(alloc));
     }
 
-    const open_box = try StyledDocPrinter.Box.text(".{ ", @intFromEnum(Style.punctuation), alloc);
-    const close_box = try StyledDocPrinter.Box.text(" }", @intFromEnum(Style.punctuation), alloc);
+    const open_box = try P.Box.text(".{ ", @intFromEnum(Style.punctuation), alloc);
+    const close_box = try P.Box.text(" }", @intFromEnum(Style.punctuation), alloc);
     const joined = try joinWithCommas(opts.max_width, fields.items, alloc);
 
-    var result = std.ArrayList(StyledDocPrinter.Box){};
+    var result = std.ArrayList(P.Box){};
     for (joined) |joined_box| {
         var tmp1 = try open_box.hcat(joined_box, alloc);
         const tmp2 = try tmp1.hcat(close_box, alloc);
@@ -318,7 +318,7 @@ fn prettyTuple(
     comptime info: std.builtin.Type.Struct,
 ) !Doc {
     if (info.fields.len == 0) {
-        return StyledDocPrinter.text(".{}", .punctuation, alloc);
+        return P.text(".{}", .punctuation, alloc);
     }
 
     var elements = std.ArrayList(Doc){};
@@ -328,11 +328,11 @@ fn prettyTuple(
         try elements.append(alloc, elem_doc);
     }
 
-    const open_box = try StyledDocPrinter.Box.text(".{ ", .punctuation, alloc);
-    const close_box = try StyledDocPrinter.Box.text(" }", .punctuation, alloc);
+    const open_box = try P.Box.text(".{ ", .punctuation, alloc);
+    const close_box = try P.Box.text(" }", .punctuation, alloc);
     const joined = try joinWithCommas(opts.max_width, elements.items, alloc);
 
-    var result = std.ArrayList(StyledDocPrinter.Box){};
+    var result = std.ArrayList(P.Box){};
     for (joined) |joined_box| {
         var tmp1 = try open_box.hcat(joined_box, alloc);
         const tmp2 = try tmp1.hcat(close_box, alloc);
@@ -350,7 +350,7 @@ fn prettyArray(
     depth: u32,
 ) !Doc {
     if (value.len == 0) {
-        return StyledDocPrinter.text(".{}", .punctuation, alloc);
+        return P.text(".{}", .punctuation, alloc);
     }
 
     var elements = std.ArrayList(Doc){};
@@ -367,11 +367,11 @@ fn prettyArray(
         }
     }
 
-    const open_box = try StyledDocPrinter.Box.text(".{ ", .punctuation, alloc);
-    const close_box = try StyledDocPrinter.Box.text(" }", .punctuation, alloc);
+    const open_box = try P.Box.text(".{ ", @intFromEnum(Style.punctuation), alloc);
+    const close_box = try P.Box.text(" }", @intFromEnum(Style.punctuation), alloc);
     const joined = try joinWithCommas(opts.max_width, elements.items, alloc);
 
-    var result = std.ArrayList(StyledDocPrinter.Box){};
+    var result = std.ArrayList(P.Box){};
     for (joined) |joined_box| {
         var tmp1 = try open_box.hcat(joined_box, alloc);
         const tmp2 = try tmp1.hcat(close_box, alloc);
@@ -390,7 +390,7 @@ fn prettySlice(
     depth: u32,
 ) !Doc {
     if (value.len == 0) {
-        return StyledDocPrinter.text(".{}", .punctuation, alloc);
+        return P.text(".{}", Style.punctuation, alloc);
     }
 
     const child = @typeInfo(T).pointer.child;
@@ -409,11 +409,11 @@ fn prettySlice(
         }
     }
 
-    const open_box = try StyledDocPrinter.Box.text(".{ ", .punctuation, alloc);
-    const close_box = try StyledDocPrinter.Box.text(" }", .punctuation, alloc);
+    const open_box = try P.Box.text(".{ ", @intFromEnum(Style.punctuation), alloc);
+    const close_box = try P.Box.text(" }", @intFromEnum(Style.punctuation), alloc);
     const joined = try joinWithCommas(opts.max_width, elements.items, alloc);
 
-    var result = std.ArrayList(StyledDocPrinter.Box){};
+    var result = std.ArrayList(P.Box){};
     for (joined) |joined_box| {
         var tmp1 = try open_box.hcat(joined_box, alloc);
         const tmp2 = try tmp1.hcat(close_box, alloc);
@@ -435,7 +435,7 @@ pub fn print(
     const tmp = arena.allocator();
 
     const doc = try pretty(T, value, tmp, opts);
-    const result = (try StyledDocPrinter.renderPlain(doc, opts.max_width, tmp)) orelse "";
+    const result = (try P.renderPlain(doc, opts.max_width, tmp)) orelse "";
     return alloc.dupe(u8, result);
 }
 
@@ -453,13 +453,14 @@ pub fn printStyled(
     const tmp = arena.allocator();
 
     const doc = try pretty(T, value, tmp, opts);
-    const segments = (try StyledDocPrinter.renderSegments(doc, opts.max_width, tmp)) orelse return;
+    const segments = (try P.renderSegments(doc, opts.max_width, tmp)) orelse return;
 
     for (segments) |seg| {
-        if (printer.theme.get(seg.style)) |_| {
-            try printer.print(seg.style, "{s}", .{seg.text});
+        try writer.splatByteAll(' ', seg.tab);
+        if (printer.theme.get(@enumFromInt(seg.ink))) |_| {
+            try printer.print(@enumFromInt(seg.ink), "{s}", .{seg.txt});
         } else {
-            try writer.writeAll(seg.text);
+            try writer.writeAll(seg.txt);
         }
     }
 }
@@ -473,43 +474,43 @@ fn prettyDepthComptime(
     depth: u32,
 ) !Doc {
     if (depth >= opts.max_depth) {
-        return StyledDocPrinter.text("...", .normal, alloc);
+        return P.text("...", Style.normal, alloc);
     }
 
     switch (@typeInfo(T)) {
         .int, .comptime_int => {
             const str = try std.fmt.allocPrint(alloc, "{d}", .{value});
-            return StyledDocPrinter.text(str, .number, alloc);
+            return P.text(str, Style.number, alloc);
         },
         .float, .comptime_float => {
             const str = try std.fmt.allocPrint(alloc, "{d}", .{value});
-            return StyledDocPrinter.text(str, .number, alloc);
+            return P.text(str, Style.number, alloc);
         },
         .bool => {
-            return StyledDocPrinter.text(if (value) "true" else "false", .keyword, alloc);
+            return P.text(if (value) "true" else "false", Style.keyword, alloc);
         },
         .void => {
-            return StyledDocPrinter.text("void", .keyword, alloc);
+            return P.text("void", Style.keyword, alloc);
         },
         .type => {
-            return StyledDocPrinter.text(@typeName(value), .type_name, alloc);
+            return P.text(@typeName(value), Style.type_name, alloc);
         },
         .@"enum" => {
             const str = try std.fmt.allocPrint(alloc, ".{s}", .{@tagName(value)});
-            return StyledDocPrinter.text(str, .keyword, alloc);
+            return P.text(str, Style.keyword, alloc);
         },
         .enum_literal => {
             const str = try std.fmt.allocPrint(alloc, ".{s}", .{@tagName(value)});
-            return StyledDocPrinter.text(str, .keyword, alloc);
+            return P.text(str, Style.keyword, alloc);
         },
         .null => {
-            return StyledDocPrinter.text("null", .keyword, alloc);
+            return P.text("null", Style.keyword, alloc);
         },
         .optional => {
             if (value) |payload| {
                 return prettyDepthComptime(@TypeOf(payload), payload, alloc, opts, depth);
             } else {
-                return StyledDocPrinter.text("null", .keyword, alloc);
+                return P.text("null", Style.keyword, alloc);
             }
         },
         .@"struct" => |info| {
@@ -524,8 +525,8 @@ fn prettyDepthComptime(
                 const tag = std.meta.activeTag(value);
                 const tag_name = @tagName(tag);
                 const tag_str = try std.fmt.allocPrint(alloc, ".{{ .{s} = ", .{tag_name});
-                const open = try StyledDocPrinter.text(tag_str, .field_name, alloc);
-                const close = try StyledDocPrinter.text(" }", .punctuation, alloc);
+                const open = try P.text(tag_str, Style.field_name, alloc);
+                const close = try P.text(" }", Style.punctuation, alloc);
 
                 const field_doc = switch (value) {
                     inline else => |field_value| try prettyDepthComptime(
@@ -537,10 +538,10 @@ fn prettyDepthComptime(
                     ),
                 };
 
-                const tmp = try StyledDocPrinter.hcat(opts.max_width, open, field_doc, alloc);
-                return StyledDocPrinter.hcat(opts.max_width, tmp, close, alloc);
+                const tmp = try P.hcat(opts.max_width, open, field_doc, alloc);
+                return P.hcat(opts.max_width, tmp, close, alloc);
             } else {
-                return StyledDocPrinter.text(".{ ... }", .punctuation, alloc);
+                return P.text(".{ ... }", Style.punctuation, alloc);
             }
         },
         .array => |info| {
@@ -561,17 +562,17 @@ fn prettyDepthComptime(
                 .@"struct", .@"union", .@"enum" => return prettyDepthComptime(@TypeOf(value.*), value.*, alloc, opts, depth),
                 else => {
                     const str = try std.fmt.allocPrint(alloc, "*{s}@{x}", .{ @typeName(ptr_info.child), @intFromPtr(value) });
-                    return StyledDocPrinter.text(str, .normal, alloc);
+                    return P.text(str, Style.normal, alloc);
                 },
             },
             else => {
                 const str = try std.fmt.allocPrint(alloc, "@{x}", .{@intFromPtr(value)});
-                return StyledDocPrinter.text(str, .normal, alloc);
+                return P.text(str, Style.normal, alloc);
             },
         },
         else => {
             const str = try std.fmt.allocPrint(alloc, "<{s}>", .{@typeName(T)});
-            return StyledDocPrinter.text(str, .type_name, alloc);
+            return P.text(str, Style.type_name, alloc);
         },
     }
 }
@@ -585,17 +586,17 @@ fn prettyStructComptime(
     comptime info: std.builtin.Type.Struct,
 ) !Doc {
     if (info.fields.len == 0) {
-        return StyledDocPrinter.text(".{}", .punctuation, alloc);
+        return P.text(".{}", Style.punctuation, alloc);
     }
 
     var fields = std.ArrayList(Doc){};
 
     inline for (info.fields) |field| {
         const field_name = try std.fmt.allocPrint(alloc, ".{s} = ", .{field.name});
-        const name_box = try StyledDocPrinter.Box.text(field_name, .field_name, alloc);
+        const name_box = try P.Box.text(field_name, @intFromEnum(Style.field_name), alloc);
         const value_doc = try prettyDepthComptime(field.type, @field(value, field.name), alloc, opts, depth + 1);
 
-        var field_boxes = std.ArrayList(StyledDocPrinter.Box){};
+        var field_boxes = std.ArrayList(P.Box){};
         for (value_doc) |value_box| {
             const field_box = try name_box.hcat(value_box, alloc);
             try field_boxes.append(alloc, field_box);
@@ -603,11 +604,11 @@ fn prettyStructComptime(
         try fields.append(alloc, try field_boxes.toOwnedSlice(alloc));
     }
 
-    const open_box = try StyledDocPrinter.Box.text(".{ ", .punctuation, alloc);
-    const close_box = try StyledDocPrinter.Box.text(" }", .punctuation, alloc);
+    const open_box = try P.Box.text(".{ ", @intFromEnum(Style.punctuation), alloc);
+    const close_box = try P.Box.text(" }", @intFromEnum(Style.punctuation), alloc);
     const joined = try joinWithCommas(opts.max_width, fields.items, alloc);
 
-    var result = std.ArrayList(StyledDocPrinter.Box){};
+    var result = std.ArrayList(P.Box){};
     for (joined) |joined_box| {
         var tmp1 = try open_box.hcat(joined_box, alloc);
         const tmp2 = try tmp1.hcat(close_box, alloc);
@@ -626,7 +627,7 @@ fn prettyTupleComptime(
     comptime info: std.builtin.Type.Struct,
 ) !Doc {
     if (info.fields.len == 0) {
-        return StyledDocPrinter.text(".{}", .punctuation, alloc);
+        return P.text(".{}", .punctuation, alloc);
     }
 
     var elements = std.ArrayList(Doc){};
@@ -636,11 +637,11 @@ fn prettyTupleComptime(
         try elements.append(alloc, elem_doc);
     }
 
-    const open_box = try StyledDocPrinter.Box.text(".{ ", .punctuation, alloc);
-    const close_box = try StyledDocPrinter.Box.text(" }", .punctuation, alloc);
+    const open_box = try P.Box.text(".{ ", .punctuation, alloc);
+    const close_box = try P.Box.text(" }", .punctuation, alloc);
     const joined = try joinWithCommas(opts.max_width, elements.items, alloc);
 
-    var result = std.ArrayList(StyledDocPrinter.Box){};
+    var result = std.ArrayList(P.Box){};
     for (joined) |joined_box| {
         var tmp1 = try open_box.hcat(joined_box, alloc);
         const tmp2 = try tmp1.hcat(close_box, alloc);
@@ -657,7 +658,7 @@ fn prettyArrayComptime(
     depth: u32,
 ) !Doc {
     if (value.len == 0) {
-        return StyledDocPrinter.text(".{}", .punctuation, alloc);
+        return P.text(".{}", .punctuation, alloc);
     }
 
     var elements = std.ArrayList(Doc){};
@@ -667,11 +668,11 @@ fn prettyArrayComptime(
         try elements.append(alloc, elem_doc);
     }
 
-    const open_box = try StyledDocPrinter.Box.text(".{ ", .punctuation, alloc);
-    const close_box = try StyledDocPrinter.Box.text(" }", .punctuation, alloc);
+    const open_box = try P.Box.text(".{ ", .punctuation, alloc);
+    const close_box = try P.Box.text(" }", .punctuation, alloc);
     const joined = try joinWithCommas(opts.max_width, elements.items, alloc);
 
-    var result = std.ArrayList(StyledDocPrinter.Box){};
+    var result = std.ArrayList(P.Box){};
     for (joined) |joined_box| {
         var tmp1 = try open_box.hcat(joined_box, alloc);
         const tmp2 = try tmp1.hcat(close_box, alloc);
@@ -689,7 +690,7 @@ fn prettySliceComptime(
     depth: u32,
 ) !Doc {
     if (value.len == 0) {
-        return StyledDocPrinter.text(".{}", .punctuation, alloc);
+        return P.text(".{}", Style.punctuation, alloc);
     }
 
     const child = @typeInfo(T).pointer.child;
@@ -701,11 +702,11 @@ fn prettySliceComptime(
         try elements.append(alloc, elem_doc);
     }
 
-    const open_box = try StyledDocPrinter.Box.text(".{ ", .punctuation, alloc);
-    const close_box = try StyledDocPrinter.Box.text(" }", .punctuation, alloc);
+    const open_box = try P.Box.text(".{ ", @intFromEnum(Style.punctuation), alloc);
+    const close_box = try P.Box.text(" }", @intFromEnum(Style.punctuation), alloc);
     const joined = try joinWithCommas(opts.max_width, elements.items, alloc);
 
-    var result = std.ArrayList(StyledDocPrinter.Box){};
+    var result = std.ArrayList(P.Box){};
     for (joined) |joined_box| {
         var tmp1 = try open_box.hcat(joined_box, alloc);
         const tmp2 = try tmp1.hcat(close_box, alloc);

@@ -94,18 +94,19 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-const Style = usize;
+const Ink = usize;
 
-/// A styled text segment
-pub const Segment = struct {
-    text: []const u8,
-    style: Style = 0,
+/// A snippet of text with style and indentation
+pub const Run = struct {
+    txt: []const u8 = "",
+    ink: Ink = 0,
+    tab: u16 = 0,
 };
 
 /// A layout candidate with metrics and styled content
 pub const Box = struct {
-    /// Text lines, each line is a list of styled segments
-    txt: std.ArrayList(std.ArrayList(Segment)) = .empty,
+    /// Text lines
+    txt: std.ArrayList(std.ArrayList(Run)) = .empty,
     /// Number of complete lines (not counting final)
     len: u16 = 0,
     /// Length of final incomplete line
@@ -113,17 +114,17 @@ pub const Box = struct {
     /// Maximum line length across all lines
     max: u16,
 
-    pub fn text(bytes: []const u8, style: Style, alloc: Allocator) !Box {
-        var line = std.ArrayList(Segment){};
-        try line.append(alloc, Segment{ .text = bytes, .style = style });
+    pub fn text(str: []const u8, ink: Ink, gpa: Allocator) !Box {
+        var line = std.ArrayList(Run){};
+        try line.append(gpa, Run{ .txt = str, .ink = ink });
 
-        var txt = std.ArrayList(std.ArrayList(Segment)){};
-        try txt.append(alloc, line);
+        var txt = std.ArrayList(std.ArrayList(Run)){};
+        try txt.append(gpa, line);
 
         return .{
             .txt = txt,
-            .fin = @intCast(bytes.len),
-            .max = @intCast(bytes.len),
+            .fin = @intCast(str.len),
+            .max = @intCast(str.len),
         };
     }
 
@@ -134,21 +135,16 @@ pub const Box = struct {
 
     pub fn indent(self: Box, n: u16, alloc: Allocator) !Box {
         var result = Box{
-            .txt = std.ArrayList(std.ArrayList(Segment)){},
+            .txt = std.ArrayList(std.ArrayList(Run)){},
             .len = self.len,
             .fin = self.fin + n,
             .max = self.max + n,
         };
 
         for (self.txt.items) |line| {
-            var new_line = std.ArrayList(Segment){};
-            // Add indent as normal-styled spaces
-            if (n > 0) {
-                const spaces = try alloc.alloc(u8, n);
-                @memset(spaces, ' ');
-                try new_line.append(alloc, Segment{ .text = spaces, .style = .normal });
-            }
-            // Copy existing segments
+            var new_line = std.ArrayList(Run){};
+            if (n > 0)
+                try new_line.append(alloc, Run{ .tab = n, .ink = .normal });
             try new_line.appendSlice(alloc, line.items);
             try result.txt.append(alloc, new_line);
         }
@@ -164,7 +160,7 @@ pub const Box = struct {
         };
 
         try result.txt.appendSlice(alloc, self.txt.items);
-        try result.txt.append(alloc, std.ArrayList(Segment){});
+        try result.txt.append(alloc, std.ArrayList(Run){});
 
         return result;
     }
@@ -178,7 +174,7 @@ pub const Box = struct {
 
         // Copy a's complete lines
         for (a.txt.items[0..a.len]) |line| {
-            var new_line = std.ArrayList(Segment){};
+            var new_line = std.ArrayList(Run){};
             try new_line.appendSlice(alloc, line.items);
             try result.txt.append(alloc, new_line);
         }
@@ -187,19 +183,16 @@ pub const Box = struct {
         const last_a = a.txt.items[a.len];
         const first_b = b.txt.items[0];
 
-        var merged = std.ArrayList(Segment){};
+        var merged = std.ArrayList(Run){};
         try merged.appendSlice(alloc, last_a.items);
         try merged.appendSlice(alloc, first_b.items);
         try result.txt.append(alloc, merged);
 
         // Copy b's remaining lines, indented by a's final width
         for (b.txt.items[1 .. b.len + 1]) |line| {
-            var new_line = std.ArrayList(Segment){};
-            // Add indent
+            var new_line = std.ArrayList(Run){};
             if (a.fin > 0) {
-                const spaces = try alloc.alloc(u8, a.fin);
-                @memset(spaces, ' ');
-                try new_line.append(alloc, Segment{ .text = spaces });
+                try new_line.append(alloc, Run{ .tab = a.fin });
             }
             try new_line.appendSlice(alloc, line.items);
             try result.txt.append(alloc, new_line);
@@ -218,12 +211,12 @@ pub const Box = struct {
     }
 
     /// Render to segments (for styled output)
-    pub fn renderSegments(self: Box, alloc: Allocator) ![]const Segment {
-        var result = std.ArrayList(Segment){};
+    pub fn renderSegments(self: Box, alloc: Allocator) ![]const Run {
+        var result = std.ArrayList(Run){};
 
         for (self.txt.items, 0..) |line, i| {
             if (i > 0) {
-                try result.append(alloc, Segment{ .text = "\n" });
+                try result.append(alloc, Run{ .txt = "\n" });
             }
             try result.appendSlice(alloc, line.items);
         }
@@ -238,7 +231,8 @@ pub const Box = struct {
         for (self.txt.items, 0..) |line, i| {
             if (i > 0) try result.append(alloc, '\n');
             for (line.items) |seg| {
-                try result.appendSlice(alloc, seg.text);
+                try result.appendNTimes(alloc, ' ', seg.tab);
+                try result.appendSlice(alloc, seg.txt);
             }
         }
 
@@ -335,7 +329,7 @@ fn selectBest(max_width: u16, a: Box, b: Box) bool {
 }
 
 /// Render document to styled segments (picks best layout)
-pub fn renderSegments(doc: Doc, max_width: u16, alloc: Allocator) !?[]const Segment {
+pub fn renderSegments(doc: Doc, max_width: u16, alloc: Allocator) !?[]const Run {
     if (std.sort.min(Box, doc, max_width, selectBest)) |best| {
         return try best.renderSegments(alloc);
     }
@@ -373,6 +367,6 @@ test "styled text" {
 
     // Should have 2 segments
     try std.testing.expectEqual(@as(usize, 2), segs.len);
-    try std.testing.expectEqual(@intFromEnum(S.a), segs[0].style);
-    try std.testing.expectEqual(@intFromEnum(S.b), segs[1].style);
+    try std.testing.expectEqual(@intFromEnum(S.a), segs[0].ink);
+    try std.testing.expectEqual(@intFromEnum(S.b), segs[1].ink);
 }

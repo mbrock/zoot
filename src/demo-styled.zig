@@ -149,14 +149,15 @@ pub fn main() !void {
             tmp,
             .{ .max_width = WIDTH, .max_depth = 10 },
         );
-        const StyledDocPrinter = zoot.StyledDocPrinter(zoot.StructPrinter.Style);
+        const StyledDocPrinter = zoot.StyledDocPrinter;
         const segments = (try StyledDocPrinter.renderSegments(doc, WIDTH, tmp)) orelse return;
 
         for (segments) |seg| {
-            if (color.theme.get(seg.style)) |_| {
-                try color.print(seg.style, "{s}", .{seg.text});
+            try writer.splatByteAll(' ', seg.tab);
+            if (color.theme.get(@enumFromInt(seg.ink))) |_| {
+                try color.print(@enumFromInt(seg.ink), "{s}", .{seg.txt});
             } else {
-                try writer.writeAll(seg.text);
+                try writer.writeAll(seg.txt);
             }
         }
     }
