@@ -235,131 +235,105 @@ const F2 = struct {
 /// whether as the "ASCII sidekick" or a standalone rune.
 ///
 /// TODO: Allow ␤ as the first or last `u7` in an ASCII quad.
-pub const Text = packed struct {
-    kind: enum(u1) { pool, tiny },
-    data: packed union {
-        /// pooled string with optional ASCII sidekick; 29 bits
-        pool: packed struct {
-            /// whether `char` is prefix or postfix
-            side: enum(u1) { l, r } = .l,
-            /// optional extra ASCII char
-            char: u7 = 0,
-            /// index into the string pool
-            text: u21,
+pub const NodeKind = enum(u1) { text, oper };
+pub const TextKind = enum(u1) { pool, tiny };
+pub const TinyKind = enum(u1) { reps, quad };
+pub const RepsKind = enum(u1) { utf8, rune };
+pub const PoolSide = enum(u1) { lchr, rchr };
+pub const OperKind = enum(u1) { plus, fork };
 
-            fn emitSidekick(char: u7, show: *Show) !void {
-                if (char == '\n')
-                    try show.newline()
-                else {
-                    try show.sink.writeByte(char);
-                    show.head +|= 1;
-                }
-            }
+pub const Span = packed struct {
+    kind: NodeKind = .text,
+    spam: u1 = 0,
+    text_kind: TextKind = .pool,
+    side: PoolSide = .lchr,
+    char: u7 = 0,
+    text: u21 = 0,
 
-            pub fn emit(this: @This(), show: *Show) !void {
-                if (this.char != 0 and this.side == .l)
-                    try emitSidekick(this.char, show);
-
-                try show.writeString(this.text);
-
-                if (this.char != 0 and this.side == .r)
-                    try emitSidekick(this.char, show);
-            }
-        },
-
-        /// immediate text representation; 29 bits
-        tiny: packed struct {
-            kind: enum(u1) { splat, ascii },
-            data: packed union {
-                /// variable-length splat of Unicode
-                splat: packed struct {
-                    kind: enum(u1) { utf8, rune },
-                    data: packed union {
-                        /// three-byte UTF-8 sequence repeated up to 8 times
-                        utf8: packed struct {
-                            reps: u3,
-                            utf8: @Vector(3, u8),
-
-                            pub fn emit(this: @This(), show: *Show) !void {
-                                _ = this;
-                                _ = show;
-                                return error.Unimplemented;
-                            }
-                        },
-
-                        /// 21-bit Unicode codepoint repeated up to 63 times;
-                        /// canonical empty node when zero
-                        rune: packed struct {
-                            reps: u6 = 0,
-                            code: u21 = 0,
-
-                            pub fn emit(this: @This(), show: *Show) !void {
-                                if (this.reps == 0)
-                                    return
-                                else if (this.code == '\n') {
-                                    for (0..this.reps) |_|
-                                        try show.newline();
-                                } else {
-                                    var buffer: [4]u8 = undefined;
-                                    const n = std.unicode.utf8Encode(this.code, &buffer) catch 0;
-                                    var data = [1][]const u8{buffer[0..n]};
-                                    try show.sink.writeSplatAll(&data, this.reps);
-                                    show.head +|= @intCast(n * this.reps);
-                                }
-                            }
-                        },
-                    },
-
-                    pub fn isEmptyText(this: @This()) bool {
-                        return this.kind == .rune and this.data.rune.reps == 0;
-                    }
-
-                    pub fn emit(this: @This(), show: *Show) !void {
-                        switch (this.kind) {
-                            .utf8 => try this.data.utf8.emit(show),
-                            .rune => try this.data.rune.emit(show),
-                        }
-                    }
-                },
-
-                /// four ASCII bytes
-                ascii: packed struct {
-                    chrs: @Vector(4, u7) = @splat(0),
-
-                    pub fn emit(this: @This(), show: *Show) !void {
-                        for (0..4) |i| {
-                            const c = this.chrs[i];
-                            if (c == 0) break else {
-                                try show.sink.writeByte(c);
-                                show.head +|= 1;
-                            }
-                        }
-                    }
-                },
-            },
-
-            pub fn isEmptyText(this: @This()) bool {
-                return this.kind == .splat and this.data.splat.isEmptyText();
-            }
-
-            pub fn emit(this: @This(), show: *Show) !void {
-                switch (this.kind) {
-                    .splat => try this.data.splat.emit(show),
-                    .ascii => try this.data.ascii.emit(show),
-                }
-            }
-        },
-    },
-
-    pub fn isEmptyText(this: @This()) bool {
-        return this.kind == .tiny and this.data.tiny.isEmptyText();
+    fn emitSidekick(char: u7, show: *Show) !void {
+        if (char == '\n')
+            try show.newline()
+        else {
+            try show.sink.writeByte(char);
+            show.head +|= 1;
+        }
     }
 
-    pub fn emit(this: @This(), show: *Show) !void {
-        switch (this.kind) {
-            .pool => try this.data.pool.emit(show),
-            .tiny => try this.data.tiny.emit(show),
+    pub fn emit(this: Span, show: *Show) !void {
+        if (this.char != 0 and this.side == .lchr)
+            try emitSidekick(this.char, show);
+
+        try show.writeString(this.text);
+
+        if (this.char != 0 and this.side == .rchr)
+            try emitSidekick(this.char, show);
+    }
+};
+
+pub const Quad = packed struct {
+    kind: NodeKind = .text,
+    spam: u1 = 0,
+    text_kind: TextKind = .tiny,
+    tiny_kind: TinyKind = .quad,
+    ch0: u7 = 0,
+    ch1: u7 = 0,
+    ch2: u7 = 0,
+    ch3: u7 = 0,
+
+    pub fn emit(this: Quad, show: *Show) !void {
+        const chars = [_]u7{ this.ch0, this.ch1, this.ch2, this.ch3 };
+        for (chars) |c| {
+            if (c == 0) break;
+            try show.sink.writeByte(c);
+            show.head +|= 1;
         }
+    }
+};
+
+pub const Trip = packed struct {
+    kind: NodeKind = .text,
+    spam: u1 = 0,
+    text_kind: TextKind = .tiny,
+    tiny_kind: TinyKind = .reps,
+    splat_kind: RepsKind = .utf8,
+    reps: u3 = 0,
+    byte0: u8 = 0,
+    byte1: u8 = 0,
+    byte2: u8 = 0,
+
+    pub fn emit(this: Trip, show: *Show) !void {
+        _ = this;
+        _ = show;
+        return error.Unimplemented;
+    }
+};
+
+pub const Rune = packed struct {
+    kind: NodeKind = .text,
+    spam: u1 = 0,
+    text_kind: TextKind = .tiny,
+    tiny_kind: TinyKind = .reps,
+    splat_kind: RepsKind = .rune,
+    reps: u6 = 0,
+    code: u21 = 0,
+
+    pub fn emit(this: Rune, show: *Show) !void {
+        if (this.reps == 0) return;
+
+        if (this.code == '\n') {
+            for (0..this.reps) |_| try show.newline();
+            return;
+        }
+
+        var buffer: [4]u8 = undefined;
+        const n = std.unicode.utf8Encode(this.code, &buffer) catch 0;
+        var data = [1][]const u8{buffer[0..n]};
+        try show.sink.writeSplatAll(&data, this.reps);
+        show.head +|= @intCast(n * this.reps);
+    }
+
+    pub fn isEmpty(this: Rune) bool {
+        return this.reps == 0;
     }
 };
 
@@ -373,17 +347,15 @@ pub const Frob = packed struct {
     nest: u6 = 0,
 };
 
-/// binary operation handle with optional column tweak; 30 bits
 pub const Oper = packed struct {
-    /// which binary operation?
-    kind: enum(u1) { plus, fork },
-    /// column frob settings
+    kind: NodeKind = .oper,
+    spam: u1 = 0,
+    oper: OperKind,
     frob: Frob = .{},
-    /// index into either plus or fork list
-    what: u21,
+    item: u21,
 
-    pub fn emit(this: @This(), show: *Show) !void {
-        switch (this.kind) {
+    pub fn emit(this: Oper, show: *Show) !void {
+        switch (this.oper) {
             .plus => {
                 const saveflat = show.flat;
                 defer show.flat = saveflat;
@@ -392,12 +364,9 @@ pub const Oper = packed struct {
                 const save_base = show.base;
                 defer show.base = save_base;
 
-                // Handle warp (align): set base to current column
-                if (this.frob.warp == 1) {
+                if (this.frob.warp == 1)
                     show.base = show.head;
-                }
 
-                // Handle nest: add indent to base
                 if (this.frob.nest != 0) {
                     const addend: u16 = @intCast(this.frob.nest);
                     const widened = @as(u32, show.base) + @as(u32, addend);
@@ -405,7 +374,7 @@ pub const Oper = packed struct {
                     show.base = @intCast(@min(widened, limit));
                 }
 
-                const args = show.tree.heap.plus.items[this.what];
+                const args = show.tree.heap.plus.items[this.item];
                 try args.a.emit(show);
                 try args.b.emit(show);
             },
@@ -414,54 +383,179 @@ pub const Oper = packed struct {
     }
 };
 
-/// handle to either terminal or binary operation; 32 bits
+/// 32-bit handle to either terminal or operation; implicitly indexes
+/// into some `Tree` aggregate.
 pub const Node = packed struct {
-    kind: enum(u1) { text, oper },
+    kind: NodeKind,
     spam: u1 = 0,
-    data: packed union { text: Text, oper: Oper },
+    bits: u30 = 0,
 
-    pub fn isEmptyText(this: Node) bool {
-        return this.kind == .text and this.data.text.isEmptyText();
-    }
+    pub const Form = enum {
+        /// slab skip, 1x C string offset + 1x ASCII prefix/postfix
+        span,
+        /// text word, 4x ASCII characters
+        quad,
+        /// text word, 3x UTF-8 bytes * u3 repeat
+        trip,
+        /// text word, 1x U21 codepoint * u6 repeat
+        rune,
+        /// heap cell, 2x nodes, append semantics
+        cons,
+        /// heap cell, 2x nodes, choice semantics
+        fork,
+    };
 
-    pub fn emit(this: @This(), show: *Show) error{
-        WriteFailed,
-        Unimplemented,
-    }!void {
-        switch (this.kind) {
-            .text => try this.data.text.emit(show),
-            .oper => try this.data.oper.emit(show),
-        }
-    }
+    const TextDiscriminants = packed struct {
+        kind: NodeKind,
+        spam: u1,
+        text: TextKind,
+        tiny: TinyKind,
+        reps: RepsKind,
+        rest: u27 = 0,
+    };
 
-    pub fn repr(this: @This()) u32 {
+    const OperDiscriminants = packed struct {
+        kind: NodeKind,
+        spam: u1,
+        oper: OperKind,
+        rest: u29 = 0,
+    };
+
+    fn viewConst(comptime T: type, this: Node) T {
         return @bitCast(this);
     }
 
-    pub const nl: Node = .{
-        .kind = .text,
-        .data = .{
-            .text = .{
-                .kind = .tiny,
-                .data = .{
-                    .tiny = .{
-                        .kind = .splat,
-                        .data = .{
-                            .splat = .{
-                                .kind = .rune,
-                                .data = .{
-                                    .rune = .{
-                                        .reps = 1,
-                                        .code = '\n',
-                                    },
-                                },
-                            },
-                        },
-                    },
-                },
+    fn viewMut(comptime T: type, this: *Node) *T {
+        return @ptrCast(@alignCast(this));
+    }
+
+    pub fn classify(this: Node) Form {
+        return switch (this.kind) {
+            .text => blk: {
+                const d = viewConst(TextDiscriminants, this);
+                if (d.text == .pool) break :blk .span;
+                if (d.tiny == .quad) break :blk .quad;
+                break :blk if (d.reps == .utf8) .trip else .rune;
             },
-        },
-    };
+            .oper => blk: {
+                const d = viewConst(OperDiscriminants, this);
+                break :blk if (d.oper == .plus) .cons else .fork;
+            },
+        };
+    }
+
+    pub fn asTextPool(this: Node) Span {
+        return viewConst(Span, this);
+    }
+
+    pub fn asTextPoolMut(this: *Node) *Span {
+        return viewMut(Span, this);
+    }
+
+    pub fn asTinyAscii(this: Node) Quad {
+        return viewConst(Quad, this);
+    }
+
+    pub fn asTinyAsciiMut(this: *Node) *Quad {
+        return viewMut(Quad, this);
+    }
+
+    pub fn asTinyUtf8(this: Node) Trip {
+        return viewConst(Trip, this);
+    }
+
+    pub fn asTinyUtf8Mut(this: *Node) *Trip {
+        return viewMut(Trip, this);
+    }
+
+    pub fn asTinyRune(this: Node) Rune {
+        return viewConst(Rune, this);
+    }
+
+    pub fn asTinyRuneMut(this: *Node) *Rune {
+        return viewMut(Rune, this);
+    }
+
+    pub fn asOper(this: Node) Oper {
+        return viewConst(Oper, this);
+    }
+
+    pub fn asOperMut(this: *Node) *Oper {
+        return viewMut(Oper, this);
+    }
+
+    pub fn isEmptyText(this: Node) bool {
+        return switch (this.classify()) {
+            .rune => this.asTinyRune().isEmpty(),
+            else => false,
+        };
+    }
+
+    pub fn emit(this: Node, show: *Show) error{
+        WriteFailed,
+        Unimplemented,
+    }!void {
+        switch (this.classify()) {
+            .span => try this.asTextPool().emit(show),
+            .quad => try this.asTinyAscii().emit(show),
+            .trip => try this.asTinyUtf8().emit(show),
+            .rune => try this.asTinyRune().emit(show),
+            .cons => try this.asOper().emit(show),
+            .fork => try this.asOper().emit(show),
+        }
+    }
+
+    pub fn repr(this: Node) u32 {
+        return @bitCast(this);
+    }
+
+    pub fn fromTextPool(side: PoolSide, char: u7, text: u21) Node {
+        const view: Span = .{
+            .side = side,
+            .char = char,
+            .text = text,
+        };
+        return @bitCast(view);
+    }
+
+    pub fn fromTinyAscii(chars: [4]u7) Node {
+        const view: Quad = .{
+            .ch0 = chars[0],
+            .ch1 = chars[1],
+            .ch2 = chars[2],
+            .ch3 = chars[3],
+        };
+        return @bitCast(view);
+    }
+
+    pub fn fromTinyUtf8(reps: u3, bytes: [3]u8) Node {
+        const view: Trip = .{
+            .reps = reps,
+            .byte0 = bytes[0],
+            .byte1 = bytes[1],
+            .byte2 = bytes[2],
+        };
+        return @bitCast(view);
+    }
+
+    pub fn fromTinyRune(reps: u6, code: u21) Node {
+        const view: Rune = .{
+            .reps = reps,
+            .code = code,
+        };
+        return @bitCast(view);
+    }
+
+    pub fn fromOper(kind: OperKind, frob: Frob, what: u21) Node {
+        const view: Oper = .{
+            .oper = kind,
+            .frob = frob,
+            .item = what,
+        };
+        return @bitCast(view);
+    }
+
+    pub const nl: Node = Node.fromTinyRune(1, '\n');
 };
 
 /// two node handles; 64 bits
@@ -506,37 +600,25 @@ pub const Tree = struct {
 
     pub fn flat(tree: *Tree, lhs: Node) !Node {
         _ = tree;
-        switch (lhs.kind) {
-            .text => {
-                var new = lhs;
-                switch (new.data.text.kind) {
-                    .pool => {
-                        var pooled = &new.data.text.data.pool;
-                        if (pooled.char == '\n')
-                            pooled.char = ' ';
-                    },
-                    .tiny => {
-                        var tiny = &new.data.text.data.tiny;
-                        switch (tiny.kind) {
-                            .splat => {
-                                var splat = &tiny.data.splat;
-                                switch (splat.kind) {
-                                    .utf8 => {},
-                                    .rune => {
-                                        if (splat.data.rune.code == '\n')
-                                            splat.data.rune.code = ' ';
-                                    },
-                                }
-                            },
-                            .ascii => {},
-                        }
-                    },
-                }
+        var new = lhs;
+        switch (new.classify()) {
+            .span => {
+                var pool = new.asTextPoolMut();
+                if (pool.char == '\n')
+                    pool.char = ' ';
                 return new;
             },
-            .oper => {
-                var new = lhs;
-                new.data.oper.frob.flat = 1;
+            .quad => return new,
+            .trip => return new,
+            .rune => {
+                var rune = new.asTinyRuneMut();
+                if (rune.code == '\n')
+                    rune.code = ' ';
+                return new;
+            },
+            .cons, .fork => {
+                var oper = new.asOperMut();
+                oper.frob.flat = 1;
                 return new;
             },
         }
@@ -554,13 +636,14 @@ pub const Tree = struct {
         if (indent == 0)
             return doc;
 
-        switch (doc.kind) {
-            .text => return doc,
-            .oper => {
-                var new = doc;
-                new.data.oper.frob.nest +|= indent;
+        var new = doc;
+        switch (new.classify()) {
+            .cons, .fork => {
+                var oper = new.asOperMut();
+                oper.frob.nest +|= indent;
                 return new;
             },
+            else => return doc,
         }
     }
 
@@ -573,13 +656,13 @@ pub const Tree = struct {
     ///     ...DDDDDD
     ///     ...DDD
     pub fn warp(tree: *Tree, doc: Node) !Node {
-        switch (doc.kind) {
-            .oper => {
+        switch (doc.classify()) {
+            .cons, .fork => {
                 var new = doc;
-                new.data.oper.frob.warp = 1;
+                new.asOperMut().frob.warp = 1;
                 return new;
             },
-            .text => if (doc.isEmptyText())
+            .span, .quad, .trip, .rune => if (doc.isEmptyText())
                 return doc
             else {
                 const oper = try tree.plus(doc, try tree.text(""));
@@ -599,10 +682,10 @@ pub const Tree = struct {
 
         if (rhs.repr() == nl_repr and lhs.kind == .text) {
             var fused = lhs;
-            if (fused.data.text.kind == .pool) {
-                var pool = &fused.data.text.data.pool;
+            if (fused.classify() == .span) {
+                var pool = fused.asTextPoolMut();
                 if (pool.char == 0) {
-                    pool.side = .r;
+                    pool.side = .rchr;
                     pool.char = '\n';
                     return fused;
                 }
@@ -611,10 +694,10 @@ pub const Tree = struct {
 
         if (lhs.repr() == nl_repr and rhs.kind == .text) {
             var fused = rhs;
-            if (fused.data.text.kind == .pool) {
-                var pool = &fused.data.text.data.pool;
+            if (fused.classify() == .span) {
+                var pool = fused.asTextPoolMut();
                 if (pool.char == 0) {
-                    pool.side = .l;
+                    pool.side = .lchr;
                     pool.char = '\n';
                     return fused;
                 }
@@ -627,29 +710,13 @@ pub const Tree = struct {
 
         const next: u21 = @intCast(tree.heap.plus.items.len);
         try tree.heap.plus.append(tree.alloc, .{ .a = lhs, .b = rhs });
-        return .{
-            .kind = .oper,
-            .data = .{
-                .oper = .{
-                    .kind = .plus,
-                    .what = next,
-                },
-            },
-        };
+        return Node.fromOper(.plus, .{}, next);
     }
 
     pub fn fork(tree: *Tree, lhs: Node, rhs: Node) !Node {
         const next: u21 = @intCast(tree.heap.fork.items.len);
         try tree.heap.fork.append(tree.alloc, .{ .a = lhs, .b = rhs });
-        return .{
-            .kind = .oper,
-            .data = .{
-                .oper = .{
-                    .kind = .fork,
-                    .what = next,
-                },
-            },
-        };
+        return Node.fromOper(.fork, .{}, next);
     }
 
     /// Concatenate multiple nodes in sequence
@@ -714,11 +781,10 @@ pub const Tree = struct {
 
         // If text() didn't point to our new string, rewind the slab
         // (either it found a duplicate, or it made a tiny immediate node)
-        const should_rewind = switch (node.kind) {
-            .text => switch (node.data.text.kind) {
-                .pool => node.data.text.data.pool.text != start_len,
-                .tiny => true,
-            },
+        const start_index: u21 = @intCast(start_len);
+        const should_rewind = switch (node.classify()) {
+            .span => node.asTextPool().text != start_index,
+            .quad, .trip, .rune => true,
             else => false,
         };
 
@@ -777,31 +843,8 @@ pub const Tree = struct {
         const span = s;
 
         if (span.len <= 1) {
-            return .{
-                .kind = .text,
-                .data = .{
-                    .text = .{
-                        .kind = .tiny,
-                        .data = .{
-                            .tiny = .{
-                                .kind = .splat,
-                                .data = .{
-                                    .splat = .{
-                                        .kind = .rune,
-                                        .data = .{
-                                            .rune = .{
-                                                // All that for a single character...
-                                                .reps = @intCast(span.len),
-                                                .code = if (span.len == 0) 0 else span[0],
-                                            },
-                                        },
-                                    },
-                                },
-                            },
-                        },
-                    },
-                },
-            };
+            const code: u21 = if (span.len == 0) 0 else @intCast(span[0]);
+            return Node.fromTinyRune(@intCast(span.len), code);
         }
 
         if (span.len <= 4) {
@@ -820,22 +863,7 @@ pub const Tree = struct {
                     ascii[i] = @intCast(c);
                 }
 
-                return .{
-                    .kind = .text,
-                    .data = .{
-                        .text = .{
-                            .kind = .tiny,
-                            .data = .{
-                                .tiny = .{
-                                    .kind = .ascii,
-                                    .data = .{
-                                        .ascii = .{ .chrs = ascii },
-                                    },
-                                },
-                            },
-                        },
-                    },
-                };
+                return Node.fromTinyAscii(ascii);
             }
             // Fall through to pool case for non-ASCII UTF-8
         }
@@ -852,17 +880,7 @@ pub const Tree = struct {
             },
         );
 
-        return .{
-            .kind = .text,
-            .data = .{
-                .text = .{
-                    .kind = .pool,
-                    .data = .{
-                        .pool = .{ .text = spot },
-                    },
-                },
-            },
-        };
+        return Node.fromTextPool(.lchr, 0, spot);
     }
 };
 
@@ -944,9 +962,9 @@ test "fuse text <> nl" {
     const text_node = try t.text("Hello, world!");
     const fused = try t.plus(text_node, .nl);
 
-    try expect(fused.kind == .text);
-    const pool = fused.data.text.data.pool;
-    try expectEqual(pool.side, .r);
+    try expect(fused.classify() == .span);
+    const pool = fused.asTextPool();
+    try expectEqual(pool.side, .rchr);
     try expectEqual(pool.char, '\n');
     try expectEqual(0, t.heap.plus.items.len);
     try expectEmitString(&t, "Hello, world!\n", fused);
@@ -959,9 +977,9 @@ test "fuse nl <> text" {
     const text_node = try t.text("Hello, world!");
     const fused = try t.plus(.nl, text_node);
 
-    try expect(fused.kind == .text);
-    const pool = fused.data.text.data.pool;
-    try expectEqual(pool.side, .l);
+    try expect(fused.classify() == .span);
+    const pool = fused.asTextPool();
+    try expectEqual(pool.side, .lchr);
     try expectEqual(pool.char, '\n');
     try expectEqual(0, t.heap.plus.items.len);
     try expectEmitString(&t, "\nHello, world!", fused);

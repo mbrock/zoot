@@ -6,6 +6,7 @@ pub const DocPrinter = @import("DocPrinter.zig");
 pub const StyledDocPrinter = @import("StyledDocPrinter.zig");
 pub const StructPrinter = @import("StructPrinter.zig");
 pub const PrettyGoodMachine = @import("pretty.zig");
+pub const PrettyViz = @import("pretty_viz.zig");
 
 test {
     std.testing.refAllDecls(@This());

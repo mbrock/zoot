@@ -1,5 +1,6 @@
 const std = @import("std");
 const pretty = @import("zoot").PrettyGoodMachine;
+const viz = @import("zoot").PrettyViz;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -60,14 +61,14 @@ pub fn main() !void {
 
     // Generate graphviz
     var dot_buffer: [65536]u8 = undefined;
-    const dot = try tree.graphviz(&dot_buffer, if_stmt);
+    const dot = try viz.graphviz(&tree, &dot_buffer, if_stmt);
     const dot_file = try std.fs.cwd().createFile("graphviz.dot", .{});
     defer dot_file.close();
     try dot_file.writeAll(dot);
 
     // Generate JSON
     var json_buffer: [65536]u8 = undefined;
-    const json = try tree.toJson(&json_buffer, if_stmt);
+    const json = try viz.toJson(&tree, &json_buffer, if_stmt);
     const json_file = try std.fs.cwd().createFile("tree.json", .{});
     defer json_file.close();
     try json_file.writeAll(json);
