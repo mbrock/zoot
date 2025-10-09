@@ -375,10 +375,10 @@ pub const Frob = packed struct {
 
 /// binary operation handle with optional column tweak; 30 bits
 pub const Oper = packed struct {
-    /// column frob settings
-    frob: Frob = .{},
     /// which binary operation?
     kind: enum(u1) { plus, fork },
+    /// column frob settings
+    frob: Frob = .{},
     /// index into either plus or fork list
     what: u21,
 
@@ -417,11 +417,8 @@ pub const Oper = packed struct {
 /// handle to either terminal or binary operation; 32 bits
 pub const Node = packed struct {
     kind: enum(u1) { text, oper },
-    pad1: u1 = 0, // might be useful for something...
-    data: packed union {
-        text: Text,
-        oper: Oper,
-    },
+    spam: u1 = 0,
+    data: packed union { text: Text, oper: Oper },
 
     pub fn isEmptyText(this: Node) bool {
         return this.kind == .text and this.data.text.isEmptyText();
@@ -501,252 +498,6 @@ pub const Tree = struct {
         var it = Show{ .tree = tree, .sink = &w };
         try node.emit(&it);
         return it.sink.buffered();
-    }
-
-    pub fn toJson(t1: *Tree, buffer: []u8, node: Node) ![]const u8 {
-        var t2 = Tree.init(t1.alloc);
-        defer t2.deinit();
-
-        const body = try jsonNode(&t2, t1, node);
-        return try t2.show(buffer, body);
-    }
-
-    fn jsonNode(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
-        const id = node.repr();
-
-        const kind_str = switch (node.kind) {
-            .text => "text",
-            .oper => if (node.data.oper.kind == .plus) "plus" else "fork",
-        };
-
-        const label = switch (node.kind) {
-            .text => try formatTextNode(t2, t1, node),
-            .oper => blk: {
-                const oper = node.data.oper;
-                break :blk try t2.cat(&.{
-                    try t2.text(if (oper.kind == .plus) "+" else "?"),
-                    try t2.when(oper.frob.flat == 1, try t2.text("ᶠ")),
-                    try t2.when(oper.frob.warp == 1, try t2.text("ʷ")),
-                    try t2.when(oper.frob.nest != 0, try t2.format("ⁿ{d}", .{oper.frob.nest})),
-                });
-            },
-        };
-
-        const id_field = try t2.cat(&.{
-            try t2.quotes(try t2.text("id")),
-            try t2.text(":"),
-            try t2.quotes(try t2.format("{x}", .{id})),
-        });
-
-        const kind_field = try t2.cat(&.{
-            try t2.quotes(try t2.text("kind")),
-            try t2.text(":"),
-            try t2.quotes(try t2.text(kind_str)),
-        });
-
-        const label_field = try t2.cat(&.{
-            try t2.quotes(try t2.text("label")),
-            try t2.text(":"),
-            try t2.quotes(label),
-        });
-
-        const text_kind_field = if (node.kind == .text) blk: {
-            const tk = switch (node.data.text.kind) {
-                .pool => "pool",
-                .tiny => "tiny",
-            };
-            break :blk try t2.cat(&.{
-                try t2.quotes(try t2.text("textKind")),
-                try t2.text(":"),
-                try t2.quotes(try t2.text(tk)),
-            });
-        } else try t2.text("");
-
-        const children_field = if (node.kind == .oper) blk: {
-            const oper = node.data.oper;
-            const args = if (oper.kind == .plus)
-                t1.heap.plus.items[oper.what]
-            else
-                t1.heap.fork.items[oper.what];
-
-            const left = try jsonNode(t2, t1, args.a);
-            const right = try jsonNode(t2, t1, args.b);
-
-            break :blk try t2.cat(&.{
-                try t2.quotes(try t2.text("children")),
-                try t2.text(":"),
-                try t2.brackets(try t2.sepBy(&.{ left, right }, try t2.text(","))),
-            });
-        } else try t2.text("");
-
-        const fields = if (node.kind == .oper)
-            &[_]Node{ id_field, kind_field, label_field, children_field }
-        else if (node.kind == .text)
-            &[_]Node{ id_field, kind_field, text_kind_field, label_field }
-        else
-            &[_]Node{ id_field, kind_field, label_field };
-
-        return try t2.braces(try t2.sepBy(fields, try t2.text(",")));
-    }
-
-    pub fn graphviz(t1: *Tree, buffer: []u8, node: Node) ![]const u8 {
-        var t2 = Tree.init(t1.alloc);
-        defer t2.deinit();
-
-        const body = try graphvizDoc(&t2, t1, node);
-
-        const doc = try t2.block(
-            try t2.text("digraph Tree"),
-            try t2.cat(&.{
-                try t2.text("ordering=out;"),
-                Node.nl,
-                try t2.text("ranksep=0.5;"),
-                Node.nl,
-                try t2.text("node [shape=box, fontname=\"monospace\"];"),
-                Node.nl,
-                body,
-            }),
-            2,
-        );
-
-        return try t2.show(buffer, doc);
-    }
-
-    fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
-        const id = node.repr();
-
-        const label = switch (node.kind) {
-            .text => try formatTextNode(t2, t1, node),
-            .oper => blk: {
-                const oper = node.data.oper;
-                break :blk try t2.cat(&.{
-                    try t2.text(if (oper.kind == .plus) "+" else "?"),
-                    try t2.when(oper.frob.flat == 1, try t2.text("ᶠ")),
-                    try t2.when(oper.frob.warp == 1, try t2.text("ʷ")),
-                    try t2.when(oper.frob.nest != 0, try t2.format("ⁿ{d}", .{oper.frob.nest})),
-                });
-            },
-        };
-
-        const color = switch (node.kind) {
-            .text => switch (node.data.text.kind) {
-                .pool => "lightcyan",
-                .tiny => "lightblue",
-            },
-            .oper => if (node.data.oper.kind == .plus) "gray20" else "lightyellow",
-        };
-
-        const shape = switch (node.kind) {
-            .text => switch (node.data.text.kind) {
-                .pool => "ellipse",
-                .tiny => "box",
-            },
-            .oper => if (node.data.oper.kind == .plus) "point" else "box",
-        };
-
-        const style_attrs = if (node.kind == .oper and node.data.oper.kind == .plus)
-            try t2.cat(&.{
-                try t2.attr("shape", try t2.text(shape)),
-                try t2.text(", "),
-                try t2.attr("width", try t2.text("0.15")),
-                try t2.text(", "),
-                try t2.attr("fillcolor", try t2.text(color)),
-                try t2.text(", "),
-                try t2.attr("style", try t2.text("filled")),
-            })
-        else
-            try t2.cat(&.{
-                try t2.attr("label", label),
-                try t2.text(", "),
-                try t2.attr("shape", try t2.text(shape)),
-                try t2.text(", "),
-                try t2.attr("fillcolor", try t2.text(color)),
-                try t2.text(", "),
-                try t2.attr("style", try t2.text("filled")),
-            });
-
-        const node_line = try t2.cat(&.{
-            try t2.format("n{x} ", .{id}),
-            try t2.brackets(style_attrs),
-            try t2.text(";"),
-        });
-
-        // Add edges if this is an oper
-        if (node.kind == .oper) {
-            const oper = node.data.oper;
-            const args = if (oper.kind == .plus)
-                t1.heap.plus.items[oper.what]
-            else
-                t1.heap.fork.items[oper.what];
-
-            return try t2.sepBy(
-                &.{
-                    node_line,
-                    try graphvizDoc(t2, t1, args.a),
-                    try t2.cat(&.{
-                        try t2.format("n{x}:sw -> n{x} ", .{ id, args.a.repr() }),
-                        try t2.brackets(try t2.attr("color", try t2.text("blue"))),
-                        try t2.text(";"),
-                    }),
-                    try graphvizDoc(t2, t1, args.b),
-                    try t2.cat(&.{
-                        try t2.format("n{x}:se -> n{x} ", .{ id, args.b.repr() }),
-                        try t2.brackets(try t2.attr("color", try t2.text("red"))),
-                        try t2.text(";"),
-                    }),
-                },
-                Node.nl,
-            );
-        }
-
-        return node_line;
-    }
-
-    fn formatTextNode(doc_tree: *Tree, data_tree: *Tree, node: Node) !Node {
-        std.debug.assert(node.kind == .text);
-
-        return switch (node.data.text.kind) {
-            .pool => blk: {
-                const pool = node.data.text.data.pool;
-                const tail = data_tree.byte.items[pool.text..];
-                const span = std.mem.sliceTo(tail, 0);
-
-                break :blk try doc_tree.cat(&.{
-                    try doc_tree.when(
-                        pool.char != 0 and pool.side == .l,
-                        try doc_tree.format("{f}", .{std.zig.fmtChar(pool.char)}),
-                    ),
-                    try doc_tree.format("{f}", .{std.zig.fmtString(span)}),
-                    try doc_tree.when(
-                        pool.char != 0 and pool.side == .r,
-                        try doc_tree.format("{f}", .{std.zig.fmtChar(pool.char)}),
-                    ),
-                });
-            },
-            .tiny => switch (node.data.text.data.tiny.kind) {
-                .splat => switch (node.data.text.data.tiny.data.splat.kind) {
-                    .rune => blk: {
-                        const rune = node.data.text.data.tiny.data.splat.data.rune;
-                        if (rune.reps == 0) {
-                            break :blk try doc_tree.text("(empty)");
-                        } else {
-                            break :blk try doc_tree.cat(&.{
-                                try doc_tree.format("{f}", .{std.zig.fmtChar(rune.code)}),
-                                try doc_tree.when(rune.reps > 1, try doc_tree.format("x{d}", .{rune.reps})),
-                            });
-                        }
-                    },
-                    .utf8 => try doc_tree.text("(utf8)"),
-                },
-                .ascii => blk: {
-                    const ascii = node.data.text.data.tiny.data.ascii;
-                    var bytes: [4]u8 = undefined;
-                    for (0..4) |i| bytes[i] = ascii.chrs[i];
-                    const span = std.mem.sliceTo(&bytes, 0);
-                    break :blk try doc_tree.format("{f}", .{std.zig.fmtString(span)});
-                },
-            },
-        };
     }
 
     pub fn rank(tree: *Tree, conf: anytype, node: Node) !@TypeOf(conf).Rank {
@@ -1363,24 +1114,4 @@ test "warp with nest when head is non-zero" {
 
     // result: "AAA" (head=3) + "X" (head=4) + "\n" + (3 warp + 2 nest = 5 spaces) + "Y"
     try expectEmitString(&t, "AAAX\n     Y", outer);
-}
-
-test "graphviz output" {
-    var t = Tree.init(std.testing.allocator);
-    defer t.deinit();
-
-    // Create: warp(nest(2, ("foo" <> nl) <> "bar"))
-    const inner = try t.plus(
-        try t.plus(try t.text("foo"), Node.nl),
-        try t.text("bar"),
-    );
-    const doc = try t.warp(try t.nest(2, inner));
-
-    var buffer: [1024]u8 = undefined;
-    const dot = try t.graphviz(&buffer, doc);
-
-    // Just verify it contains expected elements
-    try expect(std.mem.indexOf(u8, dot, "digraph Tree") != null);
-    try expect(std.mem.indexOf(u8, dot, "foo") != null);
-    try expect(std.mem.indexOf(u8, dot, "bar") != null);
 }
