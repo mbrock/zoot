@@ -28,17 +28,25 @@ pub const Show = struct {
 
     /// This is an `std.Io.Writer` that measures without printing.
     pub const Cost = struct {
-        pub const Data = struct {
+        /// 32 bits
+        pub const Data = packed struct {
             /// total number of rows
             rows: u16 = 0,
+            /// overflow quantity
+            debt: u16 = 0,
             /// width of longest row
             long: u8 = 0,
             /// width of last row
             last: u8 = 0,
-            /// overflow quantity
-            debt: u8 = 0,
-            /// number of newlines softened
-            soft: u8 = 0,
+
+            pub fn less(a: Data, b: Data) bool {
+                if (a.rows <= b.rows)
+                    if (a.long <= b.long)
+                        if (a.debt <= b.debt)
+                            if (a.last <= b.last)
+                                return true;
+                return false;
+            }
         };
 
         /// accumulated cost vector
@@ -741,7 +749,6 @@ test "nest braces cost" {
     try expectEqual(1, m.last);
     try expectEqual(7, m.long);
     try expectEqual(0, m.debt);
-    try expectEqual(0, m.soft);
 }
 
 test "flatten('a' <> nl <> 'b')" {
