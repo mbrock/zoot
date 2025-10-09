@@ -27,103 +27,171 @@ pub const Show = struct {
     }
 
     /// This is an `std.Io.Writer` that measures without printing.
-    pub const Cost = struct {
-        /// 32 bits
-        pub const Data = packed struct {
-            /// total number of rows
-            rows: u16 = 0,
-            /// overflow quantity
-            debt: u16 = 0,
-            /// width of longest row
-            long: u8 = 0,
-            /// width of last row
-            last: u8 = 0,
+    pub fn Pack(Cost: type) type {
+        return struct {
+            head: u16 = 0,
+            cost: Cost.Snap,
+            conf: Cost,
+            sink: std.Io.Writer,
 
-            pub fn less(a: Data, b: Data) bool {
-                if (a.rows <= b.rows)
-                    if (a.long <= b.long)
-                        if (a.debt <= b.debt)
-                            if (a.last <= b.last)
-                                return true;
-                return false;
-            }
-        };
-
-        /// accumulated cost vector
-        data: Data = .{},
-
-        /// buffered interface
-        sink: std.Io.Writer,
-
-        /// page width, or target line width
-        page: u8,
-
-        pub fn init(buffer: []u8, width: u8) Cost {
-            return .{
-                .page = width,
-                .sink = .{
-                    .buffer = buffer,
-                    .vtable = &.{
-                        .drain = Cost.drain,
-                        .rebase = std.Io.Writer.failingRebase,
+            pub fn init(buffer: []u8, conf: Cost) @This() {
+                return .{
+                    .conf = conf,
+                    .cost = conf.text(0, 0),
+                    .sink = .{
+                        .buffer = buffer,
+                        .vtable = &.{
+                            .drain = drain,
+                            .rebase = std.Io.Writer.failingRebase,
+                        },
                     },
-                },
-            };
-        }
+                };
+            }
 
-        pub fn scan(this: *@This(), data: []const u8) !void {
-            var m = &this.data;
-            if (m.rows == 0) m.rows = 1;
+            pub fn pack(conf: Cost, tree: *Tree, node: Node) !Cost.Snap {
+                var note: [256]u8 = undefined;
+                var this = init(&note, conf);
+                var work = Show{ .tree = tree, .sink = &this.sink };
+                try node.emit(&work);
+                try this.sink.flush();
+                return this.cost;
+            }
 
-            var head = m.last;
-            var long = m.long;
-
-            for (data) |c| {
-                if (c == '\n') {
-                    if (head > long) long = head;
-                    m.rows += 1;
-                    head = 0; // indent will be space-splatted
-                } else {
-                    head += 1;
+            pub fn scan(this: *@This(), data: []const u8) !void {
+                for (data) |c| {
+                    if (c == '\n') {
+                        this.cost = this.conf.plus(this.cost, this.conf.line());
+                        this.head = 0;
+                    } else {
+                        this.cost = this.conf.plus(this.cost, this.conf.text(this.head, 1));
+                        this.head += 1;
+                    }
                 }
             }
 
-            m.last = head;
-            m.long = @max(long, head);
-            if (m.long > this.page)
-                m.debt = m.long - this.page;
-        }
+            pub fn drain(
+                w: *std.Io.Writer,
+                data: []const []const u8,
+                splat: usize,
+            ) !usize {
+                const this: *@This() = @alignCast(@fieldParentPtr("sink", w));
 
-        pub fn drain(
-            w: *std.Io.Writer,
-            data: []const []const u8,
-            splat: usize,
-        ) !usize {
-            const this: *Cost = @alignCast(@fieldParentPtr("sink", w));
+                if (w.end > 0) {
+                    try this.scan(w.buffered());
+                    w.end = 0;
+                }
 
-            if (w.end > 0) {
-                try this.scan(w.buffered());
-                w.end = 0;
+                if (data.len == 0) return 0;
+
+                var took: usize = 0;
+
+                for (data[0 .. data.len - 1]) |part| {
+                    try this.scan(part);
+                    took += part.len;
+                }
+
+                const bulk = data[data.len - 1];
+                for (0..splat) |_| {
+                    try this.scan(bulk);
+                    took += bulk.len;
+                }
+
+                return took;
             }
+        };
+    }
+};
 
-            if (data.len == 0) return 0;
+/// Example 3.4. in *A Pretty Expressive Printer*.
+///
+/// > Consider an optimality objective that minimizes the sum of overflows
+/// > (the number of characters that exceed a given page width limit 𝑤 in each line),
+/// > and then minimizes the height (the total number of newline characters,
+/// > or equivalently, the number of lines minus one).
+const F1 = struct {
+    w: u16,
 
-            var took: usize = 0;
+    pub const Snap = struct {
+        /// the sum of overflows
+        o: u16 = 0,
+        /// the number of newlines
+        h: u16 = 0,
 
-            for (data[0 .. data.len - 1]) |part| {
-                try this.scan(part);
-                took += part.len;
-            }
-
-            const bulk = data[data.len - 1];
-            for (0..splat) |_| {
-                try this.scan(bulk);
-                took += bulk.len;
-            }
-
-            return took;
+        pub fn key(snap: Snap) u32 {
+            return (@as(u32, snap.o) << 16) | snap.h;
         }
     };
+
+    pub fn init(w: u16) F1 {
+        return .{ .w = w };
+    }
+
+    pub fn line(_: @This()) Snap {
+        return .{ .h = 1 };
+    }
+
+    pub fn text(this: @This(), c: u16, l: u16) Snap {
+        return .{ .o = (c +| l) -| @max(this.w, c) };
+    }
+
+    pub fn plus(_: @This(), lhs: Snap, rhs: Snap) Snap {
+        return .{ .h = lhs.h +| rhs.h, .o = lhs.o +| rhs.o };
+    }
+
+    pub fn wins(_: @This(), a: Snap, b: Snap) bool {
+        return a.key() <= b.key();
+    }
+};
+
+/// Example 3.5. in *A Pretty Expressive Printer*.
+///
+/// > The following cost factory targets an optimality objective
+/// > that minimizes the sum of *squared* overflows over the page width limit 𝑤,
+/// > and then the height. This optimality objective is an improvement
+/// > over the one in Example 3.4 by discouraging overly large overflows.
+/// >
+/// > This is (essentially) the default cost factory that our implementation,
+/// > *PrettyExpressive*, employs.
+const F2 = struct {
+    w: u16,
+
+    pub const Snap = struct {
+        /// the sum of squared overflows
+        o: u32 = 0,
+        /// the number of newlines
+        h: u16 = 0,
+
+        pub fn key(snap: Snap) u48 {
+            return (snap.o << 16) | snap.h;
+        }
+    };
+
+    pub fn init(w: u16) F2 {
+        return .{ .w = w };
+    }
+
+    pub fn line(_: @This()) Snap {
+        return .{ .h = 1 };
+    }
+
+    pub fn text(this: @This(), c: u16, l: u16) Snap {
+        const w = this.w;
+
+        const a = @max(w, c) -| w;
+        const b = (c + l) -| @max(w, c);
+
+        return .{
+            .o = b * (2 * a + b),
+        };
+    }
+
+    pub fn plus(_: @This(), lhs: Snap, rhs: Snap) Snap {
+        return .{ .h = lhs.h +| rhs.h, .o = lhs.o +| rhs.o };
+    }
+
+    pub fn wins(_: @This(), a: Snap, b: Snap) bool {
+        return a.key() <= b.key();
+    }
 };
 
 /// Pooled or immediate text; 30 bits.
@@ -393,13 +461,8 @@ pub const Tree = struct {
         return it.sink.buffered();
     }
 
-    pub fn cost(tree: *Tree, page: u8, node: Node) !Show.Cost.Data {
-        var note: [256]u8 = undefined;
-        var sink = Show.Cost.init(&note, page);
-        var work = Show{ .tree = tree, .sink = &sink.sink };
-        try node.emit(&work);
-        try sink.sink.flush();
-        return sink.data;
+    pub fn pack(tree: *Tree, conf: anytype, node: Node) !@TypeOf(conf).Snap {
+        return try Show.Pack(@TypeOf(conf)).pack(conf, tree, node);
     }
 
     pub fn flat(tree: *Tree, lhs: Node) !Node {
@@ -603,7 +666,7 @@ const expectEqual = std.testing.expectEqual;
 const expectEqualStrings = std.testing.expectEqualStrings;
 
 fn expectEmitString(tree: *Tree, text: []const u8, node: Node) !void {
-    const buffer = try std.testing.allocator.alloc(u8, text.len);
+    const buffer = try std.testing.allocator.alloc(u8, text.len * 2);
     defer std.testing.allocator.free(buffer);
 
     try expectEqualStrings(text, try tree.show(buffer, node));
@@ -733,22 +796,61 @@ test "nest braces cost" {
     var t = Tree.init(std.testing.allocator);
     defer t.deinit();
 
-    const doc = try t.plus(
+    const s1 = try t.pack(
+        F1.init(32),
         try t.plus(
-            try t.text("foo {"),
-            try t.nest(
-                4,
-                try t.plus(.nl, try t.text("bar")),
+            try t.plus(
+                try t.text("foo {"),
+                try t.nest(
+                    4,
+                    try t.plus(.nl, try t.text("bar")),
+                ),
             ),
+            try t.plus(.nl, try t.text("}")),
         ),
-        try t.plus(.nl, try t.text("}")),
     );
 
-    const m: Show.Cost.Data = try t.cost(32, doc);
-    try expectEqual(3, m.rows);
-    try expectEqual(1, m.last);
-    try expectEqual(7, m.long);
-    try expectEqual(0, m.debt);
+    try expectEqual(2, s1.h);
+    try expectEqual(0, s1.o);
+}
+
+test "F2 cost matches example" {
+    var t = Tree.init(std.testing.allocator);
+    defer t.deinit();
+
+    // See Example 3.5. and Figure 7 in *A Pretty Expressive Printer*.
+
+    const d1 = try t.text("   = func( pretty, print )");
+    const c1 = try t.pack(F2.init(6), d1);
+
+    try expectEqual(0, c1.h);
+    try expectEqual(20 * 20, c1.o);
+
+    const d2 = try t.plus(
+        try t.nest(
+            2,
+            try t.plus(
+                try t.plus(try t.text("   = func("), .nl),
+                try t.plus(
+                    try t.plus(try t.text("pretty,"), .nl),
+                    try t.text("print"),
+                ),
+            ),
+        ),
+        try t.plus(.nl, try t.text(")")),
+    );
+
+    try expectEmitString(&t,
+        \\   = func(
+        \\  pretty,
+        \\  print
+        \\)
+    , d2);
+
+    const c2 = try t.pack(F2.init(6), d2);
+
+    try expectEqual(3, c2.h);
+    try expectEqual(4 * 4 + 3 * 3 + 1, c2.o);
 }
 
 test "flatten('a' <> nl <> 'b')" {
