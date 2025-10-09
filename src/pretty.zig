@@ -12,7 +12,24 @@ pub const Sink = struct {
     }
 };
 
-/// pooled or immediate text; 30 bits
+/// Pooled or immediate text; 30 bits.
+///
+/// A text is either
+///
+///   (1) a single-line non-empty UTF-8 string ("a slice");
+///   (2) the empty text;
+///   (3) the soft line break character ("␤");
+///   (4) ␤ followed by a slice; or
+///   (5) a slice followed by ␤.
+///
+/// This lets us construct `X <> nl` and `nl <> X`
+/// for most text nodes without allocating a plus node.
+///
+/// Since ␤ (`\n`, U+000A) does not occur in normal texts,
+/// we simply use that as the soft line break sentinel,
+/// whether as the "ASCII sidekick" or a standalone rune.
+///
+/// TODO: Allow ␤ as the first or last `u7` in an ASCII quad.
 pub const Text = packed struct {
     kind: enum(u1) { pool, tiny },
     data: packed union {
@@ -67,7 +84,7 @@ pub const Text = packed struct {
                                     return
                                 else {
                                     var buffer: [4]u8 = undefined;
-                                    const n = try std.unicode.utf8Encode(this.code, &buffer);
+                                    const n = std.unicode.utf8Encode(this.code, &buffer) catch 0;
                                     var data = [1][]const u8{buffer[0..n]};
                                     try sink.w.writeSplatAll(&data, this.reps);
                                 }
@@ -138,16 +155,21 @@ pub const Frob = packed struct {
 /// binary operation handle with optional column tweak; 30 bits
 pub const Oper = packed struct {
     /// column frob settings
-    frob: Frob,
+    frob: Frob = .{},
     /// which binary operation?
     kind: enum(u1) { plus, fork },
     /// index into either plus or fork list
     what: u21,
 
     pub fn emit(this: @This(), sink: *Sink) !void {
-        _ = this;
-        _ = sink;
-        return error.Unimplemented;
+        switch (this.kind) {
+            .plus => {
+                const args = sink.t.heap.plus.items[this.what];
+                try args.a.emit(sink);
+                try args.b.emit(sink);
+            },
+            .fork => return error.Unimplemented,
+        }
     }
 };
 
@@ -164,11 +186,18 @@ pub const Node = packed struct {
         return this.kind == .text and this.data.text.isEmptyText();
     }
 
-    pub fn emit(this: @This(), sink: *Sink) !void {
+    pub fn emit(this: @This(), sink: *Sink) error{
+        WriteFailed,
+        Unimplemented,
+    }!void {
         switch (this.kind) {
             .text => try this.data.text.emit(sink),
             .oper => try this.data.oper.emit(sink),
         }
+    }
+
+    pub fn repr(this: @This()) u32 {
+        return @bitCast(this);
     }
 };
 
@@ -189,6 +218,12 @@ pub const Tree = struct {
         return .{ .alloc = alloc };
     }
 
+    pub fn deinit(tree: *Tree) void {
+        tree.heap.byte.deinit(tree.alloc);
+        tree.heap.plus.deinit(tree.alloc);
+        tree.heap.fork.deinit(tree.alloc);
+    }
+
     pub fn show(tree: *Tree, buffer: []u8, node: Node) ![]const u8 {
         var w = std.Io.Writer.fixed(buffer);
         var sink = Sink{ .t = tree, .w = &w };
@@ -202,7 +237,7 @@ pub const Tree = struct {
         // When A and B are tiny texts, A + B is often also a tiny text.
 
         const next: u21 = @intCast(tree.heap.plus.items.len);
-        try tree.heap.plus.items.append(tree.allocator, .{ .a = lhs, .b = rhs });
+        try tree.heap.plus.append(tree.alloc, .{ .a = lhs, .b = rhs });
         return .{
             .kind = .oper,
             .data = .{
@@ -216,7 +251,7 @@ pub const Tree = struct {
 
     pub fn fork(tree: *Tree, lhs: Node, rhs: Node) !Node {
         const next: u21 = @intCast(tree.heap.fork.items.len);
-        try tree.heap.fork.append(tree.allocator, .{ .a = lhs, .b = rhs });
+        try tree.heap.fork.append(tree.alloc, .{ .a = lhs, .b = rhs });
         return .{
             .kind = .oper,
             .data = .{
@@ -284,12 +319,14 @@ pub const Tree = struct {
             };
         }
 
+        const spanz = span[0 .. span.len + 1];
+
         const spot: u21 = @intCast(
-            if (std.mem.indexOf(u8, tree.heap.byte.items, span)) |i|
+            if (std.mem.indexOf(u8, tree.heap.byte.items, spanz)) |i|
                 i
             else blk: {
                 const next = tree.heap.byte.items.len;
-                try tree.heap.byte.appendSlice(tree.alloc, span);
+                try tree.heap.byte.appendSlice(tree.alloc, spanz);
                 break :blk next;
             },
         );
@@ -308,11 +345,15 @@ pub const Tree = struct {
     }
 };
 
+const expect = std.testing.expect;
+const expectEqual = std.testing.expectEqual;
+const expectEqualStrings = std.testing.expectEqualStrings;
+
 fn expectEmitString(tree: *Tree, text: []const u8, node: Node) !void {
     const buffer = try std.testing.allocator.alloc(u8, text.len);
     defer std.testing.allocator.free(buffer);
 
-    try std.testing.expectEqualStrings(text, try tree.show(buffer, node));
+    try expectEqualStrings(text, try tree.show(buffer, node));
 }
 
 test "show tiny" {
@@ -323,4 +364,40 @@ test "show tiny" {
     try expectEmitString(&tree, "AB", try tree.text("AB"));
     try expectEmitString(&tree, "A", try tree.text("A"));
     try expectEmitString(&tree, "", try tree.text(""));
+}
+
+test "show text" {
+    var tree = Tree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    try expectEmitString(&tree, "Hello, world!", try tree.text("Hello, world!"));
+}
+
+test "text dedup" {
+    var tree = Tree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    const n1 = try tree.text("Hello, world!");
+    const n2 = try tree.text("Hello, world!");
+
+    try expectEqual(n1.repr(), n2.repr());
+    try expectEqual(1 + "Hello, world!".len, tree.heap.byte.items.len);
+
+    const n3 = try tree.text("Hello");
+    try expect(n2.repr() != n3.repr());
+    try expectEqual(1 + "Hello, world!".len + 6, tree.heap.byte.items.len);
+}
+
+test "emit plus node" {
+    var tree = Tree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    const n1 = try tree.text("Hello,");
+    const n2 = try tree.text("world!");
+
+    try expectEmitString(
+        &tree,
+        "Hello,world!",
+        try tree.plus(n1, n2),
+    );
 }
