@@ -89,6 +89,27 @@ pub fn build(b: *std.Build) void {
         bench_cmd.addArgs(args);
     }
 
+    const graphviz_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zoot", .module = mod },
+        },
+    });
+
+    const graphviz_exe = b.addExecutable(.{
+        .name = "zoot-graphviz",
+        .root_module = graphviz_mod,
+    });
+
+    b.installArtifact(graphviz_exe);
+
+    const graphviz_step = b.step("graphviz", "Generate graphviz visualization");
+    const graphviz_cmd = b.addRunArtifact(graphviz_exe);
+    graphviz_step.dependOn(&graphviz_cmd.step);
+    graphviz_cmd.step.dependOn(b.getInstallStep());
+
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });

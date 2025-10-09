@@ -1,43 +1,71 @@
 const std = @import("std");
-const zoot = @import("zoot");
-
-fn printBigTree(
-    writer: *std.Io.Writer,
-    tree: *zoot.TreePrinter,
-    depth: u32,
-    max_depth: u32,
-    node_count: *u32,
-) !void {
-    if (depth >= max_depth or node_count.* >= 100000) return;
-
-    const has_more = depth < max_depth - 1 and node_count.* < 99990;
-
-    try tree.show(writer, has_more);
-    try writer.print("node {d}\n", .{node_count.*});
-    node_count.* += 1;
-
-    if (has_more) {
-        try tree.push(true);
-
-        // Print 2-3 children at this level
-        const children = if (depth % 3 == 0) @as(u32, 3) else 2;
-        var i: u32 = 0;
-        while (i < children and node_count.* < 100000) : (i += 1) {
-            try printBigTree(writer, tree, depth + 1, max_depth, node_count);
-        }
-
-        tree.pop();
-    }
-}
+const pretty = @import("zoot").PrettyGoodMachine;
 
 pub fn main() !void {
-    var buffer: [8192]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&buffer);
-    const writer = &stdout.interface;
-    defer writer.flush() catch {};
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
-    var tree = zoot.TreePrinter.empty;
-    var node_count: u32 = 0;
+    // Create a more elaborate nested structure
+    var tree = pretty.Tree.init(allocator);
+    defer tree.deinit();
 
-    try printBigTree(writer, &tree, 0, 32, &node_count);
+    // Build a complex nested expression: if (x > 0) { fooFunction(alpha, beta); barFunction(); }
+    const condition = try tree.cat(&.{
+        try tree.text("x"),
+        try tree.text(" "),
+        try tree.text(">"),
+        try tree.text(" "),
+        try tree.text("0"),
+    });
+
+    const call1_args = try tree.cat(&.{
+        try tree.text("alpha"),
+        try tree.text(","),
+        try tree.fork(
+            try tree.text(" "),
+            try tree.plus(pretty.Node.nl, try tree.text("  ")),
+        ),
+        try tree.text("beta"),
+    });
+
+    const call1 = try tree.cat(&.{
+        try tree.text("fooFunction"),
+        try tree.parens(call1_args),
+        try tree.text(";"),
+    });
+
+    const call2 = try tree.cat(&.{
+        try tree.text("barFunction"),
+        try tree.text("()"),
+        try tree.text(";"),
+    });
+
+    const body = try tree.sepBy(&.{ call1, call2 }, try tree.fork(
+        try tree.text(" "),
+        pretty.Node.nl,
+    ));
+
+    const if_stmt = try tree.cat(&.{
+        try tree.text("if"),
+        try tree.text(" "),
+        try tree.parens(condition),
+        try tree.text(" "),
+        try tree.braces(try tree.cat(&.{
+            try tree.fork(try tree.text(" "), pretty.Node.nl),
+            try tree.nest(2, body),
+            try tree.fork(try tree.text(" "), pretty.Node.nl),
+        })),
+    });
+
+    var buffer2: [65536]u8 = undefined;
+    const dot2 = try tree.graphviz(&buffer2, if_stmt);
+
+    // Write to file
+    const file = try std.fs.cwd().createFile("graphviz.dot", .{});
+    defer file.close();
+    try file.writeAll(dot2);
+
+    std.debug.print("Generated graphviz.dot with {d} bytes\n", .{dot2.len});
+    std.debug.print("Run: dot -Tpdf graphviz.dot -o graphviz.pdf\n", .{});
 }

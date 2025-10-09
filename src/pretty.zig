@@ -11,18 +11,21 @@ pub const Show = struct {
     /// treat ␤ as ␠?
     flat: bool = false,
 
-    pub fn writeString(this: @This(), what: u21) !void {
-        const tail = this.tree.heap.byte.items[what..];
+    pub fn writeString(this: *@This(), what: u21) !void {
+        const tail = this.tree.byte.items[what..];
         const span = std.mem.sliceTo(tail, 0);
         try this.sink.writeAll(span);
+        this.head +|= @intCast(span.len);
     }
 
     pub fn newline(this: *@This()) !void {
-        if (this.flat)
-            try this.sink.writeByte(' ')
-        else {
+        if (this.flat) {
+            try this.sink.writeByte(' ');
+            this.head +|= 1;
+        } else {
             try this.sink.writeByte('\n');
             try this.sink.splatByteAll(' ', this.base);
+            this.head = this.base;
         }
     }
 
@@ -227,8 +230,10 @@ pub const Text = packed struct {
             fn emitSidekick(char: u7, show: *Show) !void {
                 if (char == '\n')
                     try show.newline()
-                else
+                else {
                     try show.sink.writeByte(char);
+                    show.head +|= 1;
+                }
             }
 
             pub fn emit(this: @This(), show: *Show) !void {
@@ -279,6 +284,7 @@ pub const Text = packed struct {
                                     const n = std.unicode.utf8Encode(this.code, &buffer) catch 0;
                                     var data = [1][]const u8{buffer[0..n]};
                                     try show.sink.writeSplatAll(&data, this.reps);
+                                    show.head +|= @intCast(n * this.reps);
                                 }
                             }
                         },
@@ -303,7 +309,10 @@ pub const Text = packed struct {
                     pub fn emit(this: @This(), show: *Show) !void {
                         for (0..4) |i| {
                             const c = this.chrs[i];
-                            if (c == 0) break else try show.sink.writeByte(c);
+                            if (c == 0) break else {
+                                try show.sink.writeByte(c);
+                                show.head +|= 1;
+                            }
                         }
                     }
                 },
@@ -362,9 +371,16 @@ pub const Oper = packed struct {
 
                 const save_base = show.base;
                 defer show.base = save_base;
+
+                // Handle warp (align): set base to current column
+                if (this.frob.warp == 1) {
+                    show.base = show.head;
+                }
+
+                // Handle nest: add indent to base
                 if (this.frob.nest != 0) {
                     const addend: u16 = @intCast(this.frob.nest);
-                    const widened = @as(u32, save_base) + @as(u32, addend);
+                    const widened = @as(u32, show.base) + @as(u32, addend);
                     const limit = @as(u32, std.math.maxInt(u16));
                     show.base = @intCast(@min(widened, limit));
                 }
@@ -436,8 +452,8 @@ pub const Pair = struct { a: Node, b: Node };
 
 /// tree-in-construction; actually more like DAG
 pub const Tree = struct {
+    byte: std.ArrayList(u8) = .empty,
     heap: struct {
-        byte: std.ArrayList(u8) = .empty,
         plus: std.ArrayList(Pair) = .empty,
         fork: std.ArrayList(Pair) = .empty,
     } = .{},
@@ -449,7 +465,7 @@ pub const Tree = struct {
     }
 
     pub fn deinit(tree: *Tree) void {
-        tree.heap.byte.deinit(tree.alloc);
+        tree.byte.deinit(tree.alloc);
         tree.heap.plus.deinit(tree.alloc);
         tree.heap.fork.deinit(tree.alloc);
     }
@@ -459,6 +475,166 @@ pub const Tree = struct {
         var it = Show{ .tree = tree, .sink = &w };
         try node.emit(&it);
         return it.sink.buffered();
+    }
+
+    pub fn graphviz(t1: *Tree, buffer: []u8, node: Node) ![]const u8 {
+        var t2 = Tree.init(t1.alloc);
+        defer t2.deinit();
+
+        const body = try graphvizDoc(&t2, t1, node);
+
+        const doc = try t2.block(
+            try t2.text("digraph Tree"),
+            try t2.cat(&.{
+                try t2.text("ordering=out;"),
+                Node.nl,
+                try t2.text("ranksep=0.5;"),
+                Node.nl,
+                try t2.text("node [shape=box, fontname=\"monospace\"];"),
+                Node.nl,
+                body,
+            }),
+            2,
+        );
+
+        return try t2.show(buffer, doc);
+    }
+
+    fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
+        const id = node.repr();
+
+        const label = switch (node.kind) {
+            .text => try formatTextNode(t2, t1, node),
+            .oper => blk: {
+                const oper = node.data.oper;
+                break :blk try t2.cat(&.{
+                    try t2.text(if (oper.kind == .plus) "+" else "?"),
+                    try t2.when(oper.frob.flat == 1, try t2.text("ᶠ")),
+                    try t2.when(oper.frob.warp == 1, try t2.text("ʷ")),
+                    try t2.when(oper.frob.nest != 0, try t2.format("ⁿ{d}", .{oper.frob.nest})),
+                });
+            },
+        };
+
+        const color = switch (node.kind) {
+            .text => switch (node.data.text.kind) {
+                .pool => "lightcyan",
+                .tiny => "lightblue",
+            },
+            .oper => if (node.data.oper.kind == .plus) "gray20" else "lightyellow",
+        };
+
+        const shape = switch (node.kind) {
+            .text => switch (node.data.text.kind) {
+                .pool => "ellipse",
+                .tiny => "box",
+            },
+            .oper => if (node.data.oper.kind == .plus) "point" else "box",
+        };
+
+        const style_attrs = if (node.kind == .oper and node.data.oper.kind == .plus)
+            try t2.cat(&.{
+                try t2.attr("shape", try t2.text(shape)),
+                try t2.text(", "),
+                try t2.attr("width", try t2.text("0.15")),
+                try t2.text(", "),
+                try t2.attr("fillcolor", try t2.text(color)),
+                try t2.text(", "),
+                try t2.attr("style", try t2.text("filled")),
+            })
+        else
+            try t2.cat(&.{
+                try t2.attr("label", label),
+                try t2.text(", "),
+                try t2.attr("shape", try t2.text(shape)),
+                try t2.text(", "),
+                try t2.attr("fillcolor", try t2.text(color)),
+                try t2.text(", "),
+                try t2.attr("style", try t2.text("filled")),
+            });
+
+        const node_line = try t2.cat(&.{
+            try t2.format("n{x} ", .{id}),
+            try t2.brackets(style_attrs),
+            try t2.text(";"),
+        });
+
+        // Add edges if this is an oper
+        if (node.kind == .oper) {
+            const oper = node.data.oper;
+            const args = if (oper.kind == .plus)
+                t1.heap.plus.items[oper.what]
+            else
+                t1.heap.fork.items[oper.what];
+
+            return try t2.sepBy(
+                &.{
+                    node_line,
+                    try graphvizDoc(t2, t1, args.a),
+                    try t2.cat(&.{
+                        try t2.format("n{x}:sw -> n{x} ", .{ id, args.a.repr() }),
+                        try t2.brackets(try t2.attr("color", try t2.text("blue"))),
+                        try t2.text(";"),
+                    }),
+                    try graphvizDoc(t2, t1, args.b),
+                    try t2.cat(&.{
+                        try t2.format("n{x}:se -> n{x} ", .{ id, args.b.repr() }),
+                        try t2.brackets(try t2.attr("color", try t2.text("red"))),
+                        try t2.text(";"),
+                    }),
+                },
+                Node.nl,
+            );
+        }
+
+        return node_line;
+    }
+
+    fn formatTextNode(doc_tree: *Tree, data_tree: *Tree, node: Node) !Node {
+        std.debug.assert(node.kind == .text);
+
+        return switch (node.data.text.kind) {
+            .pool => blk: {
+                const pool = node.data.text.data.pool;
+                const tail = data_tree.byte.items[pool.text..];
+                const span = std.mem.sliceTo(tail, 0);
+
+                break :blk try doc_tree.cat(&.{
+                    try doc_tree.when(
+                        pool.char != 0 and pool.side == .l,
+                        try doc_tree.format("{f}", .{std.zig.fmtChar(pool.char)}),
+                    ),
+                    try doc_tree.format("{f}", .{std.zig.fmtString(span)}),
+                    try doc_tree.when(
+                        pool.char != 0 and pool.side == .r,
+                        try doc_tree.format("{f}", .{std.zig.fmtChar(pool.char)}),
+                    ),
+                });
+            },
+            .tiny => switch (node.data.text.data.tiny.kind) {
+                .splat => switch (node.data.text.data.tiny.data.splat.kind) {
+                    .rune => blk: {
+                        const rune = node.data.text.data.tiny.data.splat.data.rune;
+                        if (rune.reps == 0) {
+                            break :blk try doc_tree.text("(empty)");
+                        } else {
+                            break :blk try doc_tree.cat(&.{
+                                try doc_tree.format("{f}", .{std.zig.fmtChar(rune.code)}),
+                                try doc_tree.when(rune.reps > 1, try doc_tree.format("x{d}", .{rune.reps})),
+                            });
+                        }
+                    },
+                    .utf8 => try doc_tree.text("(utf8)"),
+                },
+                .ascii => blk: {
+                    const ascii = node.data.text.data.tiny.data.ascii;
+                    var bytes: [4]u8 = undefined;
+                    for (0..4) |i| bytes[i] = ascii.chrs[i];
+                    const span = std.mem.sliceTo(&bytes, 0);
+                    break :blk try doc_tree.format("{f}", .{std.zig.fmtString(span)});
+                },
+            },
+        };
     }
 
     pub fn pack(tree: *Tree, conf: anytype, node: Node) !@TypeOf(conf).Snap {
@@ -609,6 +785,127 @@ pub const Tree = struct {
         };
     }
 
+    /// Concatenate multiple nodes in sequence
+    pub fn cat(tree: *Tree, nodes: []const Node) !Node {
+        if (nodes.len == 0) return try tree.text("");
+        var result = nodes[0];
+        for (nodes[1..]) |n| {
+            result = try tree.plus(result, n);
+        }
+        return result;
+    }
+
+    /// Join nodes with a separator
+    pub fn join(tree: *Tree, nodes: []const Node, sep: Node) !Node {
+        if (nodes.len == 0) return try tree.text("");
+        var result = nodes[0];
+        for (nodes[1..]) |n| {
+            result = try tree.plus(result, sep);
+            result = try tree.plus(result, n);
+        }
+        return result;
+    }
+
+    /// Concatenate text strings into a single node
+    pub fn str(tree: *Tree, strings: []const [:0]const u8) !Node {
+        if (strings.len == 0) return try tree.text("");
+        var result = try tree.text(strings[0]);
+        for (strings[1..]) |s| {
+            result = try tree.plus(result, try tree.text(s));
+        }
+        return result;
+    }
+
+    /// Add a node only if condition is true, otherwise return empty
+    pub fn when(tree: *Tree, condition: bool, node: Node) !Node {
+        return if (condition) node else try tree.text("");
+    }
+
+    /// Wrap body in "header {" ... "}" with optional indentation
+    pub fn block(tree: *Tree, header: Node, body: Node, indent: u6) !Node {
+        const open = try tree.plus(header, try tree.text(" {"));
+        const indented = if (indent > 0) try tree.nest(indent, body) else body;
+        const close = try tree.text("}");
+
+        return try tree.join(&.{
+            open,
+            indented,
+            close,
+        }, Node.nl);
+    }
+
+    /// Format a string using std.fmt and add to the slab with deduplication
+    pub fn format(tree: *Tree, comptime fmt: []const u8, args: anytype) !Node {
+        const start_len = tree.byte.items.len;
+
+        // Format directly into the slab
+        try tree.byte.writer(tree.alloc).print(fmt ++ "\x00", args);
+
+        // Now use text() which will do the deduplication logic for us
+        const written = tree.byte.items[start_len .. tree.byte.items.len - 1 :0];
+        const node = try tree.text(written);
+
+        // If text() didn't point to our new string, rewind the slab
+        // (either it found a duplicate, or it made a tiny immediate node)
+        const should_rewind = switch (node.kind) {
+            .text => switch (node.data.text.kind) {
+                .pool => node.data.text.data.pool.text != start_len,
+                .tiny => true,
+            },
+            else => false,
+        };
+
+        if (should_rewind) {
+            tree.byte.shrinkRetainingCapacity(start_len);
+        }
+
+        return node;
+    }
+
+    /// Join nodes with a separator (like sepBy in Haskell)
+    pub fn sepBy(tree: *Tree, items: []const Node, sep: Node) !Node {
+        return try tree.join(items, sep);
+    }
+
+    /// Wrap content in delimiters: open <> content <> close
+    pub fn wrap(tree: *Tree, open: [:0]const u8, content: Node, close: [:0]const u8) !Node {
+        return try tree.cat(&.{
+            try tree.text(open),
+            content,
+            try tree.text(close),
+        });
+    }
+
+    /// Wrap in parentheses: (content)
+    pub fn parens(tree: *Tree, content: Node) !Node {
+        return try tree.wrap("(", content, ")");
+    }
+
+    /// Wrap in brackets: [content]
+    pub fn brackets(tree: *Tree, content: Node) !Node {
+        return try tree.wrap("[", content, "]");
+    }
+
+    /// Wrap in braces: {content}
+    pub fn braces(tree: *Tree, content: Node) !Node {
+        return try tree.wrap("{", content, "}");
+    }
+
+    /// Wrap in double quotes: "content"
+    pub fn quotes(tree: *Tree, content: Node) !Node {
+        return try tree.wrap("\"", content, "\"");
+    }
+
+    /// Attribute pattern: name="value"
+    pub fn attr(tree: *Tree, name: [:0]const u8, value: Node) !Node {
+        return try tree.cat(&.{
+            try tree.text(name),
+            try tree.text("=\""),
+            value,
+            try tree.text("\""),
+        });
+    }
+
     pub fn text(tree: *Tree, s: [:0]const u8) !Node {
         const span = s;
 
@@ -640,39 +937,49 @@ pub const Tree = struct {
         }
 
         if (span.len <= 4) {
-            // TODO: handle non-ASCII UTF-8 spans up to 3 bytes
-
-            var ascii = [4]u7{ 0, 0, 0, 0 };
-            for (span, 0..) |c, i| {
-                ascii[i] = @intCast(c);
+            // Check if all bytes are ASCII (< 128)
+            var all_ascii = true;
+            for (span) |c| {
+                if (c >= 128) {
+                    all_ascii = false;
+                    break;
+                }
             }
 
-            return .{
-                .kind = .text,
-                .data = .{
-                    .text = .{
-                        .kind = .tiny,
-                        .data = .{
-                            .tiny = .{
-                                .kind = .ascii,
-                                .data = .{
-                                    .ascii = .{ .chrs = ascii },
+            if (all_ascii) {
+                var ascii = [4]u7{ 0, 0, 0, 0 };
+                for (span, 0..) |c, i| {
+                    ascii[i] = @intCast(c);
+                }
+
+                return .{
+                    .kind = .text,
+                    .data = .{
+                        .text = .{
+                            .kind = .tiny,
+                            .data = .{
+                                .tiny = .{
+                                    .kind = .ascii,
+                                    .data = .{
+                                        .ascii = .{ .chrs = ascii },
+                                    },
                                 },
                             },
                         },
                     },
-                },
-            };
+                };
+            }
+            // Fall through to pool case for non-ASCII UTF-8
         }
 
         const spanz = span[0 .. span.len + 1];
 
         const spot: u21 = @intCast(
-            if (std.mem.indexOf(u8, tree.heap.byte.items, spanz)) |i|
+            if (std.mem.indexOf(u8, tree.byte.items, spanz)) |i|
                 i
             else blk: {
-                const next = tree.heap.byte.items.len;
-                try tree.heap.byte.appendSlice(tree.alloc, spanz);
+                const next = tree.byte.items.len;
+                try tree.byte.appendSlice(tree.alloc, spanz);
                 break :blk next;
             },
         );
@@ -727,11 +1034,11 @@ test "text dedup" {
     const n2 = try tree.text("Hello, world!");
 
     try expectEqual(n1.repr(), n2.repr());
-    try expectEqual(1 + "Hello, world!".len, tree.heap.byte.items.len);
+    try expectEqual(1 + "Hello, world!".len, tree.byte.items.len);
 
     const n3 = try tree.text("Hello");
     try expect(n2.repr() != n3.repr());
-    try expectEqual(1 + "Hello, world!".len + 6, tree.heap.byte.items.len);
+    try expectEqual(1 + "Hello, world!".len + 6, tree.byte.items.len);
 }
 
 test "emit plus node" {
@@ -910,10 +1217,55 @@ test "warp aligns after NL; nest adds indent" {
             try t.text("B"),
         );
 
-    // apply warp first (align base to current column = 3), then add nest(+2)
+    // apply warp first (align base to current column = 0), then add nest(+2)
     const doc1 = try t.warp(doc0);
     const doc2 = try t.nest(2, doc1);
 
-    // result: "AAA\n" + 3 (warp) + 2 (nest) spaces + "B"
-    try expectEmitString(&t, "AAA\n     B", doc2);
+    // result: "AAA\n" + 0 (warp) + 2 (nest) spaces + "B"
+    try expectEmitString(&t, "AAA\n  B", doc2);
+}
+
+test "warp with nest when head is non-zero" {
+    var t = Tree.init(std.testing.allocator);
+    defer t.deinit();
+
+    // inner = "X" <> NL <> "Y"
+    const inner =
+        try t.plus(
+            try t.plus(try t.text("X"), Node.nl),
+            try t.text("Y"),
+        );
+
+    // apply warp and nest to inner
+    const warped = try t.warp(inner);
+    const nested = try t.nest(2, warped);
+
+    // outer = "AAA" <> nested
+    // When we emit nested, head will be at column 3 (after "AAA")
+    const outer = try t.plus(try t.text("AAA"), nested);
+
+    // result: "AAA" (head=3) + "X" (head=4) + "\n" + (3 warp + 2 nest = 5 spaces) + "Y"
+    try expectEmitString(&t, "AAAX\n     Y", outer);
+}
+
+test "graphviz output" {
+    var t = Tree.init(std.testing.allocator);
+    defer t.deinit();
+
+    // Create: warp(nest(2, ("foo" <> nl) <> "bar"))
+    const inner = try t.plus(
+        try t.plus(try t.text("foo"), Node.nl),
+        try t.text("bar"),
+    );
+    const doc = try t.warp(try t.nest(2, inner));
+
+    var buffer: [1024]u8 = undefined;
+    const dot = try t.graphviz(&buffer, doc);
+
+    // Just verify it contains expected elements
+    try expect(std.mem.indexOf(u8, dot, "digraph Tree") != null);
+    try expect(std.mem.indexOf(u8, dot, "foo") != null);
+    try expect(std.mem.indexOf(u8, dot, "bar") != null);
+    try expect(std.mem.indexOf(u8, dot, "ʷ") != null);
+    try expect(std.mem.indexOf(u8, dot, "ⁿ") != null);
 }
