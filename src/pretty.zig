@@ -159,6 +159,10 @@ pub const F1 = struct {
         pub fn key(rank: Rank) u32 {
             return (@as(u32, rank.o) << 16) | rank.h;
         }
+
+        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
+            try writer.print("[-{d} #{d}]", .{ self.o, self.h });
+        }
     };
 
     pub fn init(w: u16) F1 {
@@ -258,6 +262,7 @@ pub const Tag = enum(u3) {
     rune = 0b011,
     cons = 0b100,
     fork = 0b101,
+    cont = 0b110,
 };
 
 pub const Side = enum(u1) { lchr, rchr };
@@ -414,6 +419,7 @@ pub const Node = packed struct {
         rune: Rune,
         cons: Oper,
         fork: Oper,
+        cont: Node,
     };
 
     pub const Edit = union(Tag) {
@@ -423,7 +429,10 @@ pub const Node = packed struct {
         rune: *Rune,
         cons: *Oper,
         fork: *Oper,
+        cont: *Node,
     };
+
+    pub const halt = Node{ .tag = .cont, .payload = std.math.maxInt(u29) };
 
     fn view(comptime T: type, this: Node) T {
         return @bitCast(this);
@@ -441,6 +450,7 @@ pub const Node = packed struct {
             .rune => .{ .rune = view(Rune, this) },
             .cons => .{ .cons = view(Oper, this) },
             .fork => .{ .fork = view(Oper, this) },
+            .cont => .{ .cont = this },
         };
     }
 
@@ -452,6 +462,7 @@ pub const Node = packed struct {
             .rune => .{ .rune = mut(Rune, this) },
             .cons => .{ .cons = mut(Oper, this) },
             .fork => .{ .fork = mut(Oper, this) },
+            .cont => .{ .cont = this },
         };
     }
 
@@ -536,118 +547,55 @@ pub const Node = packed struct {
 /// two node handles; 64 bits
 pub const Pair = struct { a: Node, b: Node };
 
-/// Maze layer modeling a small-step evaluator for choosing layouts.
+/// A small-step evaluator for choosing layouts.
 ///
-/// Conceptually we run a Mealy machine whose *current focus* is a `Node`,
-/// accompanied by a continuation that knows what to do once the current
-/// focus finishes.  The continuation is stored in a compact side array so
-/// that machine states are just a tiny `(Node, Tail)` pair.
+/// The `Pair` type is used by the maze in a somewhat different way.
+/// The `a` field is a `Node` as expected, but the `b` field is always
+/// a `.cont` Node which is just an index into the `maze` list.
 pub const Maze = struct {
-    /// A continuation is a single machine instruction: either `halt`,
-    /// meaning we are finished, or `seq(slot)` meaning “after emitting this
-    /// node, look up frame `slot` to continue”.  In other words, `Tail`
-    /// points into the side array of suspended work.
-    pub const Tail = packed struct {
-        kind: Kind = .halt,
-        slot: u29 = 0,
-
-        pub fn halt() Tail {
-            return .{ .kind = .halt };
-        }
-
-        pub fn seq(index: u29) Tail {
-            return .{ .kind = .seq, .slot = index };
-        }
-
-        pub fn isHalt(this: Tail) bool {
-            return this.kind == .halt;
-        }
-    };
-
-    pub const Kind = enum(u3) {
-        halt = 0,
-        seq = 1,
-    };
-
-    /// A `Cell` is the live state of the evaluator: the current `node`
-    /// plus the continuation (`tail`) explaining what to do afterwards.
-    /// Cells are short-lived and live on the worker stack.
-    pub const Cell = struct {
-        node: Node,
-        tail: Tail = Tail.halt(),
-    };
-
-    /// A `Frame` is a suspended continuation stored on the heap.  Whenever
-    /// we descend into the left branch of a sequencing node we push a frame
-    /// that remembers the right branch and whatever tail we were carrying.
-    pub const Frame = struct {
-        next: Node,
-        tail: Tail,
-    };
-
-    /// The small-step machine has three kinds of transitions:
-    ///
-    /// * `emit`: return the next focused node together with the updated tail;
-    /// * `choose`: branch the computation, returning cells for each branch; or
-    /// * `halt`: there is nothing left to evaluate.
     pub const Step = union(enum) {
-        emit: struct {
-            node: Node,
-            tail: Tail,
-        },
-        choose: Choice,
+        emit: Pair,
+        fork: Fork,
         halt: void,
     };
 
-    pub const Choice = struct {
-        left: Cell,
-        right: Cell,
+    pub const Fork = struct {
+        lhs: Pair,
+        rhs: Pair,
     };
 
-    pub fn seed(node: Node) Cell {
-        return .{ .node = node };
+    pub fn goto(tree: *Tree, tail: Node) ?Pair {
+        return if (tail == Node.halt) null else tree.heap.maze.items[tail.payload];
     }
 
-    pub fn reenter(tree: *Tree, tail: Tail) ?Cell {
-        return switch (tail.kind) {
-            .halt => null,
-            .seq => blk: {
-                const frame = tree.heap.maze.items[tail.slot];
-                break :blk .{ .node = frame.next, .tail = frame.tail };
-            },
-        };
-    }
-
-    pub fn step(tree: *Tree, cell: Cell) !Step {
-        switch (cell.node.tag) {
-            .cons => {
-                const oper = cell.node.look().cons;
+    pub fn step(tree: *Tree, cell: Pair) !Step {
+        switch (cell.a.look()) {
+            .cons => |oper| {
                 const pair = tree.heap.plus.items[oper.item];
-                const tail = try pushSeq(tree, pair.b, cell.tail);
-                return .{ .emit = .{ .node = pair.a, .tail = tail } };
+                const tail = try cont(tree, pair.b, cell.b);
+                return .{ .emit = .{ .a = pair.a, .b = tail } };
             },
-            .fork => {
-                const oper = cell.node.look().fork;
+            .fork => |oper| {
                 const pair = tree.heap.fork.items[oper.item];
-                return .{ .choose = .{
-                    .left = .{ .node = pair.a, .tail = cell.tail },
-                    .right = .{ .node = pair.b, .tail = cell.tail },
-                } };
+                return .{
+                    .fork = .{
+                        .lhs = .{ .a = pair.a, .b = cell.b },
+                        .rhs = .{ .a = pair.b, .b = cell.b },
+                    },
+                };
             },
             else => {
-                if (cell.tail.isHalt())
-                    return .{ .emit = .{ .node = cell.node, .tail = Tail.halt() } };
-                return .{ .emit = .{ .node = cell.node, .tail = cell.tail } };
+                return .{ .emit = cell };
             },
         }
     }
 
-    fn pushSeq(tree: *Tree, next: Node, tail: Tail) !Tail {
+    fn cont(tree: *Tree, next: Node, tail: Node) !Node {
         const slot_usize = tree.heap.maze.items.len;
         std.debug.assert(slot_usize <= std.math.maxInt(u29));
         const slot: u29 = @intCast(slot_usize);
-        try tree.heap.maze.append(tree.alloc, .{ .next = next, .tail = tail });
-        return Tail.seq(slot);
+        try tree.heap.maze.append(tree.alloc, .{ .a = next, .b = tail });
+        return .{ .tag = .cont, .payload = slot };
     }
 
     pub const Path = struct {
@@ -729,13 +677,12 @@ pub const Maze = struct {
                 return;
             }
 
-            try writer.writeAll("0b");
             var index: usize = 0;
             while (index < self.bit_len) : (index += 1) {
                 const byte_index = index >> 3;
                 const bit_index: u3 = @intCast(index & 7);
                 const bit = (self.bits[byte_index] >> bit_index) & 1;
-                try writer.writeByte(if (bit == 0) '0' else '1');
+                try writer.writeByte(if (bit == 0) '\\' else '/');
             }
         }
     };
@@ -753,7 +700,7 @@ pub const Tree = struct {
     heap: struct {
         plus: std.ArrayList(Pair) = .empty,
         fork: std.ArrayList(Pair) = .empty,
-        maze: std.ArrayList(Maze.Frame) = .empty,
+        maze: std.ArrayList(Pair) = .empty,
     } = .{},
 
     alloc: std.mem.Allocator,
@@ -780,11 +727,6 @@ pub const Tree = struct {
         return try Gist(@TypeOf(conf)).eval(conf, tree, node);
     }
 
-    pub fn mazeCell(tree: *Tree, node: Node) Maze.Cell {
-        _ = tree;
-        return Maze.seed(node);
-    }
-
     pub fn mazeBest(
         tree: *Tree,
         alloc: std.mem.Allocator,
@@ -800,10 +742,10 @@ pub const Tree = struct {
         const Cost = @TypeOf(cost);
 
         const Candidate = struct {
-            cell: Maze.Cell,
+            cell: Pair,
             trail: std.BitStack,
 
-            fn init(cell: Maze.Cell, arena: std.mem.Allocator) @This() {
+            fn init(cell: Pair, arena: std.mem.Allocator) @This() {
                 return .{
                     .cell = cell,
                     .trail = std.BitStack.init(arena),
@@ -833,7 +775,10 @@ pub const Tree = struct {
             stack.deinit(alloc);
         }
 
-        try stack.append(alloc, Candidate.init(tree.mazeCell(root), alloc));
+        try stack.append(
+            alloc,
+            Candidate.init(.{ .a = root, .b = .halt }, alloc),
+        );
 
         var best_rank: ?Cost.Rank = null;
         var best_path: ?Maze.Path = null;
@@ -852,12 +797,12 @@ pub const Tree = struct {
                 const step = try Maze.step(tree, cand.cell);
                 switch (step) {
                     .emit => |emit| {
-                        cand.cell = .{ .node = emit.node, .tail = emit.tail };
+                        cand.cell = emit;
 
-                        if (!cand.cell.node.isText())
+                        if (!cand.cell.a.isText())
                             continue;
 
-                        if (Maze.reenter(tree, cand.cell.tail)) |next| {
+                        if (Maze.goto(tree, cand.cell.b)) |next| {
                             cand.cell = next;
                             continue;
                         }
@@ -865,16 +810,16 @@ pub const Tree = struct {
                         finished = true;
                         break;
                     },
-                    .choose => |choice| {
+                    .fork => |choice| {
                         var right = try cand.clone(alloc);
                         try right.trail.push(1);
-                        right.cell = choice.right;
+                        right.cell = choice.rhs;
                         stack.append(alloc, right) catch |err| {
                             right.deinit(alloc);
                             return err;
                         };
                         try cand.trail.push(0);
-                        cand.cell = choice.left;
+                        cand.cell = choice.lhs;
                         continue;
                     },
                     .halt => {
@@ -900,16 +845,11 @@ pub const Tree = struct {
             const is_new_best = best_rank == null or cost.wins(cand_rank, best_rank.?);
 
             if (trace_writer) |w| {
-                var tail_buf: [64]u8 = undefined;
-                const summary = tailSummary(tree, cand.cell.tail, &tail_buf);
                 try w.print(
-                    "maze path={f} depth={d} frames={d} node={s} tail={s} rank={any}{s}\n",
+                    "{f} x{d} {f}{s}\n",
                     .{
                         Maze.fmtStack(&cand.trail),
-                        cand.trail.bit_len,
                         tree.heap.maze.items.len,
-                        @tagName(cand.cell.node.tag),
-                        summary,
                         cand_rank,
                         if (is_new_best) "  ← best so far" else "",
                     },
@@ -946,44 +886,6 @@ pub const Tree = struct {
         if (cursor.remaining() != 0)
             return error.MazePathUnused;
         try sink.flush();
-    }
-
-    fn tailSummary(tree: *Tree, tail: Maze.Tail, buffer: []u8) []const u8 {
-        var stream = std.io.fixedBufferStream(buffer);
-        const writer = stream.writer();
-
-        if (tail.isHalt()) {
-            writer.writeAll("-") catch {};
-            return stream.getWritten();
-        }
-
-        writer.writeByte('[') catch {};
-
-        var current = tail;
-        var depth: usize = 0;
-
-        while (true) {
-            const frame = tree.heap.maze.items[current.slot];
-            if (depth != 0) {
-                writer.writeAll(",") catch {};
-            }
-            writer.print("{s}", .{@tagName(frame.next.tag)}) catch {};
-            depth += 1;
-
-            if (frame.tail.isHalt()) {
-                break;
-            }
-
-            if (depth >= 4) {
-                writer.writeAll(",…") catch {};
-                break;
-            }
-
-            current = frame.tail;
-        }
-
-        writer.writeByte(']') catch {};
-        return stream.getWritten();
     }
 
     pub fn flat(tree: *Tree, lhs: Node) !Node {
@@ -1405,14 +1307,14 @@ test "maze small-step plus" {
             try expectEqual(left.repr(), emit.node.repr());
             try expect(!emit.tail.isHalt());
 
-            const next_cell = Maze.reenter(&tree, emit.tail) orelse return error.TestExpectedResult;
+            const next_cell = Maze.goto(&tree, emit.tail) orelse return error.TestExpectedResult;
             const second = try Maze.step(&tree, next_cell);
 
             switch (second) {
                 .emit => |again| {
                     try expectEqual(right.repr(), again.node.repr());
                     try expect(again.tail.isHalt());
-                    try expect(Maze.reenter(&tree, again.tail) == null);
+                    try expect(Maze.goto(&tree, again.tail) == null);
                 },
                 else => return error.TestExpectedResult,
             }
