@@ -276,8 +276,11 @@ test "graphviz output" {
     );
     const doc = try t.warp(try t.nest(2, inner));
 
-    var buffer: [1024]u8 = undefined;
-    const dot = try graphviz(&t, &buffer, doc);
+    var sink = std.Io.Writer.Allocating.init(std.testing.allocator);
+    defer sink.deinit();
+
+    try graphviz(&t, &sink.writer, doc);
+    const dot = sink.written();
 
     // Just verify it contains expected elements
     try expect(std.mem.indexOf(u8, dot, "digraph Tree") != null);

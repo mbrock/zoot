@@ -613,21 +613,21 @@ pub const Pair = packed struct {
     pub const halt: Pair = .{ .a = .halt, .b = .halt };
 };
 
+/// The next step of the maze task is zero, one, or two continuations.
+/// If both are halt, that's zero continuations; done.
+/// If both are full, that's two continuations; fork.
+/// If tail is halt, that's one continuation; emit.
+pub const Step = struct {
+    head: Pair = .halt,
+    tail: Pair = .halt,
+};
+
 /// A small-step evaluator for choosing layouts.
 ///
 /// The `Pair` type is used by the maze in a somewhat different way.
 /// The `a` field is a `Node` as expected, but the `b` field is always
 /// a `.cont` Node which is just an index into the `maze` list.
 pub const Maze = struct {
-    /// The next step of the maze task is zero, one, or two continuations.
-    /// If both are halt, that's zero continuations; done.
-    /// If both are full, that's two continuations; fork.
-    /// If tail is halt, that's one continuation; emit.
-    pub const Step = struct {
-        head: Pair = .halt,
-        tail: Pair = .halt,
-    };
-
     pub fn goto(tree: *Tree, tail: Node) ?Pair {
         return if (tail == Node.halt) null else tree.heap.maze.items[tail.payload];
     }
@@ -1290,26 +1290,18 @@ test "maze small-step plus" {
 
     const start: Pair = .{ .a = doc, .b = .halt };
     const first = try Maze.step(&tree, start);
+    const emit = first.head;
 
-    switch (first) {
-        .emit => |emit| {
-            try expectEqual(left.repr(), emit.a.repr());
-            try expect(emit.b != Node.halt);
+    try expectEqual(left.repr(), emit.a.repr());
+    try expect(emit.b != Node.halt);
 
-            const next_cell = Maze.goto(&tree, emit.b) orelse return error.TestExpectedResult;
-            const second = try Maze.step(&tree, next_cell);
+    const next_cell = Maze.goto(&tree, emit.b) orelse return error.TestExpectedResult;
+    const second = try Maze.step(&tree, next_cell);
+    const again = second.head;
 
-            switch (second) {
-                .emit => |again| {
-                    try expectEqual(right.repr(), again.a.repr());
-                    try expect(again.b == Node.halt);
-                    try expect(Maze.goto(&tree, again.b) == null);
-                },
-                else => return error.TestExpectedResult,
-            }
-        },
-        else => return error.TestExpectedResult,
-    }
+    try expectEqual(right.repr(), again.a.repr());
+    try expect(again.b == Node.halt);
+    try expect(Maze.goto(&tree, again.b) == null);
 }
 
 test "maze evaluation chooses best layout" {
@@ -1332,15 +1324,13 @@ test "maze evaluation chooses best layout" {
 
     const cost = F1.init(10);
     var result = try tree.best(std.testing.allocator, cost, doc, null);
-    defer result.path.deinit(std.testing.allocator);
+    defer result.deinit(std.testing.allocator);
 
     const buf = try std.testing.allocator.alloc(u8, 64);
     defer std.testing.allocator.free(buf);
     var sink = std.Io.Writer.fixed(buf);
-    try tree.renderWithPath(&sink, doc, &result.path);
+    try tree.renderWithPath(&sink, doc, &result);
     try expectEqualStrings("foo bar", sink.buffered());
-    try expectEqual(@as(u16, 0), result.rank.o);
-    try expectEqual(@as(u16, 0), result.rank.h);
 }
 
 test "flatten fused text <> nl" {
