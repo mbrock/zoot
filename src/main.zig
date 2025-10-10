@@ -125,65 +125,15 @@ pub fn main() !void {
     try writer.writeByte('\n');
     try writer.print("score: overflow={d} lines={d}\n\n", .{ best_demo.rank.o, best_demo.rank.h });
 
-    // Produce the original visualization example.
-    var tree = pretty.Tree.init(allocator);
-    defer tree.deinit();
-
-    const condition = try tree.cat(&.{
-        try tree.text("x"),
-        try tree.text(" "),
-        try tree.text(">"),
-        try tree.text(" "),
-        try tree.text("0"),
-    });
-
-    const call1_args = try tree.cat(&.{
-        try tree.text("alpha"),
-        try tree.text(","),
-        try tree.fork(
-            try tree.text(" "),
-            try tree.plus(pretty.Node.nl, try tree.text("  ")),
-        ),
-        try tree.text("beta"),
-    });
-
-    const call1 = try tree.cat(&.{
-        try tree.text("fooFunction"),
-        try tree.parens(call1_args),
-        try tree.text(";"),
-    });
-
-    const call2 = try tree.cat(&.{
-        try tree.text("barFunction"),
-        try tree.text("()"),
-        try tree.text(";"),
-    });
-
-    const body = try tree.sepBy(&.{ call1, call2 }, try tree.fork(
-        try tree.text(" "),
-        pretty.Node.nl,
-    ));
-
-    const if_stmt = try tree.cat(&.{
-        try tree.text("if"),
-        try tree.text(" "),
-        try tree.parens(condition),
-        try tree.text(" "),
-        try tree.braces(try tree.cat(&.{
-            try tree.fork(try tree.text(" "), pretty.Node.nl),
-            try tree.nest(2, body),
-            try tree.fork(try tree.text(" "), pretty.Node.nl),
-        })),
-    });
-
+    // Export the same document for visualization.
     var dot_buffer: [65536]u8 = undefined;
-    const dot = try viz.graphviz(&tree, &dot_buffer, if_stmt);
+    const dot = try viz.graphviz(&demo_tree, &dot_buffer, demo_doc);
     const dot_file = try std.fs.cwd().createFile("graphviz.dot", .{});
     defer dot_file.close();
     try dot_file.writeAll(dot);
 
     var json_buffer: [65536]u8 = undefined;
-    const json = try viz.toJson(&tree, &json_buffer, if_stmt);
+    const json = try viz.toJson(&demo_tree, &json_buffer, demo_doc);
     const json_file = try std.fs.cwd().createFile("tree.json", .{});
     defer json_file.close();
     try json_file.writeAll(json);

@@ -1,4 +1,5 @@
 const std = @import("std");
+const TreePrinter = @import("TreePrinter.zig");
 const log = std.log;
 
 pub const Show = struct {
@@ -535,8 +536,17 @@ pub const Node = packed struct {
 /// two node handles; 64 bits
 pub const Pair = struct { a: Node, b: Node };
 
-/// Maze layer modeling small-step exploration above the node layer.
+/// Maze layer modeling a small-step evaluator for choosing layouts.
+///
+/// Conceptually we run a Mealy machine whose *current focus* is a `Node`,
+/// accompanied by a continuation that knows what to do once the current
+/// focus finishes.  The continuation is stored in a compact side array so
+/// that machine states are just a tiny `(Node, Tail)` pair.
 pub const Maze = struct {
+    /// A continuation is a single machine instruction: either `halt`,
+    /// meaning we are finished, or `seq(slot)` meaning “after emitting this
+    /// node, look up frame `slot` to continue”.  In other words, `Tail`
+    /// points into the side array of suspended work.
     pub const Tail = packed struct {
         kind: Kind = .halt,
         slot: u29 = 0,
@@ -559,16 +569,27 @@ pub const Maze = struct {
         seq = 1,
     };
 
+    /// A `Cell` is the live state of the evaluator: the current `node`
+    /// plus the continuation (`tail`) explaining what to do afterwards.
+    /// Cells are short-lived and live on the worker stack.
     pub const Cell = struct {
         node: Node,
         tail: Tail = Tail.halt(),
     };
 
+    /// A `Frame` is a suspended continuation stored on the heap.  Whenever
+    /// we descend into the left branch of a sequencing node we push a frame
+    /// that remembers the right branch and whatever tail we were carrying.
     pub const Frame = struct {
         next: Node,
         tail: Tail,
     };
 
+    /// The small-step machine has three kinds of transitions:
+    ///
+    /// * `emit`: return the next focused node together with the updated tail;
+    /// * `choose`: branch the computation, returning cells for each branch; or
+    /// * `halt`: there is nothing left to evaluate.
     pub const Step = union(enum) {
         emit: struct {
             node: Node,
@@ -879,11 +900,20 @@ pub const Tree = struct {
             const is_new_best = best_rank == null or cost.wins(cand_rank, best_rank.?);
 
             if (trace_writer) |w| {
-                try w.print("maze path={f} rank={any}{s}\n", .{
-                    Maze.fmtStack(&cand.trail),
-                    cand_rank,
-                    if (is_new_best) "  ← best so far" else "",
-                });
+                var tail_buf: [64]u8 = undefined;
+                const summary = tailSummary(tree, cand.cell.tail, &tail_buf);
+                try w.print(
+                    "maze path={f} depth={d} frames={d} node={s} tail={s} rank={any}{s}\n",
+                    .{
+                        Maze.fmtStack(&cand.trail),
+                        cand.trail.bit_len,
+                        tree.heap.maze.items.len,
+                        @tagName(cand.cell.node.tag),
+                        summary,
+                        cand_rank,
+                        if (is_new_best) "  ← best so far" else "",
+                    },
+                );
             }
 
             if (is_new_best) {
@@ -916,6 +946,44 @@ pub const Tree = struct {
         if (cursor.remaining() != 0)
             return error.MazePathUnused;
         try sink.flush();
+    }
+
+    fn tailSummary(tree: *Tree, tail: Maze.Tail, buffer: []u8) []const u8 {
+        var stream = std.io.fixedBufferStream(buffer);
+        const writer = stream.writer();
+
+        if (tail.isHalt()) {
+            writer.writeAll("-") catch {};
+            return stream.getWritten();
+        }
+
+        writer.writeByte('[') catch {};
+
+        var current = tail;
+        var depth: usize = 0;
+
+        while (true) {
+            const frame = tree.heap.maze.items[current.slot];
+            if (depth != 0) {
+                writer.writeAll(",") catch {};
+            }
+            writer.print("{s}", .{@tagName(frame.next.tag)}) catch {};
+            depth += 1;
+
+            if (frame.tail.isHalt()) {
+                break;
+            }
+
+            if (depth >= 4) {
+                writer.writeAll(",…") catch {};
+                break;
+            }
+
+            current = frame.tail;
+        }
+
+        writer.writeByte(']') catch {};
+        return stream.getWritten();
     }
 
     pub fn flat(tree: *Tree, lhs: Node) !Node {

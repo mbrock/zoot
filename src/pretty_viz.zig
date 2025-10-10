@@ -23,8 +23,11 @@ pub fn toJson(t1: *Tree, buffer: []u8, node: Node) ![]const u8 {
     var t2 = Tree.init(t1.alloc);
     defer t2.deinit();
 
-    const body = try jsonNode(&t2, t1, node);
-    return try t2.render(buffer, body);
+    const tree_field = try jsonField(&t2, "tree", try jsonNode(&t2, t1, node));
+    const maze_field = try jsonField(&t2, "maze", try jsonMaze(&t2, t1));
+
+    const doc = try t2.braces(try t2.sepBy(&.{ tree_field, maze_field }, try t2.text(",")));
+    return try t2.render(buffer, doc);
 }
 
 fn jsonNode(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
@@ -83,6 +86,29 @@ fn jsonNode(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
     };
 
     return try t2.braces(try t2.sepBy(fields, try t2.text(",")));
+}
+
+fn jsonMaze(t2: *Tree, t1: *Tree) !Node {
+    var frames = std.ArrayListUnmanaged(Node){};
+    defer frames.deinit(t2.alloc);
+
+    for (t1.heap.maze.items, 0..) |frame, idx| {
+        const slot_field = try jsonField(t2, "slot", try t2.format("{d}", .{idx}));
+        const next_field = try jsonField(t2, "next", try t2.quotes(try t2.format("{x}", .{frame.next.repr()})));
+        const next_kind_field = try jsonString(t2, "nextKind", @tagName(frame.next.tag));
+        const tail_kind_field = try jsonString(t2, "tailKind", @tagName(frame.tail.kind));
+        const tail_slot_field = try jsonField(t2, "tailSlot", try t2.format("{d}", .{frame.tail.slot}));
+
+        const span = &[_]Node{ slot_field, next_field, next_kind_field, tail_kind_field, tail_slot_field };
+        try frames.append(t2.alloc, try t2.braces(try t2.sepBy(span, try t2.text(","))));
+    }
+
+    const contents = if (frames.items.len == 0)
+        try t2.text("")
+    else
+        try t2.sepBy(frames.items, try t2.text(","));
+
+    return try t2.brackets(contents);
 }
 
 pub fn graphviz(t1: *Tree, buffer: []u8, node: Node) ![]const u8 {
