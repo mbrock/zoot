@@ -392,16 +392,52 @@ pub const Node = packed struct {
 
     pub const Form = Tag;
 
-    fn viewConst(comptime T: type, this: Node) T {
+    pub const Look = union(Tag) {
+        span: Span,
+        quad: Quad,
+        trip: Trip,
+        rune: Rune,
+        cons: Oper,
+        fork: Oper,
+    };
+
+    pub const Edit = union(Tag) {
+        span: *Span,
+        quad: *Quad,
+        trip: *Trip,
+        rune: *Rune,
+        cons: *Oper,
+        fork: *Oper,
+    };
+
+    fn view(comptime T: type, this: Node) T {
         return @bitCast(this);
     }
 
-    fn viewMut(comptime T: type, this: *Node) *T {
+    fn mut(comptime T: type, this: *Node) *T {
         return @ptrCast(@alignCast(this));
     }
 
-    pub fn look(this: Node) Form {
-        return this.tag;
+    pub fn look(this: Node) Look {
+        return switch (this.tag) {
+            .span => .{ .span = view(Span, this) },
+            .quad => .{ .quad = view(Quad, this) },
+            .trip => .{ .trip = view(Trip, this) },
+            .rune => .{ .rune = view(Rune, this) },
+            .cons => .{ .cons = view(Oper, this) },
+            .fork => .{ .fork = view(Oper, this) },
+        };
+    }
+
+    pub fn edit(this: *Node) Edit {
+        return switch (this.tag) {
+            .span => .{ .span = mut(Span, this) },
+            .quad => .{ .quad = mut(Quad, this) },
+            .trip => .{ .trip = mut(Trip, this) },
+            .rune => .{ .rune = mut(Rune, this) },
+            .cons => .{ .cons = mut(Oper, this) },
+            .fork => .{ .fork = mut(Oper, this) },
+        };
     }
 
     pub fn isText(this: Node) bool {
@@ -411,49 +447,9 @@ pub const Node = packed struct {
         };
     }
 
-    pub fn asSpan(this: Node) Span {
-        return viewConst(Span, this);
-    }
-
-    pub fn asSpanPtr(this: *Node) *Span {
-        return viewMut(Span, this);
-    }
-
-    pub fn asQuad(this: Node) Quad {
-        return viewConst(Quad, this);
-    }
-
-    pub fn asQuadPtr(this: *Node) *Quad {
-        return viewMut(Quad, this);
-    }
-
-    pub fn asTrip(this: Node) Trip {
-        return viewConst(Trip, this);
-    }
-
-    pub fn asTripPtr(this: *Node) *Trip {
-        return viewMut(Trip, this);
-    }
-
-    pub fn asRune(this: Node) Rune {
-        return viewConst(Rune, this);
-    }
-
-    pub fn asRunePtr(this: *Node) *Rune {
-        return viewMut(Rune, this);
-    }
-
-    pub fn asOper(this: Node) Oper {
-        return viewConst(Oper, this);
-    }
-
-    pub fn asOperPtr(this: *Node) *Oper {
-        return viewMut(Oper, this);
-    }
-
     pub fn isEmptyText(this: Node) bool {
         return switch (this.look()) {
-            .rune => this.asRune().isEmpty(),
+            .rune => |rune| rune.isEmpty(),
             else => false,
         };
     }
@@ -463,12 +459,7 @@ pub const Node = packed struct {
         Unimplemented,
     }!void {
         switch (this.look()) {
-            .span => try this.asSpan().emit(show),
-            .quad => try this.asQuad().emit(show),
-            .trip => try this.asTrip().emit(show),
-            .rune => try this.asRune().emit(show),
-            .cons => try this.asOper().emit(show),
-            .fork => try this.asOper().emit(show),
+            inline else => |value| try value.emit(show),
         }
     }
 
@@ -477,55 +468,52 @@ pub const Node = packed struct {
     }
 
     pub fn fromSpan(side: Side, char: u7, text: u21) Node {
-        const view: Span = .{
+        const span: Span = .{
             .side = side,
             .char = char,
             .text = text,
         };
-        return @bitCast(view);
+        return @bitCast(span);
     }
 
-    pub fn fromTinyAscii(chars: [4]u7) Node {
-        const view: Quad = .{
-            .pad = 0,
+    pub fn fromQuad(chars: [4]u7) Node {
+        const quad: Quad = .{
             .ch0 = chars[0],
             .ch1 = chars[1],
             .ch2 = chars[2],
             .ch3 = chars[3],
         };
-        return @bitCast(view);
+        return @bitCast(quad);
     }
 
-    pub fn fromTinyUtf8(reps: u3, bytes: [3]u8) Node {
-        const view: Trip = .{
-            .pad = 0,
+    pub fn fromTrip(reps: u3, bytes: [3]u8) Node {
+        const trip: Trip = .{
             .reps = reps,
             .byte0 = bytes[0],
             .byte1 = bytes[1],
             .byte2 = bytes[2],
         };
-        return @bitCast(view);
+        return @bitCast(trip);
     }
 
-    pub fn fromTinyRune(reps: u6, code: u21) Node {
-        const view: Rune = .{
-            .pad = 0,
+    pub fn fromRune(reps: u6, code: u21) Node {
+        const rune: Rune = .{
             .reps = reps,
             .code = code,
         };
-        return @bitCast(view);
+        return @bitCast(rune);
     }
 
     pub fn fromOper(kind: Tag, frob: Frob, what: u21) Node {
-        const view: Oper = .{
+        const oper: Oper = .{
             .tag = kind,
             .frob = frob,
             .item = what,
         };
-        return @bitCast(view);
+        return @bitCast(oper);
     }
 
-    pub const nl: Node = Node.fromTinyRune(1, '\n');
+    pub const nl: Node = Node.fromRune(1, '\n');
 };
 
 /// two node handles; 64 bits
@@ -557,7 +545,7 @@ pub const Tree = struct {
         tree.heap.fork.deinit(tree.alloc);
     }
 
-    pub fn show(tree: *Tree, buffer: []u8, node: Node) ![]const u8 {
+    pub fn render(tree: *Tree, buffer: []u8, node: Node) ![]const u8 {
         var w = std.Io.Writer.fixed(buffer);
         var it = Show{ .tree = tree, .sink = &w };
         try node.emit(&it);
@@ -571,23 +559,20 @@ pub const Tree = struct {
     pub fn flat(tree: *Tree, lhs: Node) !Node {
         _ = tree;
         var new = lhs;
-        switch (new.look()) {
-            .span => {
-                var pool = new.asSpanPtr();
-                if (pool.char == '\n')
-                    pool.char = ' ';
+        switch (new.edit()) {
+            .span => |span| {
+                if (span.char == '\n')
+                    span.char = ' ';
                 return new;
             },
             .quad => return new,
             .trip => return new,
-            .rune => {
-                var rune = new.asRunePtr();
+            .rune => |rune| {
                 if (rune.code == '\n')
                     rune.code = ' ';
                 return new;
             },
-            .cons, .fork => {
-                var oper = new.asOperPtr();
+            .cons, .fork => |oper| {
                 oper.frob.flat = 1;
                 return new;
             },
@@ -607,9 +592,8 @@ pub const Tree = struct {
             return doc;
 
         var new = doc;
-        switch (new.look()) {
-            .cons, .fork => {
-                var oper = new.asOperPtr();
+        switch (new.edit()) {
+            .cons, .fork => |oper| {
                 oper.frob.nest +|= indent;
                 return new;
             },
@@ -626,10 +610,13 @@ pub const Tree = struct {
     ///     ...DDDDDD
     ///     ...DDD
     pub fn warp(tree: *Tree, doc: Node) !Node {
-        switch (doc.look()) {
+        switch (doc.tag) {
             .cons, .fork => {
                 var new = doc;
-                new.asOperPtr().frob.warp = 1;
+                switch (new.edit()) {
+                    .cons, .fork => |oper| oper.frob.warp = 1,
+                    else => unreachable,
+                }
                 return new;
             },
             .span, .quad, .trip, .rune => if (doc.isEmptyText())
@@ -640,7 +627,7 @@ pub const Tree = struct {
                 // We need an `oper` to carry the `frob`.
                 // If `plus` learns to fuse tiny texts,
                 // we'll need to fix this path.
-                std.debug.assert(oper.look() == .cons);
+                std.debug.assert(oper.tag == .cons);
 
                 return try tree.warp(oper);
             },
@@ -649,26 +636,30 @@ pub const Tree = struct {
 
     pub fn plus(tree: *Tree, lhs: Node, rhs: Node) !Node {
         if (rhs == Node.nl and lhs.isText()) {
-            var fused = lhs;
-            if (fused.look() == .span) {
-                var pool = fused.asSpanPtr();
-                if (pool.char == 0) {
-                    pool.side = .rchr;
-                    pool.char = '\n';
-                    return fused;
-                }
+            var new = lhs;
+            switch (new.edit()) {
+                .span => |span| {
+                    if (span.char == 0) {
+                        span.side = .rchr;
+                        span.char = '\n';
+                        return new;
+                    }
+                },
+                else => {},
             }
         }
 
         if (lhs == Node.nl and rhs.isText()) {
-            var fused = rhs;
-            if (fused.look() == .span) {
-                var pool = fused.asSpanPtr();
-                if (pool.char == 0) {
-                    pool.side = .lchr;
-                    pool.char = '\n';
-                    return fused;
-                }
+            var new = rhs;
+            switch (new.edit()) {
+                .span => |span| {
+                    if (span.char == 0) {
+                        span.side = .lchr;
+                        span.char = '\n';
+                        return new;
+                    }
+                },
+                else => {},
             }
         }
 
@@ -751,7 +742,7 @@ pub const Tree = struct {
         // (either it found a duplicate, or it made a tiny immediate node)
         const start_index: u21 = @intCast(start_len);
         const should_rewind = switch (node.look()) {
-            .span => node.asSpan().text != start_index,
+            .span => |span| span.text != start_index,
             .quad, .trip, .rune => true,
             else => false,
         };
@@ -812,7 +803,7 @@ pub const Tree = struct {
 
         if (span.len <= 1) {
             const code: u21 = if (span.len == 0) 0 else @intCast(span[0]);
-            return Node.fromTinyRune(@intCast(span.len), code);
+            return Node.fromRune(@intCast(span.len), code);
         }
 
         if (span.len <= 4) {
@@ -831,7 +822,7 @@ pub const Tree = struct {
                     ascii[i] = @intCast(c);
                 }
 
-                return Node.fromTinyAscii(ascii);
+                return Node.fromQuad(ascii);
             }
             // Fall through to pool case for non-ASCII UTF-8
         }
@@ -850,6 +841,13 @@ pub const Tree = struct {
 
         return Node.fromSpan(.lchr, 0, spot);
     }
+
+    pub fn format_peek(tree: *Tree, comptime fmt: []const u8, args: anytype) !Node.Look {
+        _ = tree;
+        _ = fmt;
+        _ = args;
+        return error.Unimplemented;
+    }
 };
 
 const expect = std.testing.expect;
@@ -860,7 +858,7 @@ fn expectEmitString(tree: *Tree, text: []const u8, node: Node) !void {
     const buffer = try std.testing.allocator.alloc(u8, text.len * 2);
     defer std.testing.allocator.free(buffer);
 
-    try expectEqualStrings(text, try tree.show(buffer, node));
+    try expectEqualStrings(text, try tree.render(buffer, node));
 }
 
 test "show tiny" {
@@ -930,10 +928,14 @@ test "fuse text <> nl" {
     const text_node = try t.text("Hello, world!");
     const fused = try t.plus(text_node, .nl);
 
-    try expect(fused.look() == .span);
-    const pool = fused.asSpan();
-    try expectEqual(pool.side, .rchr);
-    try expectEqual(pool.char, '\n');
+    try expect(fused.tag == .span);
+    switch (fused.look()) {
+        .span => |pool| {
+            try expectEqual(pool.side, .rchr);
+            try expectEqual(pool.char, '\n');
+        },
+        else => unreachable,
+    }
     try expectEqual(0, t.heap.plus.items.len);
     try expectEmitString(&t, "Hello, world!\n", fused);
 }
@@ -945,10 +947,14 @@ test "fuse nl <> text" {
     const text_node = try t.text("Hello, world!");
     const fused = try t.plus(.nl, text_node);
 
-    try expect(fused.look() == .span);
-    const pool = fused.asSpan();
-    try expectEqual(pool.side, .lchr);
-    try expectEqual(pool.char, '\n');
+    try expect(fused.tag == .span);
+    switch (fused.look()) {
+        .span => |pool| {
+            try expectEqual(pool.side, .lchr);
+            try expectEqual(pool.char, '\n');
+        },
+        else => unreachable,
+    }
     try expectEqual(0, t.heap.plus.items.len);
     try expectEmitString(&t, "\nHello, world!", fused);
 }
