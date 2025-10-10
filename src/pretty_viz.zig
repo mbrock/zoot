@@ -19,7 +19,7 @@ fn stmt(t: *Tree, s: Node) !Node {
     return try t.cat(&.{ s, try t.text(";") });
 }
 
-pub fn toJson(t1: *Tree, buffer: []u8, node: Node) ![]const u8 {
+pub fn toJson(t1: *Tree, sink: *std.Io.Writer, node: Node) !void {
     var t2 = Tree.init(t1.alloc);
     defer t2.deinit();
 
@@ -27,7 +27,7 @@ pub fn toJson(t1: *Tree, buffer: []u8, node: Node) ![]const u8 {
     const maze_field = try jsonField(&t2, "maze", try jsonMaze(&t2, t1));
 
     const doc = try t2.braces(try t2.sepBy(&.{ tree_field, maze_field }, try t2.text(",")));
-    return try t2.render(buffer, doc);
+    try t2.emit(sink, doc);
 }
 
 fn jsonNode(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
@@ -113,7 +113,7 @@ fn jsonMaze(t2: *Tree, t1: *Tree) !Node {
     return try t2.brackets(contents);
 }
 
-pub fn graphviz(t1: *Tree, buffer: []u8, node: Node) ![]const u8 {
+pub fn graphviz(t1: *Tree, sink: *std.Io.Writer, node: Node) !void {
     var t2 = Tree.init(t1.alloc);
     defer t2.deinit();
 
@@ -130,7 +130,7 @@ pub fn graphviz(t1: *Tree, buffer: []u8, node: Node) ![]const u8 {
         2,
     );
 
-    return try t2.render(buffer, doc);
+    try t2.emit(sink, doc);
 }
 
 fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {

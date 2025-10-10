@@ -40,7 +40,7 @@ pub const Path = struct {
         var index: usize = 0;
         while (index < this.bits.bit_length) : (index += 1) {
             const bit = this.bits.isSet(index);
-            try writer.writeByte(if (bit) '/' else '\\');
+            try writer.writeAll(if (bit) "╱" else "╲");
         }
     }
 
@@ -225,7 +225,7 @@ pub const F1 = struct {
         }
 
         pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            try writer.print("[-{d} #{d}]", .{ self.o, self.h });
+            try writer.print("{d: >4} debt {d: >4} rows", .{ self.o, self.h });
         }
     };
 
@@ -427,12 +427,12 @@ pub const Frob = packed struct {
 };
 
 pub const Oper = packed struct {
-    tag: Tag = .cons,
+    kind: Tag = .cons,
     frob: Frob = .{},
     item: u21 = 0,
 
     pub fn emit(this: Oper, show: *Show) !void {
-        switch (this.tag) {
+        switch (this.kind) {
             .cons => {
                 const saveflat = show.flat;
                 defer show.flat = saveflat;
@@ -595,7 +595,7 @@ pub const Node = packed struct {
 
     pub fn fromOper(kind: Tag, frob: Frob, what: u21) Node {
         const oper: Oper = .{
-            .tag = kind,
+            .kind = kind,
             .frob = frob,
             .item = what,
         };
@@ -638,7 +638,12 @@ pub const Maze = struct {
                 // To step into `a <> b` with a continuation `c`,
                 // we step into `a` with a new continuation `b <> c`.
                 const pair = tree.heap.plus.items[cons.item];
-                return .{ .head = .{ .a = pair.a, .b = try save(tree, pair.b, cont.b) } };
+                return .{
+                    .head = .{
+                        .a = pair.a,
+                        .b = try save(tree, pair.b, cont.b),
+                    },
+                };
             },
             .fork => |fork| {
                 const pair = tree.heap.fork.items[fork.item];
@@ -661,6 +666,134 @@ pub const Maze = struct {
             .tag = .cont,
             .payload = @intCast(slot),
         };
+    }
+
+    pub fn best(
+        tree: *Tree,
+        bank: std.mem.Allocator,
+        cost: anytype,
+        root: Node,
+        info: ?*std.Io.Writer,
+    ) !Path {
+        tree.heap.maze.clearRetainingCapacity();
+
+        const Cost = @TypeOf(cost);
+
+        const Candidate = struct {
+            cell: Pair,
+            path: Path,
+
+            fn init(cell: Pair, arena: std.mem.Allocator) !@This() {
+                return .{
+                    .cell = cell,
+                    .path = try Path.init(arena),
+                };
+            }
+
+            fn copy(self: *const @This(), arena: std.mem.Allocator) !@This() {
+                return .{
+                    .cell = self.cell,
+                    .path = try self.path.clone(arena),
+                };
+            }
+
+            fn free(self: *@This(), arena: std.mem.Allocator) void {
+                self.path.deinit(arena);
+            }
+        };
+
+        var stack = std.ArrayList(Candidate){};
+        defer {
+            for (stack.items) |*c| c.free(bank);
+            stack.deinit(bank);
+        }
+
+        try stack.append(
+            bank,
+            try Candidate.init(.{ .a = root, .b = .halt }, bank),
+        );
+
+        var best_rank: ?Cost.Rank = null;
+        var best_path: ?Path = null;
+        errdefer if (best_path) |*path| {
+            path.deinit(bank);
+        };
+
+        while (stack.items.len != 0) {
+            var cand = stack.pop() orelse unreachable;
+            defer cand.free(bank);
+
+            var finished = false;
+
+            while (true) {
+                const cont = try Maze.step(tree, cand.cell);
+                if (cont.head == Pair.halt) {
+                    finished = true;
+                    continue;
+                } else if (cont.tail == Pair.halt) {
+                    cand.cell = cont.head;
+
+                    if (!cand.cell.a.isText())
+                        continue;
+
+                    if (Maze.goto(tree, cand.cell.b)) |next| {
+                        cand.cell = next;
+                        continue;
+                    }
+
+                    finished = true;
+                    break;
+                } else {
+                    var right = try cand.copy(bank);
+                    try right.path.push(bank, 1);
+                    right.cell = cont.tail;
+                    stack.append(bank, right) catch |err| {
+                        right.free(bank);
+                        return err;
+                    };
+                    try cand.path.push(bank, 0);
+                    cand.cell = cont.head;
+                    continue;
+                }
+            }
+
+            if (!finished) continue;
+
+            var walk = cand.path.walk();
+            var note: [256]u8 = undefined;
+            var gist = Gist(Cost).init(&note, cost);
+            var show = Show{ .tree = tree, .sink = &gist.sink, .path = &walk };
+            try root.emit(&show);
+            try gist.sink.flush();
+
+            if (walk.remaining() != 0)
+                return error.MazePathUnused;
+
+            const cand_rank = gist.rank;
+            const is_new_best = best_rank == null or cost.wins(cand_rank, best_rank.?);
+
+            if (info) |w| {
+                try w.print(
+                    "{s} {f} {f}  {d: >4} maze\n",
+                    .{
+                        if (is_new_best) "★" else " ",
+                        cand.path,
+                        cand_rank,
+                        tree.heap.maze.items.len,
+                    },
+                );
+            }
+
+            if (is_new_best) {
+                if (best_path) |*path| {
+                    path.deinit(bank);
+                }
+                best_path = try cand.path.clone(bank);
+                best_rank = cand_rank;
+            }
+        }
+
+        return best_path orelse return error.MazeNoLayouts;
     }
 };
 
@@ -699,144 +832,23 @@ pub const Tree = struct {
         return it.sink.buffered();
     }
 
+    pub fn emit(tree: *Tree, sink: *std.Io.Writer, node: Node) !void {
+        var it = Show{ .tree = tree, .sink = sink };
+        try node.emit(&it);
+    }
+
     pub fn rank(tree: *Tree, conf: anytype, node: Node) !@TypeOf(conf).Rank {
         return try Gist(@TypeOf(conf)).eval(conf, tree, node);
     }
 
-    pub fn mazeBest(
+    pub fn best(
         tree: *Tree,
-        alloc: std.mem.Allocator,
-        cost: anytype,
-        root: Node,
-        trace_writer: ?*std.Io.Writer,
-    ) !struct {
-        path: Path,
-        rank: @TypeOf(cost).Rank,
-    } {
-        tree.heap.maze.clearRetainingCapacity();
-
-        const Cost = @TypeOf(cost);
-
-        const Candidate = struct {
-            cell: Pair,
-            trail: Path,
-
-            fn init(cell: Pair, arena: std.mem.Allocator) !@This() {
-                return .{
-                    .cell = cell,
-                    .trail = try Path.init(arena),
-                };
-            }
-
-            fn clone(self: *const @This(), arena: std.mem.Allocator) !@This() {
-                return .{
-                    .cell = self.cell,
-                    .trail = try self.trail.clone(arena),
-                };
-            }
-
-            fn deinit(self: *@This(), arena: std.mem.Allocator) void {
-                self.trail.deinit(arena);
-            }
-        };
-
-        var stack = std.ArrayListUnmanaged(Candidate){};
-        defer {
-            for (stack.items) |*c| c.deinit(alloc);
-            stack.deinit(alloc);
-        }
-
-        try stack.append(
-            alloc,
-            try Candidate.init(.{ .a = root, .b = .halt }, alloc),
-        );
-
-        var best_rank: ?Cost.Rank = null;
-        var best_path: ?Path = null;
-        errdefer if (best_path) |*path| {
-            path.deinit(alloc);
-        };
-
-        while (stack.items.len != 0) {
-            var cand = stack.pop() orelse unreachable;
-            defer cand.deinit(alloc);
-
-            var finished = false;
-
-            while (true) {
-                const step = try Maze.step(tree, cand.cell);
-                if (step.head == Pair.halt) {
-                    finished = true;
-                    continue;
-                } else if (step.tail == Pair.halt) {
-                    cand.cell = step.head;
-
-                    if (!cand.cell.a.isText())
-                        continue;
-
-                    if (Maze.goto(tree, cand.cell.b)) |next| {
-                        cand.cell = next;
-                        continue;
-                    }
-
-                    finished = true;
-                    break;
-                } else {
-                    var right = try cand.clone(alloc);
-                    try right.trail.push(alloc, 1);
-                    right.cell = step.tail;
-                    stack.append(alloc, right) catch |err| {
-                        right.deinit(alloc);
-                        return err;
-                    };
-                    try cand.trail.push(alloc, 0);
-                    cand.cell = step.head;
-                    continue;
-                }
-            }
-
-            if (!finished) continue;
-
-            var walk = cand.trail.walk();
-            var note: [256]u8 = undefined;
-            var gist = Gist(Cost).init(&note, cost);
-            var show = Show{ .tree = tree, .sink = &gist.sink, .path = &walk };
-            try root.emit(&show);
-            try gist.sink.flush();
-
-            if (walk.remaining() != 0)
-                return error.MazePathUnused;
-
-            const cand_rank = gist.rank;
-            const is_new_best = best_rank == null or cost.wins(cand_rank, best_rank.?);
-
-            if (trace_writer) |w| {
-                try w.print(
-                    "{f} x{d} {f}{s}\n",
-                    .{
-                        cand.trail,
-                        tree.heap.maze.items.len,
-                        cand_rank,
-                        if (is_new_best) "  ← best so far" else "",
-                    },
-                );
-            }
-
-            if (is_new_best) {
-                if (best_path) |*path| {
-                    path.deinit(alloc);
-                }
-                best_path = try cand.trail.clone(alloc);
-                best_rank = cand_rank;
-            }
-        }
-
-        if (best_rank) |best_val| {
-            const path = best_path orelse return error.MazeNoLayouts;
-            return .{ .path = path, .rank = best_val };
-        }
-
-        return error.MazeNoLayouts;
+        bank: std.mem.Allocator,
+        conf: anytype,
+        node: Node,
+        info: ?*std.Io.Writer,
+    ) !Path {
+        return Maze.best(tree, bank, conf, node, info);
     }
 
     pub fn renderWithPath(
@@ -987,6 +999,11 @@ pub const Tree = struct {
         return result;
     }
 
+    /// Concatenate with nl separator
+    pub fn pile(tree: *Tree, nodes: []const Node) !Node {
+        return tree.sepBy(nodes, .nl);
+    }
+
     /// Join nodes with a separator
     pub fn join(tree: *Tree, nodes: []const Node, sep: Node) !Node {
         if (nodes.len == 0) return try tree.text("");
@@ -1085,6 +1102,11 @@ pub const Tree = struct {
     /// Wrap in double quotes: "content"
     pub fn quotes(tree: *Tree, content: Node) !Node {
         return try tree.wrap("\"", content, "\"");
+    }
+
+    /// Separate by `", "`.
+    pub fn commatize(tree: *Tree, nodes: []const Node) !Node {
+        return tree.sepBy(nodes, try tree.text(", "));
     }
 
     /// Attribute pattern: name="value"
@@ -1309,7 +1331,7 @@ test "maze evaluation chooses best layout" {
     const doc = try tree.fork(inline_doc, multiline);
 
     const cost = F1.init(10);
-    var result = try tree.mazeBest(std.testing.allocator, cost, doc, null);
+    var result = try tree.best(std.testing.allocator, cost, doc, null);
     defer result.path.deinit(std.testing.allocator);
 
     const buf = try std.testing.allocator.alloc(u8, 64);
