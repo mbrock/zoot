@@ -606,7 +606,12 @@ pub const Node = packed struct {
 };
 
 /// two node handles; 64 bits
-pub const Pair = struct { a: Node, b: Node };
+pub const Pair = packed struct {
+    a: Node,
+    b: Node,
+
+    pub const halt: Pair = .{ .a = .halt, .b = .halt };
+};
 
 /// A small-step evaluator for choosing layouts.
 ///
@@ -614,49 +619,48 @@ pub const Pair = struct { a: Node, b: Node };
 /// The `a` field is a `Node` as expected, but the `b` field is always
 /// a `.cont` Node which is just an index into the `maze` list.
 pub const Maze = struct {
-    pub const Step = union(enum) {
-        emit: Pair,
-        fork: Fork,
-        halt: void,
-    };
-
-    pub const Fork = struct {
-        lhs: Pair,
-        rhs: Pair,
+    /// The next step of the maze task is zero, one, or two continuations.
+    /// If both are halt, that's zero continuations; done.
+    /// If both are full, that's two continuations; fork.
+    /// If tail is halt, that's one continuation; emit.
+    pub const Step = struct {
+        head: Pair = .halt,
+        tail: Pair = .halt,
     };
 
     pub fn goto(tree: *Tree, tail: Node) ?Pair {
         return if (tail == Node.halt) null else tree.heap.maze.items[tail.payload];
     }
 
-    pub fn step(tree: *Tree, cell: Pair) !Step {
-        switch (cell.a.look()) {
-            .cons => |oper| {
-                const pair = tree.heap.plus.items[oper.item];
-                const tail = try cont(tree, pair.b, cell.b);
-                return .{ .emit = .{ .a = pair.a, .b = tail } };
+    pub fn step(tree: *Tree, cont: Pair) !Step {
+        switch (cont.a.look()) {
+            .cons => |cons| {
+                // To step into `a <> b` with a continuation `c`,
+                // we step into `a` with a new continuation `b <> c`.
+                const pair = tree.heap.plus.items[cons.item];
+                return .{ .head = .{ .a = pair.a, .b = try save(tree, pair.b, cont.b) } };
             },
-            .fork => |oper| {
-                const pair = tree.heap.fork.items[oper.item];
+            .fork => |fork| {
+                const pair = tree.heap.fork.items[fork.item];
                 return .{
-                    .fork = .{
-                        .lhs = .{ .a = pair.a, .b = cell.b },
-                        .rhs = .{ .a = pair.b, .b = cell.b },
-                    },
+                    .head = .{ .a = pair.a, .b = cont.b },
+                    .tail = .{ .a = pair.b, .b = cont.b },
                 };
             },
             else => {
-                return .{ .emit = cell };
+                return .{ .head = cont };
             },
         }
     }
 
-    fn cont(tree: *Tree, next: Node, tail: Node) !Node {
-        const slot_usize = tree.heap.maze.items.len;
-        std.debug.assert(slot_usize <= std.math.maxInt(u29));
-        const slot: u29 = @intCast(slot_usize);
+    fn save(tree: *Tree, next: Node, tail: Node) !Node {
+        const slot = tree.heap.maze.items.len;
+        std.debug.assert(slot <= std.math.maxInt(u29));
         try tree.heap.maze.append(tree.alloc, .{ .a = next, .b = tail });
-        return .{ .tag = .cont, .payload = slot };
+        return .{
+            .tag = .cont,
+            .payload = @intCast(slot),
+        };
     }
 };
 
@@ -761,37 +765,33 @@ pub const Tree = struct {
 
             while (true) {
                 const step = try Maze.step(tree, cand.cell);
-                switch (step) {
-                    .emit => |emit| {
-                        cand.cell = emit;
+                if (step.head == Pair.halt) {
+                    finished = true;
+                    continue;
+                } else if (step.tail == Pair.halt) {
+                    cand.cell = step.head;
 
-                        if (!cand.cell.a.isText())
-                            continue;
-
-                        if (Maze.goto(tree, cand.cell.b)) |next| {
-                            cand.cell = next;
-                            continue;
-                        }
-
-                        finished = true;
-                        break;
-                    },
-                    .fork => |choice| {
-                        var right = try cand.clone(alloc);
-                        try right.trail.push(alloc, 1);
-                        right.cell = choice.rhs;
-                        stack.append(alloc, right) catch |err| {
-                            right.deinit(alloc);
-                            return err;
-                        };
-                        try cand.trail.push(alloc, 0);
-                        cand.cell = choice.lhs;
+                    if (!cand.cell.a.isText())
                         continue;
-                    },
-                    .halt => {
-                        finished = true;
-                        break;
-                    },
+
+                    if (Maze.goto(tree, cand.cell.b)) |next| {
+                        cand.cell = next;
+                        continue;
+                    }
+
+                    finished = true;
+                    break;
+                } else {
+                    var right = try cand.clone(alloc);
+                    try right.trail.push(alloc, 1);
+                    right.cell = step.tail;
+                    stack.append(alloc, right) catch |err| {
+                        right.deinit(alloc);
+                        return err;
+                    };
+                    try cand.trail.push(alloc, 0);
+                    cand.cell = step.head;
+                    continue;
                 }
             }
 
