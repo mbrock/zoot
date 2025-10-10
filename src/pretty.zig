@@ -6,20 +6,22 @@ const log = std.log;
 pub const Path = struct {
     const BitSet = std.bit_set.DynamicBitSetUnmanaged;
 
-    bits: BitSet,
+    bits: BitSet = .{},
 
-    pub fn init(alloc: std.mem.Allocator) !Path {
-        return .{
-            .bits = try BitSet.initEmpty(alloc, 0),
-        };
-    }
+    pub const none: Path = .{};
 
     pub fn deinit(this: *Path, alloc: std.mem.Allocator) void {
         this.bits.deinit(alloc);
     }
 
-    pub fn clone(this: *const Path, alloc: std.mem.Allocator) !Path {
+    pub fn copy(this: *const Path, alloc: std.mem.Allocator) !Path {
         return .{ .bits = try this.bits.clone(alloc) };
+    }
+
+    pub fn turn(this: Path, alloc: std.mem.Allocator, bit: u1) !Path {
+        var that = try this.copy(alloc);
+        try that.push(alloc, bit);
+        return that;
     }
 
     pub fn push(this: *Path, alloc: std.mem.Allocator, bit: u1) !void {
@@ -29,7 +31,7 @@ pub const Path = struct {
     }
 
     pub fn walk(this: *const Path) Walk {
-        return .{ .bits = &this.bits };
+        return .{ .bits = this.bits };
     }
 
     pub fn format(this: Path, writer: *std.Io.Writer) !void {
@@ -46,7 +48,7 @@ pub const Path = struct {
 
     /// Dense iterator over bit values
     pub const Walk = struct {
-        bits: *const BitSet,
+        bits: BitSet = .{},
         curr: usize = 0,
 
         pub fn next(this: *Walk) ?bool {
@@ -55,26 +57,34 @@ pub const Path = struct {
             return this.bits.isSet(this.curr);
         }
 
+        pub fn step(this: *Walk) !bool {
+            return this.next() orelse error.MazePathUnderflow;
+        }
+
+        pub fn take(this: *Walk, lhs: anytype, rhs: @TypeOf(lhs)) !@TypeOf(lhs) {
+            return if (try this.step()) rhs else lhs;
+        }
+
         pub fn remaining(this: *const Walk) usize {
             return this.bits.bit_length - this.curr;
         }
     };
 };
 
-pub const Show = struct {
-    tree: *Tree,
+pub const Plot = struct {
+    /// output writer
     sink: *std.Io.Writer,
-    path: ?*Path.Walk = null,
-
-    /// current column
+    /// cursor column
     head: u16 = 0,
     /// indent column
     base: u16 = 0,
     /// treat ␤ as ␠?
     flat: bool = false,
+    /// fork choice iterator
+    path: Path.Walk = Path.none.walk(),
 
-    pub fn writeString(this: *@This(), what: u21) !void {
-        const tail = this.tree.byte.items[what..];
+    pub fn writeString(this: *@This(), tree: *const Tree, what: u21) !void {
+        const tail = tree.byte.items[what..];
         const span = std.mem.sliceTo(tail, 0);
         try this.sink.writeAll(span);
         this.head +|= @intCast(span.len);
@@ -94,11 +104,7 @@ pub const Show = struct {
     /// Return either `x0` or `x1` depending on the next bit in the `path`.
     /// This is used to emit the root node after resolving the best fork path.
     pub fn pick(this: *@This(), x0: anytype, x1: @TypeOf(x0)) !@TypeOf(x0) {
-        const walk = this.path orelse return error.MazePathMissing;
-        return if (walk.next() orelse return error.MazePathUnderflow)
-            x1
-        else
-            x0;
+        return this.path.take(x0, x1);
     }
 };
 
@@ -144,11 +150,14 @@ pub fn Gist(Cost: type) type {
             };
         }
 
-        pub fn eval(cost: Cost, tree: *Tree, node: Node) !Cost.Rank {
+        pub fn eval(cost: Cost, tree: *Tree, path: Path, node: Node) !Cost.Rank {
             var note: [256]u8 = undefined;
             var this = init(&note, cost);
-            var work = Show{ .tree = tree, .sink = &this.sink };
-            try node.emit(&work);
+            var work = Plot{
+                .sink = &this.sink,
+                .path = path.walk(),
+            };
+            try node.emit(&work, tree);
             try this.sink.flush();
             return this.rank;
         }
@@ -337,23 +346,23 @@ pub const Span = packed struct {
     char: u7 = 0,
     text: u21 = 0,
 
-    fn emitSidekick(char: u7, show: *Show) !void {
+    fn emitSidekick(char: u7, plot: *Plot) !void {
         if (char == '\n')
-            try show.newline()
+            try plot.newline()
         else {
-            try show.sink.writeByte(char);
-            show.head +|= 1;
+            try plot.sink.writeByte(char);
+            plot.head +|= 1;
         }
     }
 
-    pub fn emit(this: Span, show: *Show) !void {
+    pub fn emit(this: Span, plot: *Plot, tree: *Tree) !void {
         if (this.char != 0 and this.side == .lchr)
-            try emitSidekick(this.char, show);
+            try emitSidekick(this.char, plot);
 
-        try show.writeString(this.text);
+        try plot.writeString(tree, this.text);
 
         if (this.char != 0 and this.side == .rchr)
-            try emitSidekick(this.char, show);
+            try emitSidekick(this.char, plot);
     }
 };
 
@@ -365,12 +374,12 @@ pub const Quad = packed struct {
     ch2: u7 = 0,
     ch3: u7 = 0,
 
-    pub fn emit(this: Quad, show: *Show) !void {
+    pub fn emit(this: Quad, plot: *Plot, _: *Tree) !void {
         const chars = [_]u7{ this.ch0, this.ch1, this.ch2, this.ch3 };
         for (chars) |c| {
             if (c == 0) break;
-            try show.sink.writeByte(c);
-            show.head +|= 1;
+            try plot.sink.writeByte(c);
+            plot.head +|= 1;
         }
     }
 };
@@ -383,9 +392,9 @@ pub const Trip = packed struct {
     byte1: u8 = 0,
     byte2: u8 = 0,
 
-    pub fn emit(this: Trip, show: *Show) !void {
+    pub fn emit(this: Trip, plot: *Plot, _: *Tree) !void {
         _ = this;
-        _ = show;
+        _ = plot;
         return error.Unimplemented;
     }
 };
@@ -396,19 +405,19 @@ pub const Rune = packed struct {
     reps: u6 = 0,
     code: u21 = 0,
 
-    pub fn emit(this: Rune, show: *Show) !void {
+    pub fn emit(this: Rune, plot: *Plot, _: *Tree) !void {
         if (this.reps == 0) return;
 
         if (this.code == '\n') {
-            for (0..this.reps) |_| try show.newline();
+            for (0..this.reps) |_| try plot.newline();
             return;
         }
 
         var buffer: [4]u8 = undefined;
         const n = std.unicode.utf8Encode(this.code, &buffer) catch 0;
         var data = [1][]const u8{buffer[0..n]};
-        try show.sink.writeSplatAll(&data, this.reps);
-        show.head +|= @intCast(n * this.reps);
+        try plot.sink.writeSplatAll(&data, this.reps);
+        plot.head +|= @intCast(n * this.reps);
     }
 
     pub fn isEmpty(this: Rune) bool {
@@ -431,34 +440,34 @@ pub const Oper = packed struct {
     frob: Frob = .{},
     item: u21 = 0,
 
-    pub fn emit(this: Oper, show: *Show) !void {
+    pub fn emit(this: Oper, plot: *Plot, tree: *Tree) !void {
         switch (this.kind) {
             .cons => {
-                const saveflat = show.flat;
-                defer show.flat = saveflat;
-                show.flat |= this.frob.flat == 1;
+                const saveflat = plot.flat;
+                defer plot.flat = saveflat;
+                plot.flat |= this.frob.flat == 1;
 
-                const save_base = show.base;
-                defer show.base = save_base;
+                const save_base = plot.base;
+                defer plot.base = save_base;
 
                 if (this.frob.warp == 1)
-                    show.base = show.head;
+                    plot.base = plot.head;
 
                 if (this.frob.nest != 0) {
                     const addend: u16 = @intCast(this.frob.nest);
-                    const widened = @as(u32, show.base) + @as(u32, addend);
+                    const widened = @as(u32, plot.base) + @as(u32, addend);
                     const limit = @as(u32, std.math.maxInt(u16));
-                    show.base = @intCast(@min(widened, limit));
+                    plot.base = @intCast(@min(widened, limit));
                 }
 
-                const args = show.tree.heap.plus.items[this.item];
-                try args.a.emit(show);
-                try args.b.emit(show);
+                const args = tree.heap.plus.items[this.item];
+                try args.head.emit(plot, tree);
+                try args.tail.emit(plot, tree);
             },
             .fork => {
-                const args = show.tree.heap.fork.items[this.item];
-                const next = try show.pick(args.a, args.b);
-                try next.emit(show);
+                const args = tree.heap.fork.items[this.item];
+                const next = try plot.pick(args.head, args.tail);
+                try next.emit(plot, tree);
             },
             else => return error.Unimplemented,
         }
@@ -469,7 +478,7 @@ pub const Oper = packed struct {
 /// into some `Tree` aggregate.
 pub const Node = packed struct {
     tag: Tag,
-    payload: u29 = 0,
+    data: u29 = 0,
 
     pub const Form = Tag;
 
@@ -493,7 +502,7 @@ pub const Node = packed struct {
         cont: *Node,
     };
 
-    pub const halt = Node{ .tag = .cont, .payload = std.math.maxInt(u29) };
+    pub const halt = Node{ .tag = .cont, .data = std.math.maxInt(u29) };
 
     fn view(comptime T: type, this: Node) T {
         return @bitCast(this);
@@ -527,7 +536,7 @@ pub const Node = packed struct {
         };
     }
 
-    pub fn isText(this: Node) bool {
+    pub fn isTerminal(this: Node) bool {
         return switch (this.tag) {
             .span, .quad, .trip, .rune => true,
             else => false,
@@ -541,14 +550,14 @@ pub const Node = packed struct {
         };
     }
 
-    pub fn emit(this: Node, show: *Show) error{
+    pub fn emit(this: Node, plot: *Plot, tree: *Tree) error{
         WriteFailed,
         Unimplemented,
         MazePathMissing,
         MazePathUnderflow,
     }!void {
         switch (this.look()) {
-            inline else => |value| try value.emit(show),
+            inline else => |value| try value.emit(plot, tree),
         }
     }
 
@@ -607,10 +616,14 @@ pub const Node = packed struct {
 
 /// two node handles; 64 bits
 pub const Pair = packed struct {
-    a: Node,
-    b: Node,
+    head: Node,
+    tail: Node,
 
-    pub const halt: Pair = .{ .a = .halt, .b = .halt };
+    pub const halt: Pair = just(.halt);
+
+    pub fn just(a: Node) Pair {
+        return .{ .head = a, .tail = .halt };
+    }
 };
 
 /// The next step of the maze task is zero, one, or two continuations.
@@ -620,6 +633,38 @@ pub const Pair = packed struct {
 pub const Step = struct {
     head: Pair = .halt,
     tail: Pair = .halt,
+
+    pub fn look(step: Step) union(enum) { step: Pair, fork: [2]Pair, done: void } {
+        return if (step.head == Pair.halt)
+            .{ .done = {} }
+        else if (step.tail == Pair.halt)
+            .{ .step = step.head }
+        else
+            .{ .fork = [2]Pair{ step.head, step.tail } };
+    }
+};
+
+/// A *road* is one task in the maze walk.
+pub const Road = struct {
+    /// The path taken; the prefix of actuality.
+    past: Path = .{},
+    /// The road ahead; the suffix of potential.
+    plan: Pair,
+
+    fn init(plan: Pair) @This() {
+        return .{ .plan = plan };
+    }
+
+    fn copy(self: *const @This(), bank: std.mem.Allocator) !@This() {
+        return .{
+            .past = try self.past.copy(bank),
+            .plan = self.plan,
+        };
+    }
+
+    fn free(self: *@This(), bank: std.mem.Allocator) void {
+        self.past.deinit(bank);
+    }
 };
 
 /// A small-step evaluator for choosing layouts.
@@ -628,28 +673,24 @@ pub const Step = struct {
 /// The `a` field is a `Node` as expected, but the `b` field is always
 /// a `.cont` Node which is just an index into the `maze` list.
 pub const Maze = struct {
-    pub fn goto(tree: *Tree, tail: Node) ?Pair {
-        return if (tail == Node.halt) null else tree.heap.maze.items[tail.payload];
-    }
-
     pub fn step(tree: *Tree, cont: Pair) !Step {
-        switch (cont.a.look()) {
+        switch (cont.head.look()) {
             .cons => |cons| {
                 // To step into `a <> b` with a continuation `c`,
                 // we step into `a` with a new continuation `b <> c`.
                 const pair = tree.heap.plus.items[cons.item];
                 return .{
                     .head = .{
-                        .a = pair.a,
-                        .b = try save(tree, pair.b, cont.b),
+                        .head = pair.head,
+                        .tail = try save(tree, pair.tail, cont.tail),
                     },
                 };
             },
             .fork => |fork| {
                 const pair = tree.heap.fork.items[fork.item];
                 return .{
-                    .head = .{ .a = pair.a, .b = cont.b },
-                    .tail = .{ .a = pair.b, .b = cont.b },
+                    .head = .{ .head = pair.head, .tail = cont.tail },
+                    .tail = .{ .head = pair.tail, .tail = cont.tail },
                 };
             },
             else => {
@@ -661,139 +702,90 @@ pub const Maze = struct {
     fn save(tree: *Tree, next: Node, tail: Node) !Node {
         const slot = tree.heap.maze.items.len;
         std.debug.assert(slot <= std.math.maxInt(u29));
-        try tree.heap.maze.append(tree.alloc, .{ .a = next, .b = tail });
+        try tree.heap.maze.append(tree.alloc, .{ .head = next, .tail = tail });
         return .{
             .tag = .cont,
-            .payload = @intCast(slot),
+            .data = @intCast(slot),
         };
     }
 
     pub fn best(
         tree: *Tree,
         bank: std.mem.Allocator,
-        cost: anytype,
+        conf: anytype,
         root: Node,
         info: ?*std.Io.Writer,
     ) !Path {
-        tree.heap.maze.clearRetainingCapacity();
+        const Rank = @TypeOf(conf).Rank;
 
-        const Cost = @TypeOf(cost);
+        var path: ?Path = null;
+        var peak: ?Rank = null;
+        var work: std.ArrayList(Road) = .empty;
 
-        const Candidate = struct {
-            cell: Pair,
-            path: Path,
+        defer work.deinit(bank);
+        defer for (work.items) |*c| c.free(bank);
+        errdefer if (path) |*p| p.deinit(bank);
 
-            fn init(cell: Pair, arena: std.mem.Allocator) !@This() {
-                return .{
-                    .cell = cell,
-                    .path = try Path.init(arena),
-                };
-            }
+        try work.append(bank, .init(.just(root)));
 
-            fn copy(self: *const @This(), arena: std.mem.Allocator) !@This() {
-                return .{
-                    .cell = self.cell,
-                    .path = try self.path.clone(arena),
-                };
-            }
-
-            fn free(self: *@This(), arena: std.mem.Allocator) void {
-                self.path.deinit(arena);
-            }
-        };
-
-        var stack = std.ArrayList(Candidate){};
-        defer {
-            for (stack.items) |*c| c.free(bank);
-            stack.deinit(bank);
-        }
-
-        try stack.append(
-            bank,
-            try Candidate.init(.{ .a = root, .b = .halt }, bank),
-        );
-
-        var best_rank: ?Cost.Rank = null;
-        var best_path: ?Path = null;
-        errdefer if (best_path) |*path| {
-            path.deinit(bank);
-        };
-
-        while (stack.items.len != 0) {
-            var cand = stack.pop() orelse unreachable;
-            defer cand.free(bank);
-
-            var finished = false;
+        while (work.pop()) |task| {
+            var road = task;
+            defer road.free(bank);
 
             while (true) {
-                const cont = try Maze.step(tree, cand.cell);
-                if (cont.head == Pair.halt) {
-                    finished = true;
-                    continue;
-                } else if (cont.tail == Pair.halt) {
-                    cand.cell = cont.head;
+                switch ((try Maze.step(tree, road.plan)).look()) {
+                    .done =>
+                    // End of the road.
+                    break,
+                    .step => |plan| {
+                        // Choiceless step.
+                        road.plan = if (plan.head.isTerminal())
+                            // No subexpressions; jump to continuation.
+                            tree.cont(plan.tail)
+                        else
+                            // Nonterminal operator.
+                            plan;
+                    },
+                    .fork => |ways| {
+                        // Branching step; enqueue the road not taken.
+                        try work.append(bank, .{
+                            .past = try road.past.turn(bank, 1),
+                            .plan = ways[1],
+                        });
 
-                    if (!cand.cell.a.isText())
-                        continue;
-
-                    if (Maze.goto(tree, cand.cell.b)) |next| {
-                        cand.cell = next;
-                        continue;
-                    }
-
-                    finished = true;
-                    break;
-                } else {
-                    var right = try cand.copy(bank);
-                    try right.path.push(bank, 1);
-                    right.cell = cont.tail;
-                    stack.append(bank, right) catch |err| {
-                        right.free(bank);
-                        return err;
-                    };
-                    try cand.path.push(bank, 0);
-                    cand.cell = cont.head;
-                    continue;
+                        try road.past.push(bank, 0);
+                        road.plan = ways[0];
+                    },
                 }
             }
 
-            if (!finished) continue;
+            // This road is fully explored; rank it and move on.
 
-            var walk = cand.path.walk();
-            var note: [256]u8 = undefined;
-            var gist = Gist(Cost).init(&note, cost);
-            var show = Show{ .tree = tree, .sink = &gist.sink, .path = &walk };
-            try root.emit(&show);
-            try gist.sink.flush();
-
-            if (walk.remaining() != 0)
-                return error.MazePathUnused;
-
-            const cand_rank = gist.rank;
-            const is_new_best = best_rank == null or cost.wins(cand_rank, best_rank.?);
+            const rank = try tree.rank(conf, road.past, root);
+            const hype = peak == null or conf.wins(rank, peak.?);
 
             if (info) |w| {
                 try w.print(
                     "{s} {f} {f}  {d: >4} maze\n",
                     .{
-                        if (is_new_best) "★" else " ",
-                        cand.path,
-                        cand_rank,
+                        if (hype) "★" else " ",
+                        road.past,
+                        rank,
                         tree.heap.maze.items.len,
                     },
                 );
             }
 
-            if (is_new_best) {
-                if (best_path) |*path| {
-                    path.deinit(bank);
+            if (hype) {
+                if (path) |*p| {
+                    p.deinit(bank);
                 }
-                best_path = try cand.path.clone(bank);
-                best_rank = cand_rank;
+                path = try road.past.copy(bank);
+                peak = rank;
             }
         }
 
-        return best_path orelse return error.MazeNoLayouts;
+        return path orelse return error.MazeNoLayouts;
     }
 };
 
@@ -827,18 +819,29 @@ pub const Tree = struct {
 
     pub fn render(tree: *Tree, buffer: []u8, node: Node) ![]const u8 {
         var w = std.Io.Writer.fixed(buffer);
-        var it = Show{ .tree = tree, .sink = &w };
-        try node.emit(&it);
+        var it = Plot{ .sink = &w };
+        try node.emit(&it, tree);
         return it.sink.buffered();
     }
 
-    pub fn emit(tree: *Tree, sink: *std.Io.Writer, node: Node) !void {
-        var it = Show{ .tree = tree, .sink = sink };
-        try node.emit(&it);
+    pub fn cont(tree: Tree, node: Node) Pair {
+        std.debug.assert(node.tag == .cont);
+        if (node == Node.halt) return Pair.halt;
+        return tree.heap.maze.items[node.data];
     }
 
-    pub fn rank(tree: *Tree, conf: anytype, node: Node) !@TypeOf(conf).Rank {
-        return try Gist(@TypeOf(conf)).eval(conf, tree, node);
+    pub fn emit(tree: *Tree, sink: *std.Io.Writer, node: Node) !void {
+        var it = Plot{ .sink = sink };
+        try node.emit(&it, tree);
+    }
+
+    pub fn rank(
+        tree: *Tree,
+        conf: anytype,
+        path: Path,
+        node: Node,
+    ) !@TypeOf(conf).Rank {
+        return try Gist(@TypeOf(conf)).eval(conf, tree, path, node);
     }
 
     pub fn best(
@@ -857,11 +860,11 @@ pub const Tree = struct {
         node: Node,
         path: *const Path,
     ) !void {
-        var walk = path.walk();
-        var show = Show{ .tree = tree, .sink = sink, .path = &walk };
-        try node.emit(&show);
-        if (walk.remaining() != 0)
-            return error.MazePathUnused;
+        var plot = Plot{
+            .sink = sink,
+            .path = path.walk(),
+        };
+        try node.emit(&plot, tree);
         try sink.flush();
     }
 
@@ -946,7 +949,7 @@ pub const Tree = struct {
     }
 
     pub fn plus(tree: *Tree, lhs: Node, rhs: Node) !Node {
-        if (rhs == Node.nl and lhs.isText()) {
+        if (rhs == Node.nl and lhs.isTerminal()) {
             var new = lhs;
             switch (new.edit()) {
                 .span => |span| {
@@ -960,7 +963,7 @@ pub const Tree = struct {
             }
         }
 
-        if (lhs == Node.nl and rhs.isText()) {
+        if (lhs == Node.nl and rhs.isTerminal()) {
             var new = rhs;
             switch (new.edit()) {
                 .span => |span| {
@@ -979,13 +982,13 @@ pub const Tree = struct {
         // When A and B are tiny texts, A + B is often also a tiny text.
 
         const next: u21 = @intCast(tree.heap.plus.items.len);
-        try tree.heap.plus.append(tree.alloc, .{ .a = lhs, .b = rhs });
+        try tree.heap.plus.append(tree.alloc, .{ .head = lhs, .tail = rhs });
         return Node.fromOper(.cons, .{}, next);
     }
 
     pub fn fork(tree: *Tree, lhs: Node, rhs: Node) !Node {
         const next: u21 = @intCast(tree.heap.fork.items.len);
-        try tree.heap.fork.append(tree.alloc, .{ .a = lhs, .b = rhs });
+        try tree.heap.fork.append(tree.alloc, .{ .head = lhs, .tail = rhs });
         return Node.fromOper(.fork, .{}, next);
     }
 
@@ -1288,20 +1291,19 @@ test "maze small-step plus" {
     const right = try tree.text("B");
     const doc = try tree.plus(left, right);
 
-    const start: Pair = .{ .a = doc, .b = .halt };
+    const start: Pair = .{ .head = doc, .tail = .halt };
     const first = try Maze.step(&tree, start);
     const emit = first.head;
 
-    try expectEqual(left.repr(), emit.a.repr());
-    try expect(emit.b != Node.halt);
+    try expectEqual(left.repr(), emit.head.repr());
+    try expect(emit.tail != Node.halt);
 
-    const next_cell = Maze.goto(&tree, emit.b) orelse return error.TestExpectedResult;
-    const second = try Maze.step(&tree, next_cell);
+    const second = try Maze.step(&tree, tree.cont(emit.tail));
     const again = second.head;
 
-    try expectEqual(right.repr(), again.a.repr());
-    try expect(again.b == Node.halt);
-    try expect(Maze.goto(&tree, again.b) == null);
+    try expectEqual(right.repr(), again.head.repr());
+    try expect(again.tail == Node.halt);
+    try expect(tree.cont(again.tail) == Pair.halt);
 }
 
 test "maze evaluation chooses best layout" {
@@ -1369,6 +1371,7 @@ test "nest braces cost" {
 
     const s1 = try t.rank(
         F1.init(32),
+        .none,
         try t.plus(
             try t.plus(
                 try t.text("foo {"),
@@ -1392,7 +1395,7 @@ test "F2 cost matches example" {
     // See Example 3.5. and Figure 7 in *A Pretty Expressive Printer*.
 
     const d1 = try t.text("   = func( pretty, print )");
-    const c1 = try t.rank(F2.init(6), d1);
+    const c1 = try t.rank(F2.init(6), .none, d1);
 
     try expectEqual(0, c1.h);
     try expectEqual(20 * 20, c1.o);
@@ -1418,7 +1421,7 @@ test "F2 cost matches example" {
         \\)
     , d2);
 
-    const c2 = try t.rank(F2.init(6), d2);
+    const c2 = try t.rank(F2.init(6), .none, d2);
 
     try expectEqual(3, c2.h);
     try expectEqual(4 * 4 + 3 * 3 + 1, c2.o);

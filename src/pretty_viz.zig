@@ -69,8 +69,8 @@ fn jsonNode(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
             else
                 t1.heap.fork.items[oper.item];
 
-            const left = try jsonNode(t2, t1, args.a);
-            const right = try jsonNode(t2, t1, args.b);
+            const left = try jsonNode(t2, t1, args.head);
+            const right = try jsonNode(t2, t1, args.tail);
 
             break :blk try jsonField(
                 t2,
@@ -96,10 +96,10 @@ fn jsonMaze(t2: *Tree, t1: *Tree) !Node {
 
     for (t1.heap.maze.items, 0..) |frame, idx| {
         const slot_field = try jsonField(t2, "slot", try t2.format("{d}", .{idx}));
-        const next_field = try jsonField(t2, "next", try t2.quotes(try t2.format("{x}", .{frame.a.repr()})));
-        const next_kind_field = try jsonString(t2, "nextKind", @tagName(frame.a.tag));
-        const tail_kind_field = try jsonString(t2, "tailKind", @tagName(frame.b.tag));
-        const tail_slot_field = try jsonField(t2, "tailSlot", try t2.format("{d}", .{frame.b.payload}));
+        const next_field = try jsonField(t2, "next", try t2.quotes(try t2.format("{x}", .{frame.head.repr()})));
+        const next_kind_field = try jsonString(t2, "nextKind", @tagName(frame.head.tag));
+        const tail_kind_field = try jsonString(t2, "tailKind", @tagName(frame.tail.tag));
+        const tail_slot_field = try jsonField(t2, "tailSlot", try t2.format("{d}", .{frame.tail.data}));
 
         const span = &[_]Node{ slot_field, next_field, next_kind_field, tail_kind_field, tail_slot_field };
         try frames.append(t2.alloc, try t2.braces(try t2.sepBy(span, try t2.text(","))));
@@ -192,21 +192,21 @@ fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
                 t1.heap.fork.items[oper.item];
 
             const left_edge = try stmt(t2, try t2.cat(&.{
-                try t2.format("n{x}:sw -> n{x} ", .{ id, args.a.repr() }),
+                try t2.format("n{x}:sw -> n{x} ", .{ id, args.head.repr() }),
                 try t2.brackets(try t2.attr("color", try t2.text("blue"))),
             }));
 
             const right_edge = try stmt(t2, try t2.cat(&.{
-                try t2.format("n{x}:se -> n{x} ", .{ id, args.b.repr() }),
+                try t2.format("n{x}:se -> n{x} ", .{ id, args.tail.repr() }),
                 try t2.brackets(try t2.attr("color", try t2.text("red"))),
             }));
 
             return try t2.sepBy(
                 &.{
                     node_line,
-                    try graphvizDoc(t2, t1, args.a),
+                    try graphvizDoc(t2, t1, args.head),
                     left_edge,
-                    try graphvizDoc(t2, t1, args.b),
+                    try graphvizDoc(t2, t1, args.tail),
                     right_edge,
                 },
                 Node.nl,
