@@ -23,7 +23,7 @@ const Pipeline = struct {
 };
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.ArenaAllocator.init(std.heap.c_allocator);
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -69,6 +69,8 @@ pub fn main() !void {
     var time = try std.time.Timer.start();
     const doc = try dump.dump(&t, pipeline);
     const t0 = time.lap();
+
+    try t.heap.work.list.ensureUnusedCapacity(allocator, 1024 * 32);
 
     var best = try t.best(allocator, pp.F1.init(40), doc, null);
     defer best.deinit(allocator);

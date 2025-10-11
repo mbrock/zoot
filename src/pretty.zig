@@ -839,7 +839,7 @@ pub const Maze = struct {
 
         var path: ?Path = null;
         var peak: ?Rank = null;
-        var work: std.ArrayList(Road) = .empty;
+        var work: std.ArrayList(Road) = try std.ArrayList(Road).initCapacity(bank, 4096);
 
         defer work.deinit(bank);
         defer for (work.items) |*c| c.free(bank);
