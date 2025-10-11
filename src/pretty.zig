@@ -1030,7 +1030,6 @@ pub const Tree = struct {
                 oper.frob.flat = 1;
                 return new;
             },
-            .work => return new,
         }
     }
 
@@ -1086,7 +1085,6 @@ pub const Tree = struct {
 
                 return try tree.warp(oper);
             },
-            .work => return doc,
         }
     }
 
@@ -1433,19 +1431,19 @@ test "maze small-step plus" {
     const right = try tree.text("B");
     const doc = try tree.plus(left, right);
 
-    const start: Pair = .{ .head = doc, .tail = .halt };
+    const start = Task.eval(doc);
     const first = try tree.flap(start);
     const emit = first.exec;
 
-    try expectEqual(left.repr(), emit.head.repr());
-    try expect(emit.tail != Node.halt);
+    try expectEqual(left.repr(), emit.expr.repr());
+    try expect(emit.link != Task.Link.halt);
 
-    const second = try tree.flap(emit.tail.load(&tree.heap));
+    const second = try tree.flap(emit.link.load(&tree.heap));
     const again = second.exec;
 
-    try expectEqual(right.repr(), again.head.repr());
-    try expect(again.tail == Node.halt);
-    try expect(again.tail.load(&tree.heap) == Pair.halt);
+    try expectEqual(right.repr(), again.expr.repr());
+    try expect(again.link == Task.Link.halt);
+    try expect(again.link.load(&tree.heap) == Task.halt);
 }
 
 test "maze evaluation chooses best layout" {

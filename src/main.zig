@@ -1,8 +1,26 @@
 const std = @import("std");
 const pp = @import("zoot").PrettyGoodMachine;
 const viz = @import("zoot").PrettyViz;
+const dump = @import("zoot").dump;
 
-const nl = pp.Node.nl;
+const Step = union(enum) {
+    run: Run,
+    wait: u32,
+    parallel: []const Step,
+};
+
+const Run = struct {
+    tool: []const u8,
+    args: []const []const u8,
+};
+
+const Pipeline = struct {
+    name: []const u8,
+    enabled: bool,
+    retries: ?u8,
+    tags: []const []const u8,
+    steps: []const Step,
+};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -18,134 +36,61 @@ pub fn main() !void {
     var t = pp.Tree.init(allocator);
     defer t.deinit();
 
-    const arg_prepare = try t.text("prepare_inputs()");
-
-    const arg_config_choice = try t.fork(
-        try t.text("load_config()"),
-        try t.pile(&.{
-            try t.text("load_config {"),
-            try t.nest(4, try t.pile(&.{
-                try t.text("lookup_env();"),
-                try t.text("read_disk();"),
-            })),
-            try t.text("}"),
-        }),
-    );
-
-    const arg_execute_choice = try t.fork(
-        try t.text("execute()"),
-        try t.pile(&.{
-            try t.text("execute("),
-            try t.nest(4, try t.pile(&.{
-                try t.cat(&.{
-                    try t.text("stage("),
-                    try t.sepBy(
-                        &.{
-                            try t.text("compile"),
-                            try t.text("test"),
-                            try t.text("package"),
-                        },
-                        try t.text(", "),
-                    ),
-                    try t.text(");"),
-                }),
-                try t.text("deploy();"),
-            })),
-            try t.text(")"),
-        }),
-    );
-
-    const pipeline_choice = try t.fork(
-        try t.cat(&.{
-            try t.text("pipeline("),
-            try t.commatize(
-                &.{
-                    arg_prepare,
-                    arg_config_choice,
-                    arg_execute_choice,
+    const pipeline_tags = &.{ "cli", "zig", "pretty" };
+    const pipeline_steps = &.{
+        Step{
+            .run = .{
+                .tool = "zig",
+                .args = &.{ "build", "-Drelease-safe=true" },
+            },
+        },
+        Step{ .wait = 30 },
+        Step{
+            .parallel = &.{
+                Step{ .run = .{ .tool = "zig", .args = &.{"test"} } },
+                Step{
+                    .run = .{
+                        .tool = "deploy",
+                        .args = &.{ "us-west", "blue" },
+                    },
                 },
-            ),
-            try t.text(")"),
-        }),
-        try t.pile(&.{
-            try t.text("pipeline("),
-            try t.nest(4, try t.sepBy(
-                &.{
-                    arg_prepare,
-                    arg_config_choice,
-                    arg_execute_choice,
-                },
-                nl,
-            )),
-            try t.text(")"),
-        }),
-    );
+            },
+        },
+    };
 
-    const binding_choice = try t.fork(
-        try t.cat(&.{
-            try t.text("let result = "),
-            pipeline_choice,
-            try t.text(";"),
-        }),
-        try t.pile(&.{
-            try t.plus(try t.text("let result = "), pipeline_choice),
-            try t.text("log(result);"),
-            try t.text("audit(result);"),
-        }),
-    );
+    const pipeline = Pipeline{
+        .name = "release",
+        .enabled = true,
+        .retries = null,
+        .tags = pipeline_tags,
+        .steps = pipeline_steps,
+    };
 
-    const return_choice = try t.fork(
-        try t.text("return finalize(result);"),
-        try t.pile(&.{
-            try t.text("return finalize("),
-            try t.nest(4, try t.pile(&.{
-                try t.text("result"),
-                try t.text("// TODO: handle retries"),
-            })),
-            try t.text(");"),
-        }),
-    );
+    var time = try std.time.Timer.start();
+    const doc = try dump.dump(&t, pipeline);
+    const t0 = time.lap();
 
-    const demo_doc = try t.fork(
-        try t.cat(&.{
-            try t.text("task build { "),
-            binding_choice,
-            try t.text(" "),
-            return_choice,
-            try t.text(" }"),
-        }),
-        try t.pile(&.{
-            try t.text("task build {"),
-            try t.nest(4, try t.sepBy(
-                &.{
-                    binding_choice,
-                    return_choice,
-                },
-                nl,
-            )),
-            try t.text("}"),
-        }),
-    );
-
-    var best = try t.best(allocator, pp.F1.init(20), demo_doc, writer);
+    var best = try t.best(allocator, pp.F1.init(40), doc, null);
     defer best.deinit(allocator);
+    const t1 = time.lap();
 
-    try writer.writeAll("\n");
-    try t.renderWithPath(writer, demo_doc, &best);
-    try writer.writeAll("\n\n");
+    try t.renderWithPath(writer, doc, &best);
+    const t2 = time.read();
+    try writer.print("\n\n  (measured 2^{d} variants)\n", .{best.bits.bit_length});
+    try writer.print("  (dump {D}; maze {D}; emit {D})\n\n", .{ t0, t1, t2 });
     try writer.flush();
 
-    {
-        const file = try std.fs.cwd().createFile("graphviz.dot", .{});
-        defer file.close();
-        var sink = file.writer(&buffer);
-        try viz.graphviz(&t, &sink.interface, demo_doc);
-    }
+    // {
+    //     const file = try std.fs.cwd().createFile("graphviz.dot", .{});
+    //     defer file.close();
+    //     var sink = file.writer(&buffer);
+    //     try viz.graphviz(&t, &sink.interface, doc);
+    // }
 
-    {
-        const file = try std.fs.cwd().createFile("tree.json", .{});
-        defer file.close();
-        var sink = file.writer(&buffer);
-        try viz.toJson(&t, &sink.interface, demo_doc);
-    }
+    // {
+    //     const file = try std.fs.cwd().createFile("tree.json", .{});
+    //     defer file.close();
+    //     var sink = file.writer(&buffer);
+    //     try viz.toJson(&t, &sink.interface, doc);
+    // }
 }
