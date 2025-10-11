@@ -644,14 +644,10 @@ pub const Task = packed struct {
     pub const halt: Task = .{ .expr = .halt };
 };
 
-/// The next step of the maze task is zero, one, or two continuations.
-/// If both are halt, that's zero continuations; done.
-/// If both are full, that's two continuations; fork.
-/// If tail is halt, that's one continuation; emit.
 pub const Step = union(enum) {
-    step: Task,
+    exec: Task,
     fork: [2]Task,
-    done: void,
+    halt: void,
 
     pub fn just(step: Task) Step {
         return both(step, Task.halt);
@@ -659,9 +655,9 @@ pub const Step = union(enum) {
 
     pub fn both(head: Task, tail: Task) Step {
         return if (head == Task.halt)
-            .{ .done = {} }
+            .{ .halt = {} }
         else if (tail == Task.halt)
-            .{ .step = head }
+            .{ .exec = head }
         else
             .{ .fork = [2]Task{ head, tail } };
     }
@@ -857,8 +853,8 @@ pub const Maze = struct {
 
             while (true) {
                 switch (try tree.flap(road.plan)) {
-                    .done => break,
-                    .step => |plan| {
+                    .halt => break,
+                    .exec => |plan| {
                         // Choiceless step.
                         road.plan = if (plan.expr.isTerminal())
                             // No subexpressions; jump to continuation.
@@ -1439,13 +1435,13 @@ test "maze small-step plus" {
 
     const start: Pair = .{ .head = doc, .tail = .halt };
     const first = try tree.flap(start);
-    const emit = first.step;
+    const emit = first.exec;
 
     try expectEqual(left.repr(), emit.head.repr());
     try expect(emit.tail != Node.halt);
 
     const second = try tree.flap(emit.tail.load(&tree.heap));
-    const again = second.step;
+    const again = second.exec;
 
     try expectEqual(right.repr(), again.head.repr());
     try expect(again.tail == Node.halt);
