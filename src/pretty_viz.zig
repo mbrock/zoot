@@ -20,7 +20,7 @@ fn stmt(t: *Tree, s: Node) !Node {
 }
 
 pub fn toJson(t1: *Tree, sink: *std.Io.Writer, node: Node) !void {
-    var t2 = Tree.init(t1.alloc);
+    var t2 = Tree.init(t1.bank);
     defer t2.deinit();
 
     const tree_field = try jsonField(&t2, "tree", try jsonNode(&t2, t1, node));
@@ -47,7 +47,6 @@ fn jsonNode(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
             try t2.when(oper.frob.warp == 1, try t2.text("ʷ")),
             try t2.when(oper.frob.nest != 0, try t2.format("ⁿ{d}", .{oper.frob.nest})),
         }),
-        .cont => unreachable,
     };
 
     const id_field = try jsonField(t2, "id", try t2.quotes(try t2.format("{x}", .{id})));
@@ -65,7 +64,7 @@ fn jsonNode(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
     const children_field = switch (node.look()) {
         .cons, .fork => |oper| blk: {
             const args = if (node.tag == .cons)
-                t1.heap.plus.items[oper.item]
+                t1.heap.cons.items[oper.item]
             else
                 t1.heap.fork.items[oper.item];
 
@@ -84,7 +83,6 @@ fn jsonNode(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
     const fields = switch (node.tag) {
         .cons, .fork => &[_]Node{ id_field, kind_field, label_field, children_field },
         .span, .quad, .trip, .rune => &[_]Node{ id_field, kind_field, text_kind_field, label_field },
-        .cont => unreachable,
     };
 
     return try t2.braces(try t2.sepBy(fields, try t2.text(",")));
@@ -92,17 +90,17 @@ fn jsonNode(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
 
 fn jsonMaze(t2: *Tree, t1: *Tree) !Node {
     var frames = std.ArrayListUnmanaged(Node){};
-    defer frames.deinit(t2.alloc);
+    defer frames.deinit(t2.bank);
 
-    for (t1.heap.maze.items, 0..) |frame, idx| {
+    for (t1.heap.work.list.items, 0..) |frame, idx| {
         const slot_field = try jsonField(t2, "slot", try t2.format("{d}", .{idx}));
-        const next_field = try jsonField(t2, "next", try t2.quotes(try t2.format("{x}", .{frame.head.repr()})));
-        const next_kind_field = try jsonString(t2, "nextKind", @tagName(frame.head.tag));
-        const tail_kind_field = try jsonString(t2, "tailKind", @tagName(frame.tail.tag));
-        const tail_slot_field = try jsonField(t2, "tailSlot", try t2.format("{d}", .{frame.tail.data}));
+        const next_field = try jsonField(t2, "next", try t2.quotes(try t2.format("{x}", .{frame.expr.repr()})));
+        const next_kind_field = try jsonString(t2, "nextKind", @tagName(frame.expr.tag));
+        const tail_kind_field = try jsonString(t2, "tailKind", @tagName(frame.link.kind));
+        const tail_slot_field = try jsonField(t2, "tailSlot", try t2.format("{d}", .{frame.link.item}));
 
         const span = &[_]Node{ slot_field, next_field, next_kind_field, tail_kind_field, tail_slot_field };
-        try frames.append(t2.alloc, try t2.braces(try t2.sepBy(span, try t2.text(","))));
+        try frames.append(t2.bank, try t2.braces(try t2.sepBy(span, try t2.text(","))));
     }
 
     const contents = if (frames.items.len == 0)
@@ -114,7 +112,7 @@ fn jsonMaze(t2: *Tree, t1: *Tree) !Node {
 }
 
 pub fn graphviz(t1: *Tree, sink: *std.Io.Writer, node: Node) !void {
-    var t2 = Tree.init(t1.alloc);
+    var t2 = Tree.init(t1.bank);
     defer t2.deinit();
 
     const body = try graphvizDoc(&t2, t1, node);
@@ -144,7 +142,6 @@ fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
             try t2.when(oper.frob.warp == 1, try t2.text("ʷ")),
             try t2.when(oper.frob.nest != 0, try t2.format("ⁿ{d}", .{oper.frob.nest})),
         }),
-        .cont => unreachable,
     };
 
     const color = switch (node.tag) {
@@ -152,7 +149,6 @@ fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
         .quad, .trip, .rune => "lightblue",
         .cons => "gray20",
         .fork => "lightyellow",
-        .cont => unreachable,
     };
 
     const shape = switch (node.tag) {
@@ -160,7 +156,6 @@ fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
         .quad, .trip, .rune => "box",
         .cons => "point",
         .fork => "box",
-        .cont => unreachable,
     };
 
     const style_attrs = switch (node.tag) {
@@ -187,7 +182,7 @@ fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
     switch (node.look()) {
         .cons, .fork => |oper| {
             const args = if (node.tag == .cons)
-                t1.heap.plus.items[oper.item]
+                t1.heap.cons.items[oper.item]
             else
                 t1.heap.fork.items[oper.item];
 
@@ -213,7 +208,6 @@ fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
             );
         },
         .span, .quad, .trip, .rune => {},
-        .cont => unreachable,
     }
 
     return node_line;
@@ -222,7 +216,7 @@ fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
 fn formatTextNode(doc_tree: *Tree, data_tree: *Tree, node: Node) !Node {
     return switch (node.look()) {
         .span => |span_node| blk: {
-            const tail = data_tree.byte.items[span_node.text..];
+            const tail = data_tree.heap.text.items[span_node.text..];
             const slice = std.mem.sliceTo(tail, 0);
 
             break :blk try doc_tree.cat(&.{
@@ -259,7 +253,6 @@ fn formatTextNode(doc_tree: *Tree, data_tree: *Tree, node: Node) !Node {
             }
         },
         .cons, .fork => unreachable,
-        .cont => unreachable,
     };
 }
 

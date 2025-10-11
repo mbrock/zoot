@@ -2,6 +2,8 @@ const std = @import("std");
 const TreePrinter = @import("TreePrinter.zig");
 const log = std.log;
 
+pub const Bank = std.mem.Allocator;
+
 /// An iterable path of binary decisions.
 pub const Path = struct {
     const BitSet = std.bit_set.DynamicBitSetUnmanaged;
@@ -10,21 +12,21 @@ pub const Path = struct {
 
     pub const none: Path = .{};
 
-    pub fn deinit(this: *Path, alloc: std.mem.Allocator) void {
+    pub fn deinit(this: *Path, alloc: Bank) void {
         this.bits.deinit(alloc);
     }
 
-    pub fn copy(this: *const Path, alloc: std.mem.Allocator) !Path {
+    pub fn copy(this: *const Path, alloc: Bank) !Path {
         return .{ .bits = try this.bits.clone(alloc) };
     }
 
-    pub fn turn(this: Path, alloc: std.mem.Allocator, bit: u1) !Path {
+    pub fn turn(this: Path, alloc: Bank, bit: u1) !Path {
         var that = try this.copy(alloc);
         try that.push(alloc, bit);
         return that;
     }
 
-    pub fn push(this: *Path, alloc: std.mem.Allocator, bit: u1) !void {
+    pub fn push(this: *Path, alloc: Bank, bit: u1) !void {
         const len = this.bits.bit_length;
         try this.bits.resize(alloc, len + 1, false);
         if (bit == 1) this.bits.set(len);
@@ -84,7 +86,7 @@ pub const Plot = struct {
     path: Path.Walk = Path.none.walk(),
 
     pub fn writeString(this: *@This(), tree: *const Tree, what: u21) !void {
-        const tail = tree.byte.items[what..];
+        const tail = tree.heap.text.items[what..];
         const span = std.mem.sliceTo(tail, 0);
         try this.sink.writeAll(span);
         this.head +|= @intCast(span.len);
@@ -310,24 +312,6 @@ pub const F2 = struct {
     }
 };
 
-/// Pooled or immediate text; 30 bits.
-///
-/// A text is either
-///
-///   (1) a single-line non-empty UTF-8 string ("a slice");
-///   (2) the empty text;
-///   (3) the soft line break character ("␤");
-///   (4) ␤ followed by a slice; or
-///   (5) a slice followed by ␤.
-///
-/// This lets us construct `X <> nl` and `nl <> X`
-/// for most text nodes without allocating a plus node.
-///
-/// Since ␤ (`\n`, U+000A) does not occur in normal texts,
-/// we simply use that as the soft line break sentinel,
-/// whether as the "ASCII sidekick" or a standalone rune.
-///
-/// TODO: Allow ␤ as the first or last `u7` in an ASCII quad.
 pub const Tag = enum(u3) {
     span = 0b000,
     quad = 0b001,
@@ -335,7 +319,6 @@ pub const Tag = enum(u3) {
     rune = 0b011,
     cons = 0b100,
     fork = 0b101,
-    cont = 0b110,
 };
 
 pub const Side = enum(u1) { lchr, rchr };
@@ -460,7 +443,7 @@ pub const Oper = packed struct {
                     plot.base = @intCast(@min(widened, limit));
                 }
 
-                const args = tree.heap.plus.items[this.item];
+                const args = tree.heap.cons.items[this.item];
                 try args.head.emit(plot, tree);
                 try args.tail.emit(plot, tree);
             },
@@ -489,7 +472,6 @@ pub const Node = packed struct {
         rune: Rune,
         cons: Oper,
         fork: Oper,
-        cont: Node,
     };
 
     pub const Edit = union(Tag) {
@@ -499,10 +481,9 @@ pub const Node = packed struct {
         rune: *Rune,
         cons: *Oper,
         fork: *Oper,
-        cont: *Node,
     };
 
-    pub const halt = Node{ .tag = .cont, .data = std.math.maxInt(u29) };
+    pub const halt = Node.fromRune(0, 0);
 
     fn view(comptime T: type, this: Node) T {
         return @bitCast(this);
@@ -520,7 +501,14 @@ pub const Node = packed struct {
             .rune => .{ .rune = view(Rune, this) },
             .cons => .{ .cons = view(Oper, this) },
             .fork => .{ .fork = view(Oper, this) },
-            .cont => .{ .cont = this },
+        };
+    }
+
+    pub fn load(this: Node, heap: *const Heap) Pair {
+        return switch (this.look()) {
+            .cons => |cons| heap.cons.items[cons.item],
+            .fork => |fork| heap.fork.items[fork.item],
+            else => unreachable,
         };
     }
 
@@ -532,7 +520,6 @@ pub const Node = packed struct {
             .rune => .{ .rune = mut(Rune, this) },
             .cons => .{ .cons = mut(Oper, this) },
             .fork => .{ .fork = mut(Oper, this) },
-            .cont => .{ .cont = this },
         };
     }
 
@@ -553,7 +540,6 @@ pub const Node = packed struct {
     pub fn emit(this: Node, plot: *Plot, tree: *Tree) error{
         WriteFailed,
         Unimplemented,
-        MazePathMissing,
         MazePathUnderflow,
     }!void {
         switch (this.look()) {
@@ -614,7 +600,6 @@ pub const Node = packed struct {
     pub const nl: Node = Node.fromRune(1, '\n');
 };
 
-/// two node handles; 64 bits
 pub const Pair = packed struct {
     head: Node,
     tail: Node,
@@ -626,21 +611,200 @@ pub const Pair = packed struct {
     }
 };
 
+pub const Task = packed struct {
+    expr: Node,
+    link: Link = .halt,
+
+    pub const Link = packed struct {
+        kind: enum(u1) { link, pink },
+        item: u21,
+
+        pub const halt: Link = .{
+            .kind = .link,
+            .item = std.math.maxInt(u21),
+        };
+
+        pub fn load(this: @This(), heap: *const Heap) Task {
+            if (this == Link.halt)
+                return Task.halt;
+            return heap.work.list.items[this.item];
+        }
+    };
+
+    pub const Slot = u21;
+
+    pub fn into(slot: Slot) Link {
+        return .{ .kind = .link, .item = slot };
+    }
+
+    pub fn eval(expr: Node) Task {
+        return .{ .expr = expr };
+    }
+
+    pub const halt: Task = .{ .expr = .halt };
+};
+
 /// The next step of the maze task is zero, one, or two continuations.
 /// If both are halt, that's zero continuations; done.
 /// If both are full, that's two continuations; fork.
 /// If tail is halt, that's one continuation; emit.
-pub const Step = struct {
-    head: Pair = .halt,
-    tail: Pair = .halt,
+pub const Step = union(enum) {
+    step: Task,
+    fork: [2]Task,
+    done: void,
 
-    pub fn look(step: Step) union(enum) { step: Pair, fork: [2]Pair, done: void } {
-        return if (step.head == Pair.halt)
+    pub fn just(step: Task) Step {
+        return both(step, Task.halt);
+    }
+
+    pub fn both(head: Task, tail: Task) Step {
+        return if (head == Task.halt)
             .{ .done = {} }
-        else if (step.tail == Pair.halt)
-            .{ .step = step.head }
+        else if (tail == Task.halt)
+            .{ .step = head }
         else
-            .{ .fork = [2]Pair{ step.head, step.tail } };
+            .{ .fork = [2]Task{ head, tail } };
+    }
+
+    /// To execute the task `e ; k` is to evaluate `e` and then execute `k`.
+    ///
+    /// The *flap* function defines the expansion of a task into a step
+    /// with subtasks for subexpressions, linked correctly to the shared
+    /// continuation task.  Like a debugger's single step operation.
+    ///
+    /// For simple expressions, `flap(e ; k)` is just `e ; k`.
+    ///
+    /// For concat, `flap((a + b) ; k)` is `a ; (b ; k)`.
+    ///
+    /// For choice, `flap((a | b) ; k)` is `(a ; k) & (b ; k)`.
+    ///
+    /// Completely applying this expansion to a syntax tree is known as
+    /// the *continuation-passing style transformation*, or CPS transform.
+    ///
+    /// Such an expansion has no nested expressions in the usual sense.
+    /// In the absence of forking choice, it linearizes expressions into
+    /// sequential chains of terminals in the order of actual evaluation.
+    /// In the presence of forking choice, rather than a linear task chain,
+    /// we get a directed acyclic graph of tasks.
+    ///
+    /// This clarifies what it means to have a forking choice nested within
+    /// a more complex expression.  The part of the expression evaluated
+    /// before the fork becomes a sequential prefix in the graph, which
+    /// then splits into two child tasks and eventually merges again;
+    /// for example
+    ///
+    ///     a + b + ((c + d) | (e + f)) + g + h
+    ///
+    /// becomes the task graph
+    ///
+    ///           c → d
+    ///          ↗     ↘
+    ///     a → b        g → h ⇥ ⊤
+    ///          ↘     ↗
+    ///           e → f
+    ///
+    /// where `⊤` is the exit task.  Note that an expression always
+    /// expands to a task graph with a single entry and single exit;
+    /// a document full of choice denotes a single coherent element
+    /// in the relevant model of evaluation.
+    ///
+    /// This program does `flap` as it evaluates instead of up front.
+    /// Doing it up front is probably better.  That's why compilers
+    /// transform into CPS or SSA; with explicit execution graphs,
+    /// it's easier to optimize the execution.
+    ///
+    /// One optimization of the execution graph that seems relevant
+    /// for this library is compacting the node structure so that
+    /// linear chains are sorted contiguously in memory and stored
+    /// as slices.  This is basically like compiling the document
+    /// program into a graph of basic blocks.
+    ///
+    /// This whole way of thinking can transform the algebraic,
+    /// functional, denotational semantics of the PDF papers
+    /// into an operational semantics, a small-step execution
+    /// engine, an abstract machine.
+    ///
+    /// The classic strategy, formalized by Danvy and Filinski
+    /// in the 1990s but rooted in lore and practice going back
+    /// at least to Gordon Plotkin in the 1970s, goes like this.
+    ///
+    /// You start with some beautiful denotational semantic
+    /// function of an algebraic syntax type, a function from
+    /// syntax to value that concisely defines the *meaning*
+    /// of any valid expression, like
+    ///
+    ///     eval(x)            = x
+    ///     eval(Plus(e1, e2)) = eval(e1) + eval(e2)
+    ///
+    /// or
+    ///
+    ///     emit(s)            = s
+    ///     emit(Cons(e1, e2)) = append(emit(e1), emit(e2))
+    ///
+    /// or what have you.  This is your basis for equational
+    /// reasoning, proving various things, sanity checking
+    /// different properties, and so on.
+    ///
+    /// Of course you can directly implement such functions.
+    /// In fact that is one of the more useful definitions of
+    /// what it even means to practice *functional programming*:
+    /// it's writing programs as pure functions from inductive
+    /// syntactic domains into semantic models.
+    ///
+    /// Haskell is basically designed to let academics transcribe
+    /// interesting ACM Functional Pearl papers into source code
+    /// that GHC turns into remarkably adequate machine code.
+    ///
+    /// One thing Haskell does to enable that is lazy evaluation.
+    /// Beautiful semantic functions transcribed to code, without
+    /// any low level mechanics, can skip entire subcomputations
+    /// which turn out to be unneeded for the final result,
+    /// and functions that look like they duplicate computation
+    /// can execute as clever shared mutable thunk graphs.
+    ///
+    /// Of course the most fundamental language feature that allows
+    /// this kind of thing is just garbage collection. The semantic
+    /// equations are blissfully oblivious of allocators, stack and heap,
+    /// cache lines, pointer invalidation, etc, for the basic reason
+    /// that they are *completely unrelated to computers*.
+    ///
+    /// Letting any aspect of your concrete computing machine taint
+    /// your denotational semantics is like trying to define the
+    /// meaning of a quadratic polynomial in terms of the Super Nintendo
+    /// math coprocessor; it's not just bad style, it makes no sense.
+    ///
+    /// But fundamentally what a language like Haskell promises is
+    /// to faithfully and elegantly preserve the functional *meaning*
+    /// of the equational definitions you write down as code.  This
+    /// brackets out the question of what the actual computer is doing,
+    /// and how we can make it stop doing that.
+    ///
+    ///
+    pub fn flap(heap: *Heap, bank: Bank, task: Task) !Step {
+        switch (task.expr.look()) {
+            .cons => |cons| {
+                // To step into `a <> b` with a continuation `c`,
+                // we step into `a` with a new continuation `b <> c`.
+                const pair = heap.cons.items[cons.item];
+                return .just(
+                    .{
+                        .expr = pair.head,
+                        .link = try heap.work.push(bank, .{
+                            .expr = pair.tail,
+                            .link = task.link,
+                        }),
+                    },
+                );
+            },
+            .fork => |fork| {
+                const pair = heap.fork.items[fork.item];
+                return .both(
+                    .{ .expr = pair.head, .link = task.link },
+                    .{ .expr = pair.tail, .link = task.link },
+                );
+            },
+            else => return .just(task),
+        }
     }
 };
 
@@ -649,69 +813,28 @@ pub const Road = struct {
     /// The path taken; the prefix of actuality.
     past: Path = .{},
     /// The road ahead; the suffix of potential.
-    plan: Pair,
+    plan: Task,
 
-    fn init(plan: Pair) @This() {
+    fn init(plan: Task) @This() {
         return .{ .plan = plan };
     }
 
-    fn copy(self: *const @This(), bank: std.mem.Allocator) !@This() {
+    fn copy(self: *const @This(), bank: Bank) !@This() {
         return .{
             .past = try self.past.copy(bank),
             .plan = self.plan,
         };
     }
 
-    fn free(self: *@This(), bank: std.mem.Allocator) void {
+    fn free(self: *@This(), bank: Bank) void {
         self.past.deinit(bank);
     }
 };
 
-/// A small-step evaluator for choosing layouts.
-///
-/// The `Pair` type is used by the maze in a somewhat different way.
-/// The `a` field is a `Node` as expected, but the `b` field is always
-/// a `.cont` Node which is just an index into the `maze` list.
 pub const Maze = struct {
-    pub fn step(tree: *Tree, cont: Pair) !Step {
-        switch (cont.head.look()) {
-            .cons => |cons| {
-                // To step into `a <> b` with a continuation `c`,
-                // we step into `a` with a new continuation `b <> c`.
-                const pair = tree.heap.plus.items[cons.item];
-                return .{
-                    .head = .{
-                        .head = pair.head,
-                        .tail = try save(tree, pair.tail, cont.tail),
-                    },
-                };
-            },
-            .fork => |fork| {
-                const pair = tree.heap.fork.items[fork.item];
-                return .{
-                    .head = .{ .head = pair.head, .tail = cont.tail },
-                    .tail = .{ .head = pair.tail, .tail = cont.tail },
-                };
-            },
-            else => {
-                return .{ .head = cont };
-            },
-        }
-    }
-
-    fn save(tree: *Tree, next: Node, tail: Node) !Node {
-        const slot = tree.heap.maze.items.len;
-        std.debug.assert(slot <= std.math.maxInt(u29));
-        try tree.heap.maze.append(tree.alloc, .{ .head = next, .tail = tail });
-        return .{
-            .tag = .cont,
-            .data = @intCast(slot),
-        };
-    }
-
     pub fn best(
         tree: *Tree,
-        bank: std.mem.Allocator,
+        bank: Bank,
         conf: anytype,
         root: Node,
         info: ?*std.Io.Writer,
@@ -726,22 +849,20 @@ pub const Maze = struct {
         defer for (work.items) |*c| c.free(bank);
         errdefer if (path) |*p| p.deinit(bank);
 
-        try work.append(bank, .init(.just(root)));
+        try work.append(bank, .init(.eval(root)));
 
         while (work.pop()) |task| {
             var road = task;
             defer road.free(bank);
 
             while (true) {
-                switch ((try Maze.step(tree, road.plan)).look()) {
-                    .done =>
-                    // End of the road.
-                    break,
+                switch (try tree.flap(road.plan)) {
+                    .done => break,
                     .step => |plan| {
                         // Choiceless step.
-                        road.plan = if (plan.head.isTerminal())
+                        road.plan = if (plan.expr.isTerminal())
                             // No subexpressions; jump to continuation.
-                            tree.cont(plan.tail)
+                            plan.link.load(&tree.heap)
                         else
                             // Nonterminal operator.
                             plan;
@@ -771,21 +892,58 @@ pub const Maze = struct {
                         if (hype) "★" else " ",
                         road.past,
                         rank,
-                        tree.heap.maze.items.len,
+                        tree.heap.work.size(),
                     },
                 );
             }
 
             if (hype) {
-                if (path) |*p| {
-                    p.deinit(bank);
-                }
+                if (path) |*p| p.deinit(bank);
                 path = try road.past.copy(bank);
                 peak = rank;
             }
         }
 
         return path orelse return error.MazeNoLayouts;
+    }
+};
+
+pub fn List(Elem: type) type {
+    return struct {
+        list: std.ArrayList(Elem) = .empty,
+
+        pub const empty: @This() = .{};
+
+        pub fn deinit(this: *@This(), bank: Bank) void {
+            this.list.deinit(bank);
+        }
+
+        pub fn push(this: *@This(), bank: Bank, elem: Elem) !Elem.Link {
+            if (std.math.cast(Elem.Slot, this.list.items.len)) |slot| {
+                try this.list.append(bank, elem);
+                return Elem.into(slot);
+            } else {
+                return error.ListFull;
+            }
+        }
+
+        pub fn size(this: *const @This()) Elem.Slot {
+            return @intCast(this.list.items.len);
+        }
+    };
+}
+
+pub const Heap = struct {
+    text: std.ArrayList(u8) = .empty,
+    cons: std.ArrayList(Pair) = .empty,
+    fork: std.ArrayList(Pair) = .empty,
+    work: List(Task) = .empty,
+
+    pub fn deinit(this: *@This(), alloc: Bank) void {
+        this.text.deinit(alloc);
+        this.cons.deinit(alloc);
+        this.fork.deinit(alloc);
+        this.work.deinit(alloc);
     }
 };
 
@@ -797,24 +955,15 @@ pub const Maze = struct {
 ///
 /// It is also used to rank layouts, and to actually print them.
 pub const Tree = struct {
-    byte: std.ArrayList(u8) = .empty,
-    heap: struct {
-        plus: std.ArrayList(Pair) = .empty,
-        fork: std.ArrayList(Pair) = .empty,
-        maze: std.ArrayList(Pair) = .empty,
-    } = .{},
+    bank: Bank,
+    heap: Heap = .{},
 
-    alloc: std.mem.Allocator,
-
-    pub fn init(alloc: std.mem.Allocator) Tree {
-        return .{ .alloc = alloc };
+    pub fn init(alloc: Bank) Tree {
+        return .{ .bank = alloc };
     }
 
     pub fn deinit(tree: *Tree) void {
-        tree.byte.deinit(tree.alloc);
-        tree.heap.plus.deinit(tree.alloc);
-        tree.heap.fork.deinit(tree.alloc);
-        tree.heap.maze.deinit(tree.alloc);
+        tree.heap.deinit(tree.bank);
     }
 
     pub fn render(tree: *Tree, buffer: []u8, node: Node) ![]const u8 {
@@ -824,10 +973,8 @@ pub const Tree = struct {
         return it.sink.buffered();
     }
 
-    pub fn cont(tree: Tree, node: Node) Pair {
-        std.debug.assert(node.tag == .cont);
-        if (node == Node.halt) return Pair.halt;
-        return tree.heap.maze.items[node.data];
+    pub fn flap(tree: *Tree, road: Task) !Step {
+        return try Step.flap(&tree.heap, tree.bank, road);
     }
 
     pub fn emit(tree: *Tree, sink: *std.Io.Writer, node: Node) !void {
@@ -846,7 +993,7 @@ pub const Tree = struct {
 
     pub fn best(
         tree: *Tree,
-        bank: std.mem.Allocator,
+        bank: Bank,
         conf: anytype,
         node: Node,
         info: ?*std.Io.Writer,
@@ -865,7 +1012,6 @@ pub const Tree = struct {
             .path = path.walk(),
         };
         try node.emit(&plot, tree);
-        try sink.flush();
     }
 
     pub fn flat(tree: *Tree, lhs: Node) !Node {
@@ -888,7 +1034,7 @@ pub const Tree = struct {
                 oper.frob.flat = 1;
                 return new;
             },
-            .cont => return new,
+            .work => return new,
         }
     }
 
@@ -944,7 +1090,7 @@ pub const Tree = struct {
 
                 return try tree.warp(oper);
             },
-            .cont => return doc,
+            .work => return doc,
         }
     }
 
@@ -981,14 +1127,14 @@ pub const Tree = struct {
         //
         // When A and B are tiny texts, A + B is often also a tiny text.
 
-        const next: u21 = @intCast(tree.heap.plus.items.len);
-        try tree.heap.plus.append(tree.alloc, .{ .head = lhs, .tail = rhs });
+        const next: u21 = @intCast(tree.heap.cons.items.len);
+        try tree.heap.cons.append(tree.bank, .{ .head = lhs, .tail = rhs });
         return Node.fromOper(.cons, .{}, next);
     }
 
     pub fn fork(tree: *Tree, lhs: Node, rhs: Node) !Node {
         const next: u21 = @intCast(tree.heap.fork.items.len);
-        try tree.heap.fork.append(tree.alloc, .{ .head = lhs, .tail = rhs });
+        try tree.heap.fork.append(tree.bank, .{ .head = lhs, .tail = rhs });
         return Node.fromOper(.fork, .{}, next);
     }
 
@@ -1048,13 +1194,13 @@ pub const Tree = struct {
 
     /// Format a string using std.fmt and add to the slab with deduplication
     pub fn format(tree: *Tree, comptime fmt: []const u8, args: anytype) !Node {
-        const start_len = tree.byte.items.len;
+        const start_len = tree.heap.text.items.len;
 
         // Format directly into the slab
-        try tree.byte.writer(tree.alloc).print(fmt ++ "\x00", args);
+        try tree.heap.text.writer(tree.bank).print(fmt ++ "\x00", args);
 
         // Now use text() which will do the deduplication logic for us
-        const written = tree.byte.items[start_len .. tree.byte.items.len - 1 :0];
+        const written = tree.heap.text.items[start_len .. tree.heap.text.items.len - 1 :0];
         const node = try tree.text(written);
 
         // If text() didn't point to our new string, rewind the slab
@@ -1067,7 +1213,7 @@ pub const Tree = struct {
         };
 
         if (should_rewind) {
-            tree.byte.shrinkRetainingCapacity(start_len);
+            tree.heap.text.shrinkRetainingCapacity(start_len);
         }
 
         return node;
@@ -1154,11 +1300,11 @@ pub const Tree = struct {
         const spanz = span[0 .. span.len + 1];
 
         const spot: u21 = @intCast(
-            if (std.mem.indexOf(u8, tree.byte.items, spanz)) |i|
+            if (std.mem.indexOf(u8, tree.heap.text.items, spanz)) |i|
                 i
             else blk: {
-                const next = tree.byte.items.len;
-                try tree.byte.appendSlice(tree.alloc, spanz);
+                const next = tree.heap.text.items.len;
+                try tree.heap.text.appendSlice(tree.bank, spanz);
                 break :blk next;
             },
         );
@@ -1210,11 +1356,11 @@ test "text dedup" {
     const n2 = try tree.text("Hello, world!");
 
     try expectEqual(n1.repr(), n2.repr());
-    try expectEqual(1 + "Hello, world!".len, tree.byte.items.len);
+    try expectEqual(1 + "Hello, world!".len, tree.heap.text.items.len);
 
     const n3 = try tree.text("Hello");
     try expect(n2.repr() != n3.repr());
-    try expectEqual(1 + "Hello, world!".len + 6, tree.byte.items.len);
+    try expectEqual(1 + "Hello, world!".len + 6, tree.heap.text.items.len);
 }
 
 test "emit plus node" {
@@ -1260,7 +1406,7 @@ test "fuse text <> nl" {
         },
         else => unreachable,
     }
-    try expectEqual(0, t.heap.plus.items.len);
+    try expectEqual(0, t.heap.cons.items.len);
     try expectEmitString(&t, "Hello, world!\n", fused);
 }
 
@@ -1279,7 +1425,7 @@ test "fuse nl <> text" {
         },
         else => unreachable,
     }
-    try expectEqual(0, t.heap.plus.items.len);
+    try expectEqual(0, t.heap.cons.items.len);
     try expectEmitString(&t, "\nHello, world!", fused);
 }
 
@@ -1292,18 +1438,18 @@ test "maze small-step plus" {
     const doc = try tree.plus(left, right);
 
     const start: Pair = .{ .head = doc, .tail = .halt };
-    const first = try Maze.step(&tree, start);
-    const emit = first.head;
+    const first = try tree.flap(start);
+    const emit = first.step;
 
     try expectEqual(left.repr(), emit.head.repr());
     try expect(emit.tail != Node.halt);
 
-    const second = try Maze.step(&tree, tree.cont(emit.tail));
-    const again = second.head;
+    const second = try tree.flap(emit.tail.load(&tree.heap));
+    const again = second.step;
 
     try expectEqual(right.repr(), again.head.repr());
     try expect(again.tail == Node.halt);
-    try expect(tree.cont(again.tail) == Pair.halt);
+    try expect(again.tail.load(&tree.heap) == Pair.halt);
 }
 
 test "maze evaluation chooses best layout" {

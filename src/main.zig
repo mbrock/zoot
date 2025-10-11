@@ -130,9 +130,10 @@ pub fn main() !void {
     var best = try t.best(allocator, pp.F1.init(20), demo_doc, writer);
     defer best.deinit(allocator);
 
-    try writer.writeAll("\nbest layout (width 20):\n");
+    try writer.writeAll("\n");
     try t.renderWithPath(writer, demo_doc, &best);
-    try writer.writeByte('\n');
+    try writer.writeAll("\n\n");
+    try writer.flush();
 
     {
         const file = try std.fs.cwd().createFile("graphviz.dot", .{});
@@ -147,8 +148,4 @@ pub fn main() !void {
         var sink = file.writer(&buffer);
         try viz.toJson(&t, &sink.interface, demo_doc);
     }
-
-    try writer.writeAll("Generated graphviz.dot\n");
-    try writer.writeAll("Generated tree.json\n");
-    try writer.writeAll("Run: dot -Tpdf graphviz.dot -o graphviz.pdf\n");
 }
