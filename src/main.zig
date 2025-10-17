@@ -79,17 +79,108 @@ pub fn main() !void {
     const doc = try dump.dump(&t, pipeline);
     const t0 = time.lap();
 
-    var best = try t.best(allocator, pp.F2.init(40), doc, writer);
-    defer best.deinit(allocator);
+    try writer.print("┏━ CEK debug ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{});
+    const Cost = pp.F2;
+    const cost_model = Cost.init(40);
+    const Frame = pp.KFrameType(Cost);
+    const Machine = pp.MachineType(Cost);
+
+    var frames = pp.List(Frame).init(allocator);
+    defer frames.deinit();
+
+    const k_done = try frames.push(allocator, .{ .done = {} });
+    var machine = Machine{
+        .eval = .{
+            .node = doc,
+            .ctx = .{},
+            .k = k_done,
+        },
+    };
+
+    const debug_limit: usize = 12;
+    var step_index: usize = 0;
+    while (step_index < debug_limit) : (step_index += 1) {
+        try writer.print("┃ step {d: >2} → {s}\n", .{ step_index, @tagName(machine) });
+
+        var stop = false;
+        switch (machine) {
+            .eval => |state| {
+                try writer.print(
+                    "┃   eval node={s} head={d} base={d} rows={d}\n",
+                    .{
+                        @tagName(state.node.tag),
+                        state.ctx.head,
+                        state.ctx.base,
+                        state.ctx.rows,
+                    },
+                );
+            },
+            .ret => |state| {
+                try writer.print(
+                    "┃   ret last={d} rows={d} taint={}\n",
+                    .{
+                        state.meas.last,
+                        state.meas.rows,
+                        state.meas.tainted,
+                    },
+                );
+            },
+            .fork => |state| {
+                try writer.print(
+                    "┃   fork L={s} R={s}\n",
+                    .{
+                        @tagName(state.left.node.tag),
+                        @tagName(state.right.node.tag),
+                    },
+                );
+                stop = true;
+            },
+            .done => |state| {
+                try writer.print(
+                    "┃   done last={d} rows={d} taint={}\n",
+                    .{
+                        state.meas.last,
+                        state.meas.rows,
+                        state.meas.tainted,
+                    },
+                );
+                stop = true;
+            },
+        }
+
+        if (stop) break;
+
+        pp.machineStep(Cost, &t, cost_model, &frames, &machine, null, null) catch |err| {
+            try writer.print("┃   step error: {s}\n", .{@errorName(err)});
+            break;
+        };
+    }
+    try writer.print("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n", .{});
+
+    const best = try t.best(allocator, cost_model, doc, writer);
     const t1 = time.lap();
 
     // var hest = try pp.Maze.hest(&t, allocator, pp.F2.init(40), doc, writer);
     // defer hest.deinit(allocator);
     const t2 = time.lap();
 
-    try t.renderWithPath(writer, doc, &best);
+    const measure = best.measure;
+
+    try writer.print(
+        "  rank: overflow={d} height={d} tainted={}\n",
+        .{ measure.rank.o, measure.rank.h, measure.tainted },
+    );
+    try writer.print(
+        "  layouts: completions={d} frontier={d} tainted_kept={} queue_peak={d}\n",
+        .{ best.completions, best.frontier_non_tainted, best.tainted_kept, best.queue_peak },
+    );
+    try writer.print(
+        "  memo: hits={d} misses={d} entries={d}\n\n",
+        .{ best.memo_hits, best.memo_misses, best.memo_entries },
+    );
+
+    try t.emit(writer, measure.layout);
     const t3 = time.read();
-    try writer.print("\n\n  (measured 2^{d} variants)\n", .{best.bits.bit_length});
     try writer.print(
         "  (dump {D}; best {D}; hest {D}; emit {D})\n\n",
         .{ t0, t1, t2, t3 },

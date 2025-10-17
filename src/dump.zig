@@ -295,12 +295,11 @@ test "dump struct inline by default" {
     const Data = struct { x: u8, y: u8 };
     const doc = try dump(&tree, Data{ .x = 1, .y = 2 });
 
-    var path = try tree.best(std.testing.allocator, pretty.F1.init(80), doc, null);
-    defer path.deinit(std.testing.allocator);
+    const layout = try tree.best(std.testing.allocator, pretty.F1.init(80), doc, null);
 
     var buffer: [64]u8 = undefined;
     var writer = std.Io.Writer.fixed(buffer[0..]);
-    try tree.renderWithPath(&writer, doc, &path);
+    try tree.emit(&writer, layout.measure.layout);
     const rendered = writer.buffered();
     try expectEqualStrings(".{ .x = 1, .y = 2, }", rendered);
 }
@@ -322,12 +321,11 @@ test "dump chooses multiline layout when narrow" {
         },
     );
 
-    var path = try tree.best(std.testing.allocator, pretty.F1.init(18), doc, null);
-    defer path.deinit(std.testing.allocator);
+    const layout = try tree.best(std.testing.allocator, pretty.F1.init(18), doc, null);
 
     var buffer: [256]u8 = undefined;
     var writer = std.Io.Writer.fixed(buffer[0..]);
-    try tree.renderWithPath(&writer, doc, &path);
+    try tree.emit(&writer, layout.measure.layout);
     const rendered = writer.buffered();
 
     try expect(std.mem.indexOf(u8, rendered, "\n") != null);

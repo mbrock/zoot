@@ -74,15 +74,457 @@ pub const Path = struct {
     };
 };
 
-pub const Crux = packed struct {
-    kind: u3 = 0b100,
-    spam: u12 = 0,
+pub const Context = struct {
     head: u16 = 0,
     base: u16 = 0,
     rows: u16 = 0,
-    cost: f32 = 0,
-    node: Node,
+    tainted: bool = false,
+
+    pub fn warp(self: *@This()) void {
+        self.base = self.head;
+    }
+
+    pub fn nest(self: *@This(), indent: u6) void {
+        if (indent == 0) return;
+        const widened = @as(u32, self.base) + @as(u32, indent);
+        const limit = @as(u32, std.math.maxInt(u16));
+        self.base = @intCast(@min(widened, limit));
+    }
 };
+
+pub fn MeasureType(comptime Cost: type) type {
+    return struct {
+        last: u16 = 0,
+        rows: u16 = 0,
+        tainted: bool = false,
+        rank: Cost.Rank = .{},
+        layout: Node = Node.halt,
+    };
+}
+
+pub const MachineStats = struct {
+    memo_hits: usize = 0,
+    memo_misses: usize = 0,
+};
+
+pub fn BestOutcomeType(comptime Cost: type) type {
+    return struct {
+        measure: MeasureType(Cost),
+        completions: usize = 0,
+        memo_hits: usize = 0,
+        memo_misses: usize = 0,
+        memo_entries: usize = 0,
+        frontier_non_tainted: usize = 0,
+        tainted_kept: bool = false,
+        queue_peak: usize = 0,
+    };
+}
+
+pub const MemoKey = packed struct {
+    node: u32,
+    head: u16,
+    base: u16,
+};
+
+pub fn MemoType(comptime Cost: type) type {
+    return std.AutoHashMap(MemoKey, MeasureType(Cost));
+}
+
+pub fn KFrameType(comptime Cost: type) type {
+    const Measure = MeasureType(Cost);
+    return union(enum) {
+        done,
+        after_left: AfterLeft,
+        after_right: AfterRight,
+
+        const Self = @This();
+
+        pub const AfterLeft = struct {
+            node: Node,
+            rhs: Node,
+            right_base: u16,
+            head: u16,
+            base: u16,
+            next: *Self,
+        };
+
+        pub const AfterRight = struct {
+            node: Node,
+            head: u16,
+            base: u16,
+            left: Measure,
+            next: *Self,
+        };
+    };
+}
+
+pub fn MachineType(comptime Cost: type) type {
+    const Measure = MeasureType(Cost);
+    const Frame = KFrameType(Cost);
+
+    return union(enum) {
+        eval: struct {
+            node: Node,
+            ctx: Context,
+            k: *Frame,
+        },
+        fork: struct {
+            left: struct {
+                node: Node,
+                ctx: Context,
+                k: *Frame,
+            },
+            right: struct {
+                node: Node,
+                ctx: Context,
+                k: *Frame,
+            },
+        },
+        ret: struct {
+            meas: Measure,
+            k: *Frame,
+        },
+        done: struct {
+            meas: Measure,
+        },
+    };
+}
+
+pub fn machineStep(
+    comptime Cost: type,
+    tree: *Tree,
+    cf: Cost,
+    frames: *List(KFrameType(Cost)),
+    machine: *MachineType(Cost),
+    memo: ?*MemoType(Cost),
+    stats: ?*MachineStats,
+) !void {
+    const Measure = MeasureType(Cost);
+    const Frame = KFrameType(Cost);
+    switch (machine.*) {
+        .eval => |*eval_state| {
+            const key = MemoKey{
+                .node = eval_state.node.repr(),
+                .head = eval_state.ctx.head,
+                .base = eval_state.ctx.base,
+            };
+
+            if (memo) |m| {
+                if (m.get(key)) |cached| {
+                    if (stats) |s| s.memo_hits += 1;
+                    machine.* = .{ .ret = .{ .meas = cached, .k = eval_state.k } };
+                    return;
+                }
+            }
+            if (stats) |s| s.memo_misses += 1;
+
+            switch (eval_state.node.look()) {
+            .rune => |rune| {
+                var last = eval_state.ctx.head;
+                var rows: u16 = 0;
+                var rank: Cost.Rank = .{};
+
+                if (rune.reps != 0) {
+                    if (rune.code == '\n') {
+                        rows = rune.reps;
+                        last = eval_state.ctx.base;
+                        for (0..rune.reps) |_| {
+                            rank = cf.plus(rank, cf.line());
+                        }
+                    } else {
+                        const width_per = std.unicode.utf8CodepointSequenceLength(rune.code) catch 1;
+                        const total: u32 = @intCast(@as(u32, width_per) * rune.reps);
+                        rank = cf.plus(rank, cf.text(eval_state.ctx.head, @intCast(total)));
+                        const widened = @as(u32, eval_state.ctx.head) + total;
+                        const limit = @as(u32, std.math.maxInt(u16));
+                        last = @intCast(@min(widened, limit));
+                    }
+                }
+
+                const meas = Measure{
+                    .layout = eval_state.node,
+                    .last = last,
+                    .rows = rows,
+                    .rank = rank,
+                    .tainted = rankTainted(rank),
+                };
+
+                if (memo) |m| try m.put(key, meas);
+                machine.* = .{ .ret = .{ .meas = meas, .k = eval_state.k } };
+            },
+            .span => |span| {
+                var head = eval_state.ctx.head;
+                var rows: u16 = 0;
+                var rank: Cost.Rank = .{};
+
+                if (span.char != 0 and span.side == .lchr) {
+                    if (span.char == '\n') {
+                        rows +|= 1;
+                        head = eval_state.ctx.base;
+                        rank = cf.plus(rank, cf.line());
+                    } else {
+                        rank = cf.plus(rank, cf.text(head, 1));
+                        head +|= 1;
+                    }
+                }
+
+                const tail = tree.heap.text.items[span.text..];
+                const text = std.mem.sliceTo(tail, 0);
+                const text_len: u16 = @intCast(text.len);
+                if (text_len != 0) {
+                    rank = cf.plus(rank, cf.text(head, text_len));
+                    head +|= text_len;
+                }
+
+                if (span.char != 0 and span.side == .rchr) {
+                    if (span.char == '\n') {
+                        rows +|= 1;
+                        rank = cf.plus(rank, cf.line());
+                        head = eval_state.ctx.base;
+                    } else {
+                        rank = cf.plus(rank, cf.text(head, 1));
+                        head +|= 1;
+                    }
+                }
+
+                const meas = Measure{
+                    .layout = eval_state.node,
+                    .last = head,
+                    .rows = rows,
+                    .rank = rank,
+                    .tainted = rankTainted(rank),
+                };
+
+                if (memo) |m| try m.put(key, meas);
+                machine.* = .{ .ret = .{ .meas = meas, .k = eval_state.k } };
+            },
+            .quad => |quad| {
+                var head = eval_state.ctx.head;
+                var rows: u16 = 0;
+                var rank: Cost.Rank = .{};
+                const chars = [_]u7{ quad.ch0, quad.ch1, quad.ch2, quad.ch3 };
+                for (chars) |c| {
+                    if (c == 0) break;
+                    if (c == '\n') {
+                        rows +|= 1;
+                        head = eval_state.ctx.base;
+                        rank = cf.plus(rank, cf.line());
+                    } else {
+                        rank = cf.plus(rank, cf.text(head, 1));
+                        head +|= 1;
+                    }
+                }
+
+                const meas = Measure{
+                    .layout = eval_state.node,
+                    .last = head,
+                    .rows = rows,
+                    .rank = rank,
+                    .tainted = rankTainted(rank),
+                };
+
+                if (memo) |m| try m.put(key, meas);
+                machine.* = .{ .ret = .{ .meas = meas, .k = eval_state.k } };
+            },
+            .cons => |oper| {
+                const pair = tree.heap.cons.items[oper.item];
+
+                var child_ctx = eval_state.ctx;
+                if (oper.frob.warp == 1)
+                    child_ctx.warp();
+                if (oper.frob.nest != 0)
+                    child_ctx.nest(oper.frob.nest);
+
+                const cont = try frames.push(tree.bank, Frame{
+                    .after_left = .{
+                        .node = eval_state.node,
+                        .rhs = pair.tail,
+                        .right_base = child_ctx.base,
+                        .head = eval_state.ctx.head,
+                        .base = eval_state.ctx.base,
+                        .next = eval_state.k,
+                    },
+                });
+
+                machine.* = .{
+                    .eval = .{
+                        .node = pair.head,
+                        .ctx = child_ctx,
+                        .k = cont,
+                    },
+                };
+            },
+            .fork => |oper| {
+                const pair = tree.heap.fork.items[oper.item];
+
+                var left_ctx = eval_state.ctx;
+                if (oper.frob.warp == 1)
+                    left_ctx.warp();
+                if (oper.frob.nest != 0)
+                    left_ctx.nest(oper.frob.nest);
+
+                const right_ctx = left_ctx;
+
+                machine.* = .{ .fork = .{
+                    .left = .{ .node = pair.head, .ctx = left_ctx, .k = eval_state.k },
+                    .right = .{ .node = pair.tail, .ctx = right_ctx, .k = eval_state.k },
+                } };
+            },
+            .trip => return error.Unimplemented,
+        }
+        },
+        .ret => |*ret_state| switch (ret_state.k.*) {
+            .done => {
+                machine.* = .{ .done = .{ .meas = ret_state.meas } };
+            },
+            .after_left => |after| {
+                const rhs = after.rhs;
+                const right_base = after.right_base;
+                const orig_head = after.head;
+                const orig_base = after.base;
+                const next = after.next;
+
+                const frame = try frames.push(tree.bank, Frame{
+                    .after_right = .{
+                        .node = after.node,
+                        .head = orig_head,
+                        .base = orig_base,
+                        .left = ret_state.meas,
+                        .next = next,
+                    },
+                });
+
+                machine.* = .{
+                    .eval = .{
+                        .node = rhs,
+                        .ctx = .{
+                            .head = ret_state.meas.last,
+                            .base = right_base,
+                            .rows = ret_state.meas.rows,
+                            .tainted = ret_state.meas.tainted,
+                        },
+                        .k = frame,
+                    },
+                };
+            },
+            .after_right => |after| {
+                const left = after.left;
+                const next = after.next;
+
+                const combined_rank = cf.plus(left.rank, ret_state.meas.rank);
+
+                const oper = switch (after.node.look()) {
+                    .cons => |oper| oper,
+                    else => unreachable,
+                };
+
+                const cons_index: u21 = @intCast(tree.heap.cons.items.len);
+                try tree.heap.cons.append(tree.bank, .{
+                    .head = left.layout,
+                    .tail = ret_state.meas.layout,
+                });
+
+                const layout = Node.fromOper(.cons, oper.frob, cons_index);
+
+                const meas = Measure{
+                    .layout = layout,
+                    .last = ret_state.meas.last,
+                    .rows = left.rows +| ret_state.meas.rows,
+                    .rank = combined_rank,
+                    .tainted = left.tainted or ret_state.meas.tainted or rankTainted(combined_rank),
+                };
+
+                if (memo) |m| {
+                    const key = MemoKey{
+                        .node = after.node.repr(),
+                        .head = after.head,
+                        .base = after.base,
+                    };
+                    try m.put(key, meas);
+                }
+
+                machine.* = .{
+                    .ret = .{
+                        .meas = meas,
+                        .k = next,
+                    },
+                };
+            },
+        },
+        .done => {},
+        .fork => {},
+    }
+}
+
+fn rankTainted(rank: anytype) bool {
+    const RankType = @TypeOf(rank);
+    if (@hasField(RankType, "o")) {
+        return @field(rank, "o") != 0;
+    }
+    return false;
+}
+
+fn costBetter(
+    comptime Cost: type,
+    conf: Cost,
+    lhs: MeasureType(Cost),
+    rhs: MeasureType(Cost),
+) bool {
+    return conf.wins(lhs.rank, rhs.rank);
+}
+
+fn dominates(
+    comptime Cost: type,
+    conf: Cost,
+    lhs: MeasureType(Cost),
+    rhs: MeasureType(Cost),
+) bool {
+    if (!lhs.tainted and rhs.tainted) return true;
+    if (lhs.tainted and !rhs.tainted) return false;
+    const lhs_wins = conf.wins(lhs.rank, rhs.rank);
+    const rhs_wins = conf.wins(rhs.rank, lhs.rank);
+    return lhs_wins and !rhs_wins;
+}
+
+fn updateFrontier(
+    comptime Cost: type,
+    conf: Cost,
+    bank: Bank,
+    frontier: *std.ArrayList(MeasureType(Cost)),
+    tainted_best: *?MeasureType(Cost),
+    meas: MeasureType(Cost),
+) !void {
+    if (!meas.tainted) {
+        tainted_best.* = null;
+
+        var i: usize = 0;
+        while (i < frontier.items.len) {
+            const existing = frontier.items[i];
+            if (dominates(Cost, conf, existing, meas)) {
+                return;
+            }
+            if (dominates(Cost, conf, meas, existing)) {
+                _ = frontier.swapRemove(i);
+                continue;
+            }
+            i += 1;
+        }
+
+        try frontier.append(bank, meas);
+        return;
+    }
+
+    if (frontier.items.len != 0) return;
+
+    if (tainted_best.*) |existing| {
+        if (dominates(Cost, conf, existing, meas)) return;
+        if (dominates(Cost, conf, meas, existing) or costBetter(Cost, conf, meas, existing)) {
+                tainted_best.* = meas;
+        }
+    } else {
+        tainted_best.* = meas;
+    }
+}
 
 pub const Plot = struct {
     /// output writer
@@ -137,16 +579,14 @@ pub const Plot = struct {
 /// addition that behaves monotonically, and an order.
 pub fn Gist(Cost: type) type {
     return struct {
-        crux: Crux,
+        ctx: Context,
         rank: Cost.Rank,
         cost: Cost,
         sink: std.Io.Writer,
 
         pub fn init(buffer: []u8, cost: Cost) @This() {
             return .{
-                .crux = .{
-                    .node = Node.halt,
-                },
+                .ctx = .{},
                 .cost = cost,
                 .rank = cost.text(0, 0),
                 .sink = .{
@@ -183,10 +623,11 @@ pub fn Gist(Cost: type) type {
                 // dispatching only on `nl` vs anything else.
                 if (c == '\n') {
                     this.rank = this.cost.plus(this.rank, this.cost.line());
-                    this.crux.head = 0;
+                    this.ctx.head = this.ctx.base;
+                    this.ctx.rows +|= 1;
                 } else {
-                    this.rank = this.cost.plus(this.rank, this.cost.text(this.crux.head, 1));
-                    this.crux.head += 1;
+                    this.rank = this.cost.plus(this.rank, this.cost.text(this.ctx.head, 1));
+                    this.ctx.head +|= 1;
                 }
             }
         }
@@ -627,22 +1068,26 @@ pub const Pair = packed struct {
     }
 };
 
-pub const Task = packed struct {
+pub const Task = struct {
     expr: Node,
-    crux: Crux,
+    crux: Context,
     link: ?*Task = null,
 
     pub fn eval(expr: Node) Task {
         return .{
             .expr = expr,
-            .crux = .{ .node = expr },
+            .crux = .{},
         };
     }
 
     pub const halt: Task = .{
         .expr = .halt,
-        .crux = .{ .node = Node.halt },
+        .crux = .{},
     };
+
+    pub fn isHalt(this: Task) bool {
+        return this.expr.repr() == Task.halt.expr.repr() and this.link == null;
+    }
 };
 
 pub const Step = union(enum) {
@@ -655,9 +1100,9 @@ pub const Step = union(enum) {
     }
 
     pub fn both(head: Task, tail: Task) Step {
-        return if (head == Task.halt)
+        return if (head.isHalt())
             .{ .halt = {} }
-        else if (tail == Task.halt)
+        else if (tail.isHalt())
             .{ .exec = head }
         else
             .{ .fork = [2]Task{ head, tail } };
@@ -781,33 +1226,73 @@ pub const Step = union(enum) {
                 // To step into `a <> b` with a continuation `c`,
                 // we step into `a` with a new continuation `b <> c`.
                 const pair = heap.cons.items[cons.item];
+
+                var child_base: u16 = task.crux.base;
+                if (cons.frob.warp == 1)
+                    child_base = task.crux.head;
+                if (cons.frob.nest != 0) {
+                    const addend: u16 = @intCast(cons.frob.nest);
+                    const widened = @as(u32, child_base) + @as(u32, addend);
+                    const limit = @as(u32, std.math.maxInt(u16));
+                    child_base = @intCast(@min(widened, limit));
+                }
+
+                const tail_ptr = try heap.work.push(bank, .{
+                    .expr = pair.tail,
+                    .crux = .{
+                        .head = task.crux.head,
+                        .base = child_base,
+                        .rows = task.crux.rows,
+                        .tainted = task.crux.tainted,
+                    },
+                    .link = task.link,
+                });
+
                 return .just(
                     .{
                         .expr = pair.head,
                         .crux = .{
-                            .node = pair.head,
+                            .head = task.crux.head,
+                            .base = child_base,
+                            .rows = task.crux.rows,
+                            .tainted = task.crux.tainted,
                         },
-                        .link = try heap.work.push(bank, .{
-                            .expr = pair.tail,
-                            .link = task.link,
-                            .crux = .{
-                                .node = pair.tail,
-                            },
-                        }),
+                        .link = tail_ptr,
                     },
                 );
             },
             .fork => |fork| {
                 const pair = heap.fork.items[fork.item];
+
+                var branch_base: u16 = task.crux.base;
+                if (fork.frob.warp == 1)
+                    branch_base = task.crux.head;
+                if (fork.frob.nest != 0) {
+                    const addend: u16 = @intCast(fork.frob.nest);
+                    const widened = @as(u32, branch_base) + @as(u32, addend);
+                    const limit = @as(u32, std.math.maxInt(u16));
+                    branch_base = @intCast(@min(widened, limit));
+                }
+
                 return .both(
                     .{
                         .expr = pair.head,
-                        .crux = .{ .node = pair.head },
+                        .crux = .{
+                            .head = task.crux.head,
+                            .base = branch_base,
+                            .rows = task.crux.rows,
+                            .tainted = task.crux.tainted,
+                        },
                         .link = task.link,
                     },
                     .{
                         .expr = pair.tail,
-                        .crux = .{ .node = pair.tail },
+                        .crux = .{
+                            .head = task.crux.head,
+                            .base = branch_base,
+                            .rows = task.crux.rows,
+                            .tainted = task.crux.tainted,
+                        },
                         .link = task.link,
                     },
                 );
@@ -824,7 +1309,7 @@ pub const Road = struct {
     /// The road ahead; the suffix of potential.
     plan: Task,
     /// The crux of it.
-    crux: Crux,
+    crux: Context,
 
     fn init(plan: Task) @This() {
         return .{
@@ -837,6 +1322,7 @@ pub const Road = struct {
         return .{
             .past = try self.past.copy(bank),
             .plan = self.plan,
+            .crux = self.crux,
         };
     }
 
@@ -890,9 +1376,12 @@ pub const Maze = struct {
                 //     }
                 //     continue :hunt;
                 // }
+                road.plan.crux = road.crux;
                 switch (try tree.flap(road.plan)) {
                     .halt => break,
                     .exec => |plan| {
+                        road.plan = plan;
+                        road.crux = plan.crux;
                         switch (plan.expr.look()) {
                             .rune => |rune| {
                                 if (!rune.isEmpty()) {
@@ -922,31 +1411,32 @@ pub const Maze = struct {
                                     road.crux.head +|= 1;
                                 }
                             },
-                            .cons => |cons| {
-                                if (cons.frob.warp == 1)
-                                    road.crux.base = road.crux.head;
-                                road.crux.base +|= cons.frob.nest;
-                            },
                             else => {},
                         }
                         // Choiceless step.
-                        road.plan = if (plan.expr.isTerminal())
-                            // No subexpressions; jump to continuation.
-                            (if (plan.link) |link| link.* else break)
-                        else
-                            // Nonterminal operator.
-                            plan;
+                        if (road.plan.expr.isTerminal()) {
+                            if (road.plan.link) |link| {
+                                link.crux.head = road.crux.head;
+                                link.crux.base = road.crux.base;
+                                link.crux.rows = road.crux.rows;
+                            road.plan = link.*;
+                            road.crux = road.plan.crux;
+                        } else {
+                            break;
+                        }
+                        }
                     },
                     .fork => |ways| {
                         // Branching step; enqueue the road not taken.
                         try work.append(bank, .{
                             .past = try road.past.turn(bank, 1),
                             .plan = ways[1],
-                            .crux = road.crux,
+                            .crux = ways[1].crux,
                         });
 
                         try road.past.push(bank, 0);
                         road.plan = ways[0];
+                        road.crux = road.plan.crux;
                     },
                 }
             }
@@ -965,7 +1455,7 @@ pub const Maze = struct {
                             road.past,
                             rank,
                             tree.heap.work.size(),
-                            road.plan.crux.node.tag,
+                            road.plan.expr.tag,
                         },
                     );
             }
@@ -1083,8 +1573,111 @@ pub const Tree = struct {
         conf: anytype,
         node: Node,
         info: ?*std.Io.Writer,
-    ) !Path {
-        return Maze.best(tree, bank, conf, node, info);
+    ) !BestOutcomeType(@TypeOf(conf)) {
+        _ = info;
+
+        const Cost = @TypeOf(conf);
+        const Measure = MeasureType(Cost);
+        const Machine = MachineType(Cost);
+        const Frame = KFrameType(Cost);
+        const Memo = MemoType(Cost);
+        const Outcome = BestOutcomeType(Cost);
+
+        const SearchState = struct {
+            machine: Machine,
+        };
+
+        var frames = List(Frame).init(bank);
+        defer frames.deinit();
+
+        var memo = Memo.init(bank);
+        defer memo.deinit();
+
+        var work = try std.ArrayList(SearchState).initCapacity(bank, 64);
+        defer work.deinit(bank);
+
+        const k_done = try frames.push(bank, Frame{ .done = {} });
+        try work.append(bank, .{ .machine = Machine{
+            .eval = .{
+                .node = node,
+                .ctx = .{},
+                .k = k_done,
+            },
+        } });
+
+        var queue_peak: usize = work.items.len;
+        var completions: usize = 0;
+        var stats = MachineStats{};
+
+        var non_tainted = try std.ArrayList(Measure).initCapacity(bank, 4);
+        defer non_tainted.deinit(bank);
+
+        var tainted_best: ?Measure = null;
+
+        while (work.pop()) |state| {
+            var machine = state.machine;
+
+            while (true) {
+                switch (machine) {
+                    .fork => |branches| {
+                        try work.append(bank, .{ .machine = Machine{ .eval = .{
+                            .node = branches.right.node,
+                            .ctx = branches.right.ctx,
+                            .k = branches.right.k,
+                        } } });
+                        if (work.items.len > queue_peak) queue_peak = work.items.len;
+                        machine = Machine{ .eval = .{
+                            .node = branches.left.node,
+                            .ctx = branches.left.ctx,
+                            .k = branches.left.k,
+                        } };
+                        continue;
+                    },
+                    .done => |done| {
+                        try updateFrontier(Cost, conf, bank, &non_tainted, &tainted_best, done.meas);
+                        completions += 1;
+                        break;
+                    },
+                    else => {},
+                }
+
+                try machineStep(Cost, tree, conf, &frames, &machine, &memo, &stats);
+            }
+        }
+
+        const memo_entries = memo.count();
+
+        if (non_tainted.items.len != 0) {
+            var optimal = non_tainted.items[0];
+            for (non_tainted.items[1..]) |candidate| {
+                if (costBetter(Cost, conf, candidate, optimal)) optimal = candidate;
+            }
+            return Outcome{
+                .measure = optimal,
+                .completions = completions,
+                .memo_hits = stats.memo_hits,
+                .memo_misses = stats.memo_misses,
+                .memo_entries = memo_entries,
+                .frontier_non_tainted = non_tainted.items.len,
+                .tainted_kept = false,
+                .queue_peak = queue_peak,
+            };
+        }
+
+        if (tainted_best) |tainted| {
+            return Outcome{
+                .measure = tainted,
+                .completions = completions,
+                .memo_hits = stats.memo_hits,
+                .memo_misses = stats.memo_misses,
+                .memo_entries = memo_entries,
+                .frontier_non_tainted = 0,
+                .tainted_kept = true,
+                .queue_peak = queue_peak,
+            };
+        }
+
+        return error.MazeNoLayouts;
     }
 
     pub fn renderWithPath(
@@ -1589,13 +2182,12 @@ test "maze evaluation chooses best layout" {
     const doc = try tree.fork(inline_doc, multiline);
 
     const cost = F1.init(10);
-    var result = try tree.best(std.testing.allocator, cost, doc, null);
-    defer result.deinit(std.testing.allocator);
+    const result = try tree.best(std.testing.allocator, cost, doc, null);
 
     const buf = try std.testing.allocator.alloc(u8, 64);
     defer std.testing.allocator.free(buf);
     var sink = std.Io.Writer.fixed(buf);
-    try tree.renderWithPath(&sink, doc, &result);
+    try tree.emit(&sink, result.measure.layout);
     try expectEqualStrings("foo bar", sink.buffered());
 }
 
