@@ -43,7 +43,6 @@ fn jsonNode(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
         .span, .quad, .trip, .rune => try formatTextNode(t2, t1, node),
         .cons, .fork => |oper| try t2.cat(&.{
             try t2.text(if (node.tag == .cons) "+" else "?"),
-            try t2.when(oper.frob.flat == 1, try t2.text("ᶠ")),
             try t2.when(oper.frob.warp == 1, try t2.text("ʷ")),
             try t2.when(oper.frob.nest != 0, try t2.format("ⁿ{d}", .{oper.frob.nest})),
         }),
@@ -138,7 +137,6 @@ fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) !Node {
         .span, .quad, .trip, .rune => try formatTextNode(t2, t1, node),
         .cons, .fork => |oper| try t2.cat(&.{
             try t2.text(if (node.tag == .cons) "+" else "?"),
-            try t2.when(oper.frob.flat == 1, try t2.text("ᶠ")),
             try t2.when(oper.frob.warp == 1, try t2.text("ʷ")),
             try t2.when(oper.frob.nest != 0, try t2.format("ⁿ{d}", .{oper.frob.nest})),
         }),

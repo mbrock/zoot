@@ -76,7 +76,6 @@ pub const Path = struct {
 
 pub const Crux = packed struct {
     kind: u3 = 0b100,
-    flat: u1 = 0,
     spam: u12 = 0,
     head: u16 = 0,
     base: u16 = 0,
@@ -92,8 +91,6 @@ pub const Plot = struct {
     head: u16 = 0,
     /// indent column
     base: u16 = 0,
-    /// treat ␤ as ␠?
-    flat: bool = false,
     /// fork choice iterator
     path: Path.Walk = Path.none.walk(),
 
@@ -105,14 +102,9 @@ pub const Plot = struct {
     }
 
     pub fn newline(this: *@This()) !void {
-        if (this.flat) {
-            try this.sink.writeByte(' ');
-            this.head +|= 1;
-        } else {
-            try this.sink.writeByte('\n');
-            try this.sink.splatByteAll(' ', this.base);
-            this.head = this.base;
-        }
+        try this.sink.writeByte('\n');
+        try this.sink.splatByteAll(' ', this.base);
+        this.head = this.base;
     }
 
     /// Return either `x0` or `x1` depending on the next bit in the `path`.
@@ -437,14 +429,13 @@ pub const Rune = packed struct {
     }
 };
 
-/// column tweak composition; 8 bits
 pub const Frob = packed struct {
-    /// 1 means flatten result
-    flat: u1 = 0,
     /// 1 means align result to current column
     warp: u1 = 0,
     /// apply nest(n, _) to result
     nest: u6 = 0,
+    /// unused
+    pad: u1 = 0,
 };
 
 pub const Oper = packed struct {
@@ -455,10 +446,6 @@ pub const Oper = packed struct {
     pub fn emit(this: Oper, plot: *Plot, tree: *Tree) !void {
         switch (this.kind) {
             .cons => {
-                const saveflat = plot.flat;
-                defer plot.flat = saveflat;
-                plot.flat |= this.frob.flat == 1;
-
                 const save_base = plot.base;
                 defer plot.base = save_base;
 
@@ -910,7 +897,7 @@ pub const Maze = struct {
                             .rune => |rune| {
                                 if (!rune.isEmpty()) {
                                     for (0..rune.reps) |_| {
-                                        if (rune.code == '\n' and road.crux.flat == 0) {
+                                        if (rune.code == '\n') {
                                             road.crux.head = road.crux.base;
                                             road.crux.rows +|= 1;
                                         } else {
@@ -939,7 +926,6 @@ pub const Maze = struct {
                                 if (cons.frob.warp == 1)
                                     road.crux.base = road.crux.head;
                                 road.crux.base +|= cons.frob.nest;
-                                road.crux.flat = cons.frob.flat;
                             },
                             else => {},
                         }
@@ -1000,45 +986,6 @@ pub const Maze = struct {
 
         return path orelse return error.MazeNoLayouts;
     }
-
-    pub fn hest(
-        tree: *Tree,
-        bank: Bank,
-        conf: anytype,
-        root: Node,
-        info: ?*std.Io.Writer,
-    ) !Path {
-        const Rank = @TypeOf(conf).Rank;
-
-        var path: ?Path = null;
-        var peak: ?Rank = null;
-        errdefer if (path) |*p| p.deinit(bank);
-
-        var road = Path.none;
-        try road.bits.resize(bank, 15, false);
-        for (0..std.math.maxInt(u15)) |tick| {
-            road.bits.masks[0] = tick;
-            const rank = try tree.rank(conf, road, root);
-            const hype = (peak == null or conf.wins(rank, peak.?));
-            if (hype) {
-                path = road;
-                peak = rank;
-            }
-            if (info) |w| {
-                try w.print(
-                    "{s} {f} {f}  {d: >4} maze\n",
-                    .{
-                        if (hype) "★" else " ",
-                        road,
-                        rank,
-                        tree.heap.work.size(),
-                    },
-                );
-            }
-        }
-
-        return path orelse return error.MazeNoLayouts;
-    }
 };
 
 pub fn List(Elem: type) type {
@@ -1090,13 +1037,19 @@ pub const Heap = struct {
 pub const Tree = struct {
     bank: Bank,
     heap: Heap,
+    flatten_cache: std.AutoHashMap(u32, Node),
 
     pub fn init(bank: Bank) Tree {
-        return .{ .bank = bank, .heap = .{ .work = .init(bank) } };
+        return .{
+            .bank = bank,
+            .heap = .{ .work = .init(bank) },
+            .flatten_cache = std.AutoHashMap(u32, Node).init(bank),
+        };
     }
 
     pub fn deinit(tree: *Tree) void {
         tree.heap.deinit(tree.bank);
+        tree.flatten_cache.deinit();
     }
 
     pub fn render(tree: *Tree, buffer: []u8, node: Node) ![]const u8 {
@@ -1147,27 +1100,57 @@ pub const Tree = struct {
         try node.emit(&plot, tree);
     }
 
-    pub fn flat(tree: *Tree, lhs: Node) !Node {
-        _ = tree;
-        var new = lhs;
-        switch (new.edit()) {
-            .span => |span| {
-                if (span.char == '\n')
-                    span.char = ' ';
-                return new;
+    pub fn flat(tree: *Tree, doc: Node) !Node {
+        return tree.flattenRec(doc);
+    }
+
+    fn flattenRec(tree: *Tree, doc: Node) !Node {
+        const key = doc.repr();
+        if (tree.flatten_cache.get(key)) |entry| return entry;
+
+        const result = switch (doc.look()) {
+            .span => |span| blk: {
+                if (span.char != '\n') break :blk doc;
+                break :blk Node.fromSpan(span.side, ' ', span.text);
             },
-            .quad => return new,
-            .trip => return new,
-            .rune => |rune| {
-                if (rune.code == '\n')
-                    rune.code = ' ';
-                return new;
+            .quad => doc,
+            .trip => doc,
+            .rune => |rune| blk: {
+                if (rune.code != '\n' or rune.reps == 0) break :blk doc;
+                break :blk Node.fromRune(rune.reps, ' ');
             },
-            .cons, .fork => |oper| {
-                oper.frob.flat = 1;
-                return new;
+            .cons => |oper| blk: {
+                const pair = tree.heap.cons.items[oper.item];
+                const head = try tree.flattenRec(pair.head);
+                const tail = try tree.flattenRec(pair.tail);
+                const changed =
+                    head.repr() != pair.head.repr() or
+                    tail.repr() != pair.tail.repr();
+                if (!changed) break :blk doc;
+
+                const next: u21 = @intCast(tree.heap.cons.items.len);
+                try tree.heap.cons.append(tree.bank, .{ .head = head, .tail = tail });
+
+                break :blk Node.fromOper(.cons, oper.frob, next);
             },
-        }
+            .fork => |oper| blk: {
+                const pair = tree.heap.fork.items[oper.item];
+                const head = try tree.flattenRec(pair.head);
+                const tail = try tree.flattenRec(pair.tail);
+                const changed =
+                    head.repr() != pair.head.repr() or
+                    tail.repr() != pair.tail.repr();
+                if (!changed) break :blk doc;
+
+                const next: u21 = @intCast(tree.heap.fork.items.len);
+                try tree.heap.fork.append(tree.bank, .{ .head = head, .tail = tail });
+
+                break :blk Node.fromOper(.fork, oper.frob, next);
+            },
+        };
+
+        try tree.flatten_cache.put(key, result);
+        return result;
     }
 
     /// The `nest` combinator shifts the base of a layout's
