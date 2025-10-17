@@ -338,7 +338,9 @@ test "dump escapes strings" {
     const doc = try dump(&tree, "quote \" and newline\n");
 
     var buffer: [64]u8 = undefined;
-    const rendered = try tree.render(buffer[0..], doc);
+    var writer = std.Io.Writer.fixed(buffer[0..]);
+    try tree.emit(&writer, doc);
+    const rendered = writer.buffered();
 
     try expectEqualStrings("\"quote \\\" and newline\\n\"", rendered);
 }

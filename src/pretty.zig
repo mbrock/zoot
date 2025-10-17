@@ -4,74 +4,8 @@ const log = std.log;
 
 pub const Bank = std.mem.Allocator;
 
-/// An iterable path of binary decisions.
 pub const Path = struct {
-    const BitSet = std.bit_set.DynamicBitSetUnmanaged;
-
-    bits: BitSet = .{},
-
     pub const none: Path = .{};
-
-    pub fn deinit(this: *Path, alloc: Bank) void {
-        this.bits.deinit(alloc);
-    }
-
-    pub fn copy(this: *const Path, alloc: Bank) !Path {
-        return .{ .bits = try this.bits.clone(alloc) };
-    }
-
-    pub fn turn(this: Path, alloc: Bank, bit: u1) !Path {
-        var that = try this.copy(alloc);
-        try that.push(alloc, bit);
-        return that;
-    }
-
-    pub fn push(this: *Path, alloc: Bank, bit: u1) !void {
-        const len = this.bits.bit_length;
-        try this.bits.resize(alloc, len + 1, false);
-        if (bit == 1) this.bits.set(len);
-    }
-
-    pub fn walk(this: *const Path) Walk {
-        return .{ .bits = this.bits };
-    }
-
-    pub fn format(this: Path, writer: *std.Io.Writer) !void {
-        if (this.bits.bit_length == 0) {
-            try writer.writeByte('-');
-            return;
-        }
-        var index: usize = 0;
-        while (index < this.bits.bit_length) : (index += 1) {
-            const bit = this.bits.isSet(index);
-            try writer.writeAll(if (bit) "╱" else "╲");
-        }
-        try writer.splatByteAll(' ', 15 -| this.bits.bit_length);
-    }
-
-    /// Dense iterator over bit values
-    pub const Walk = struct {
-        bits: BitSet = .{},
-        curr: usize = 0,
-
-        pub fn next(this: *Walk) ?bool {
-            if (this.curr >= this.bits.bit_length) return null;
-            defer this.curr += 1;
-            return this.bits.isSet(this.curr);
-        }
-
-        pub fn step(this: *Walk) !bool {
-            return this.next() orelse error.MazePathUnderflow;
-        }
-
-        pub fn take(this: *Walk, lhs: anytype, rhs: @TypeOf(lhs)) !@TypeOf(lhs) {
-            return if (try this.step()) rhs else lhs;
-        }
-
-        pub fn remaining(this: *const Walk) usize {
-            return this.bits.bit_length - this.curr;
-        }
-    };
 };
 
 pub const Context = struct {
@@ -198,6 +132,7 @@ pub fn machineStep(
     machine: *MachineType(Cost),
     memo: ?*MemoType(Cost),
     stats: ?*MachineStats,
+    sink: ?*std.Io.Writer,
 ) !void {
     const Measure = MeasureType(Cost);
     const Frame = KFrameType(Cost);
@@ -219,159 +154,188 @@ pub fn machineStep(
             if (stats) |s| s.memo_misses += 1;
 
             switch (eval_state.node.look()) {
-            .rune => |rune| {
-                var last = eval_state.ctx.head;
-                var rows: u16 = 0;
-                var rank: Cost.Rank = .{};
+                .rune => |rune| {
+                    var last = eval_state.ctx.head;
+                    var rows: u16 = 0;
+                    var rank: Cost.Rank = .{};
 
-                if (rune.reps != 0) {
-                    if (rune.code == '\n') {
-                        rows = rune.reps;
-                        last = eval_state.ctx.base;
-                        for (0..rune.reps) |_| {
-                            rank = cf.plus(rank, cf.line());
+                    if (rune.reps != 0) {
+                        if (rune.code == '\n') {
+                            rows = rune.reps;
+                            last = eval_state.ctx.base;
+                            for (0..rune.reps) |_| {
+                                if (sink) |w| {
+                                    try w.writeByte('\n');
+                                    if (eval_state.ctx.base != 0)
+                                        try w.splatByteAll(' ', eval_state.ctx.base);
+                                }
+                                rank = cf.plus(rank, cf.line());
+                            }
+                        } else {
+                            const width_per = std.unicode.utf8CodepointSequenceLength(rune.code) catch 1;
+                            const total: u32 = @intCast(@as(u32, width_per) * rune.reps);
+                            if (sink) |w| {
+                                var buffer: [4]u8 = undefined;
+                                const len = std.unicode.utf8Encode(rune.code, &buffer) catch unreachable;
+                                for (0..rune.reps) |_| try w.writeAll(buffer[0..len]);
+                            }
+                            rank = cf.plus(rank, cf.text(eval_state.ctx.head, @intCast(total)));
+                            const widened = @as(u32, eval_state.ctx.head) + total;
+                            const limit = @as(u32, std.math.maxInt(u16));
+                            last = @intCast(@min(widened, limit));
                         }
-                    } else {
-                        const width_per = std.unicode.utf8CodepointSequenceLength(rune.code) catch 1;
-                        const total: u32 = @intCast(@as(u32, width_per) * rune.reps);
-                        rank = cf.plus(rank, cf.text(eval_state.ctx.head, @intCast(total)));
-                        const widened = @as(u32, eval_state.ctx.head) + total;
-                        const limit = @as(u32, std.math.maxInt(u16));
-                        last = @intCast(@min(widened, limit));
                     }
-                }
 
-                const meas = Measure{
-                    .layout = eval_state.node,
-                    .last = last,
-                    .rows = rows,
-                    .rank = rank,
-                    .tainted = rankTainted(rank),
-                };
+                    const meas = Measure{
+                        .layout = eval_state.node,
+                        .last = last,
+                        .rows = rows,
+                        .rank = rank,
+                        .tainted = rankTainted(rank),
+                    };
 
-                if (memo) |m| try m.put(key, meas);
-                machine.* = .{ .ret = .{ .meas = meas, .k = eval_state.k } };
-            },
-            .span => |span| {
-                var head = eval_state.ctx.head;
-                var rows: u16 = 0;
-                var rank: Cost.Rank = .{};
+                    if (memo) |m| try m.put(key, meas);
+                    machine.* = .{ .ret = .{ .meas = meas, .k = eval_state.k } };
+                },
+                .span => |span| {
+                    var head = eval_state.ctx.head;
+                    var rows: u16 = 0;
+                    var rank: Cost.Rank = .{};
 
-                if (span.char != 0 and span.side == .lchr) {
-                    if (span.char == '\n') {
-                        rows +|= 1;
-                        head = eval_state.ctx.base;
-                        rank = cf.plus(rank, cf.line());
-                    } else {
-                        rank = cf.plus(rank, cf.text(head, 1));
-                        head +|= 1;
+                    if (span.char != 0 and span.side == .lchr) {
+                        if (span.char == '\n') {
+                            rows +|= 1;
+                            head = eval_state.ctx.base;
+                            if (sink) |w| {
+                                try w.writeByte('\n');
+                                if (eval_state.ctx.base != 0)
+                                    try w.splatByteAll(' ', eval_state.ctx.base);
+                            }
+                            rank = cf.plus(rank, cf.line());
+                        } else {
+                            if (sink) |w| try w.writeByte(span.char);
+                            rank = cf.plus(rank, cf.text(head, 1));
+                            head +|= 1;
+                        }
                     }
-                }
 
-                const tail = tree.heap.text.items[span.text..];
-                const text = std.mem.sliceTo(tail, 0);
-                const text_len: u16 = @intCast(text.len);
-                if (text_len != 0) {
-                    rank = cf.plus(rank, cf.text(head, text_len));
-                    head +|= text_len;
-                }
-
-                if (span.char != 0 and span.side == .rchr) {
-                    if (span.char == '\n') {
-                        rows +|= 1;
-                        rank = cf.plus(rank, cf.line());
-                        head = eval_state.ctx.base;
-                    } else {
-                        rank = cf.plus(rank, cf.text(head, 1));
-                        head +|= 1;
+                    const tail = tree.heap.text.items[span.text..];
+                    const text = std.mem.sliceTo(tail, 0);
+                    const text_len: u16 = @intCast(text.len);
+                    if (text_len != 0) {
+                        if (sink) |w| try w.writeAll(text);
+                        rank = cf.plus(rank, cf.text(head, text_len));
+                        head +|= text_len;
                     }
-                }
 
-                const meas = Measure{
-                    .layout = eval_state.node,
-                    .last = head,
-                    .rows = rows,
-                    .rank = rank,
-                    .tainted = rankTainted(rank),
-                };
-
-                if (memo) |m| try m.put(key, meas);
-                machine.* = .{ .ret = .{ .meas = meas, .k = eval_state.k } };
-            },
-            .quad => |quad| {
-                var head = eval_state.ctx.head;
-                var rows: u16 = 0;
-                var rank: Cost.Rank = .{};
-                const chars = [_]u7{ quad.ch0, quad.ch1, quad.ch2, quad.ch3 };
-                for (chars) |c| {
-                    if (c == 0) break;
-                    if (c == '\n') {
-                        rows +|= 1;
-                        head = eval_state.ctx.base;
-                        rank = cf.plus(rank, cf.line());
-                    } else {
-                        rank = cf.plus(rank, cf.text(head, 1));
-                        head +|= 1;
+                    if (span.char != 0 and span.side == .rchr) {
+                        if (span.char == '\n') {
+                            rows +|= 1;
+                            rank = cf.plus(rank, cf.line());
+                            if (sink) |w| {
+                                try w.writeByte('\n');
+                                if (eval_state.ctx.base != 0)
+                                    try w.splatByteAll(' ', eval_state.ctx.base);
+                            }
+                            head = eval_state.ctx.base;
+                        } else {
+                            if (sink) |w| try w.writeByte(span.char);
+                            rank = cf.plus(rank, cf.text(head, 1));
+                            head +|= 1;
+                        }
                     }
-                }
 
-                const meas = Measure{
-                    .layout = eval_state.node,
-                    .last = head,
-                    .rows = rows,
-                    .rank = rank,
-                    .tainted = rankTainted(rank),
-                };
+                    const meas = Measure{
+                        .layout = eval_state.node,
+                        .last = head,
+                        .rows = rows,
+                        .rank = rank,
+                        .tainted = rankTainted(rank),
+                    };
 
-                if (memo) |m| try m.put(key, meas);
-                machine.* = .{ .ret = .{ .meas = meas, .k = eval_state.k } };
-            },
-            .cons => |oper| {
-                const pair = tree.heap.cons.items[oper.item];
+                    if (memo) |m| try m.put(key, meas);
+                    machine.* = .{ .ret = .{ .meas = meas, .k = eval_state.k } };
+                },
+                .quad => |quad| {
+                    var head = eval_state.ctx.head;
+                    var rows: u16 = 0;
+                    var rank: Cost.Rank = .{};
+                    const chars = [_]u7{ quad.ch0, quad.ch1, quad.ch2, quad.ch3 };
+                    for (chars) |c| {
+                        if (c == 0) break;
+                        if (c == '\n') {
+                            rows +|= 1;
+                            head = eval_state.ctx.base;
+                            if (sink) |w| {
+                                try w.writeByte('\n');
+                                if (eval_state.ctx.base != 0)
+                                    try w.splatByteAll(' ', eval_state.ctx.base);
+                            }
+                            rank = cf.plus(rank, cf.line());
+                        } else {
+                            if (sink) |w| try w.writeByte(c);
+                            rank = cf.plus(rank, cf.text(head, 1));
+                            head +|= 1;
+                        }
+                    }
 
-                var child_ctx = eval_state.ctx;
-                if (oper.frob.warp == 1)
-                    child_ctx.warp();
-                if (oper.frob.nest != 0)
-                    child_ctx.nest(oper.frob.nest);
+                    const meas = Measure{
+                        .layout = eval_state.node,
+                        .last = head,
+                        .rows = rows,
+                        .rank = rank,
+                        .tainted = rankTainted(rank),
+                    };
 
-                const cont = try frames.push(tree.bank, Frame{
-                    .after_left = .{
-                        .node = eval_state.node,
-                        .rhs = pair.tail,
-                        .right_base = child_ctx.base,
-                        .head = eval_state.ctx.head,
-                        .base = eval_state.ctx.base,
-                        .next = eval_state.k,
-                    },
-                });
+                    if (memo) |m| try m.put(key, meas);
+                    machine.* = .{ .ret = .{ .meas = meas, .k = eval_state.k } };
+                },
+                .cons => |oper| {
+                    const pair = tree.heap.cons.items[oper.item];
 
-                machine.* = .{
-                    .eval = .{
-                        .node = pair.head,
-                        .ctx = child_ctx,
-                        .k = cont,
-                    },
-                };
-            },
-            .fork => |oper| {
-                const pair = tree.heap.fork.items[oper.item];
+                    var child_ctx = eval_state.ctx;
+                    if (oper.frob.warp == 1)
+                        child_ctx.warp();
+                    if (oper.frob.nest != 0)
+                        child_ctx.nest(oper.frob.nest);
 
-                var left_ctx = eval_state.ctx;
-                if (oper.frob.warp == 1)
-                    left_ctx.warp();
-                if (oper.frob.nest != 0)
-                    left_ctx.nest(oper.frob.nest);
+                    const cont = try frames.push(tree.bank, Frame{
+                        .after_left = .{
+                            .node = eval_state.node,
+                            .rhs = pair.tail,
+                            .right_base = child_ctx.base,
+                            .head = eval_state.ctx.head,
+                            .base = eval_state.ctx.base,
+                            .next = eval_state.k,
+                        },
+                    });
 
-                const right_ctx = left_ctx;
+                    machine.* = .{
+                        .eval = .{
+                            .node = pair.head,
+                            .ctx = child_ctx,
+                            .k = cont,
+                        },
+                    };
+                },
+                .fork => |oper| {
+                    const pair = tree.heap.fork.items[oper.item];
 
-                machine.* = .{ .fork = .{
-                    .left = .{ .node = pair.head, .ctx = left_ctx, .k = eval_state.k },
-                    .right = .{ .node = pair.tail, .ctx = right_ctx, .k = eval_state.k },
-                } };
-            },
-            .trip => return error.Unimplemented,
-        }
+                    var left_ctx = eval_state.ctx;
+                    if (oper.frob.warp == 1)
+                        left_ctx.warp();
+                    if (oper.frob.nest != 0)
+                        left_ctx.nest(oper.frob.nest);
+
+                    const right_ctx = left_ctx;
+
+                    machine.* = .{ .fork = .{
+                        .left = .{ .node = pair.head, .ctx = left_ctx, .k = eval_state.k },
+                        .right = .{ .node = pair.tail, .ctx = right_ctx, .k = eval_state.k },
+                    } };
+                },
+                .trip => return error.Unimplemented,
+            }
         },
         .ret => |*ret_state| switch (ret_state.k.*) {
             .done => {
@@ -519,147 +483,11 @@ fn updateFrontier(
     if (tainted_best.*) |existing| {
         if (dominates(Cost, conf, existing, meas)) return;
         if (dominates(Cost, conf, meas, existing) or costBetter(Cost, conf, meas, existing)) {
-                tainted_best.* = meas;
+            tainted_best.* = meas;
         }
     } else {
         tainted_best.* = meas;
     }
-}
-
-pub const Plot = struct {
-    /// output writer
-    sink: *std.Io.Writer,
-    /// cursor column
-    head: u16 = 0,
-    /// indent column
-    base: u16 = 0,
-    /// fork choice iterator
-    path: Path.Walk = Path.none.walk(),
-
-    pub fn writeString(this: *@This(), tree: *const Tree, what: u21) !void {
-        const tail = tree.heap.text.items[what..];
-        const span = std.mem.sliceTo(tail, 0);
-        try this.sink.writeAll(span);
-        this.head +|= @intCast(span.len);
-    }
-
-    pub fn newline(this: *@This()) !void {
-        try this.sink.writeByte('\n');
-        try this.sink.splatByteAll(' ', this.base);
-        this.head = this.base;
-    }
-
-    /// Return either `x0` or `x1` depending on the next bit in the `path`.
-    /// This is used to emit the root node after resolving the best fork path.
-    pub fn pick(this: *@This(), x0: anytype, x1: @TypeOf(x0)) !@TypeOf(x0) {
-        return this.path.take(x0, x1);
-    }
-};
-
-/// This is an `std.Io.Writer` that measures without printing,
-/// allocating, or concatenating anything.  It just looks for
-/// newlines, tracks the cursor column, and tallies a cost.
-///
-/// If you emit a node into a gist sink, you measure the layout
-/// exactly as it's defined; there's no separate measuring logic
-/// to get wrong; we don't multiply the number of visitor patterns
-/// and inductive semantic interpretations of the myriad different
-/// immediate small string paradigms and quirked-up little bitfields.
-///
-/// By tracking the cursor movement of the `emit` code, it computes
-/// what *A Pretty Expressive Printer*, following Bernardy, calls
-/// the *measure* of a choiceless document.
-///
-/// Looking at gists instead of emits is like looking at
-/// only the pure geometry of the bounding boxes;
-/// the medium is the message.
-///
-/// The cost parameter is a type, usually a numeric vector,
-/// with base cost values for newlines and characters,
-/// addition that behaves monotonically, and an order.
-pub fn Gist(Cost: type) type {
-    return struct {
-        ctx: Context,
-        rank: Cost.Rank,
-        cost: Cost,
-        sink: std.Io.Writer,
-
-        pub fn init(buffer: []u8, cost: Cost) @This() {
-            return .{
-                .ctx = .{},
-                .cost = cost,
-                .rank = cost.text(0, 0),
-                .sink = .{
-                    .buffer = buffer,
-                    .vtable = &.{
-                        .drain = drain,
-                        .rebase = std.Io.Writer.failingRebase,
-                    },
-                },
-            };
-        }
-
-        pub fn eval(cost: Cost, tree: *Tree, path: Path, node: Node) !Cost.Rank {
-            var note: [0]u8 = undefined;
-            var this = init(&note, cost);
-            var work = Plot{
-                .sink = &this.sink,
-                .path = path.walk(),
-            };
-            try node.emit(&work, tree);
-            try this.sink.flush();
-            return this.rank;
-        }
-
-        pub fn scan(this: *@This(), data: []const u8) !void {
-            for (data) |c| {
-                // Since the cost plus must be homomorphic or whatever,
-                // the only terminal costs we need are
-                //
-                //   (1) cost of `nl` and
-                //   (2) cost of `text(c, 1)`
-                //
-                // and we can always calculate it character by character,
-                // dispatching only on `nl` vs anything else.
-                if (c == '\n') {
-                    this.rank = this.cost.plus(this.rank, this.cost.line());
-                    this.ctx.head = this.ctx.base;
-                    this.ctx.rows +|= 1;
-                } else {
-                    this.rank = this.cost.plus(this.rank, this.cost.text(this.ctx.head, 1));
-                    this.ctx.head +|= 1;
-                }
-            }
-        }
-
-        pub fn drain(
-            w: *std.Io.Writer,
-            data: []const []const u8,
-            splat: usize,
-        ) !usize {
-            const this: *@This() = @alignCast(@fieldParentPtr("sink", w));
-
-            if (w.end > 0) {
-                try this.scan(w.buffered());
-                w.end = 0;
-            }
-
-            if (data.len == 0) return 0;
-
-            var took: usize = 0;
-
-            for (data[0 .. data.len - 1]) |part| {
-                try this.scan(part);
-                took += part.len;
-            }
-
-            const bulk = data[data.len - 1];
-            for (0..splat) |_|
-                try this.scan(bulk);
-
-            return took + bulk.len * splat;
-        }
-    };
 }
 
 /// Example 3.4. in *A Pretty Expressive Printer*.
@@ -790,25 +618,6 @@ pub const Span = packed struct {
     side: Side = .lchr,
     char: u7 = 0,
     text: u21 = 0,
-
-    fn emitSidekick(char: u7, plot: *Plot) !void {
-        if (char == '\n')
-            try plot.newline()
-        else {
-            try plot.sink.writeByte(char);
-            plot.head +|= 1;
-        }
-    }
-
-    pub fn emit(this: Span, plot: *Plot, tree: *Tree) !void {
-        if (this.char != 0 and this.side == .lchr)
-            try emitSidekick(this.char, plot);
-
-        try plot.writeString(tree, this.text);
-
-        if (this.char != 0 and this.side == .rchr)
-            try emitSidekick(this.char, plot);
-    }
 };
 
 pub const Quad = packed struct {
@@ -818,15 +627,6 @@ pub const Quad = packed struct {
     ch1: u7 = 0,
     ch2: u7 = 0,
     ch3: u7 = 0,
-
-    pub fn emit(this: Quad, plot: *Plot, _: *Tree) !void {
-        const chars = [_]u7{ this.ch0, this.ch1, this.ch2, this.ch3 };
-        for (chars) |c| {
-            if (c == 0) break;
-            try plot.sink.writeByte(c);
-            plot.head +|= 1;
-        }
-    }
 };
 
 pub const Trip = packed struct {
@@ -836,12 +636,6 @@ pub const Trip = packed struct {
     byte0: u8 = 0,
     byte1: u8 = 0,
     byte2: u8 = 0,
-
-    pub fn emit(this: Trip, plot: *Plot, _: *Tree) !void {
-        _ = this;
-        _ = plot;
-        return error.Unimplemented;
-    }
 };
 
 pub const Rune = packed struct {
@@ -849,21 +643,6 @@ pub const Rune = packed struct {
     pad: u2 = 0,
     reps: u6 = 0,
     code: u21 = 0,
-
-    pub fn emit(this: Rune, plot: *Plot, _: *Tree) !void {
-        if (this.reps == 0) return;
-
-        if (this.code == '\n') {
-            for (0..this.reps) |_| try plot.newline();
-            return;
-        }
-
-        var buffer: [4]u8 = undefined;
-        const n = std.unicode.utf8Encode(this.code, &buffer) catch 0;
-        var data = [1][]const u8{buffer[0..n]};
-        try plot.sink.writeSplatAll(&data, this.reps);
-        plot.head +|= @intCast(n * this.reps);
-    }
 
     pub fn isEmpty(this: Rune) bool {
         return this.reps == 0;
@@ -883,35 +662,6 @@ pub const Oper = packed struct {
     kind: Tag = .cons,
     frob: Frob = .{},
     item: u21 = 0,
-
-    pub fn emit(this: Oper, plot: *Plot, tree: *Tree) !void {
-        switch (this.kind) {
-            .cons => {
-                const save_base = plot.base;
-                defer plot.base = save_base;
-
-                if (this.frob.warp == 1)
-                    plot.base = plot.head;
-
-                if (this.frob.nest != 0) {
-                    const addend: u16 = @intCast(this.frob.nest);
-                    const widened = @as(u32, plot.base) + @as(u32, addend);
-                    const limit = @as(u32, std.math.maxInt(u16));
-                    plot.base = @intCast(@min(widened, limit));
-                }
-
-                const args = tree.heap.cons.items[this.item];
-                try args.head.emit(plot, tree);
-                try args.tail.emit(plot, tree);
-            },
-            .fork => {
-                const args = tree.heap.fork.items[this.item];
-                const next = try plot.pick(args.head, args.tail);
-                try next.emit(plot, tree);
-            },
-            else => return error.Unimplemented,
-        }
-    }
 };
 
 /// 32-bit handle to either terminal or operation; implicitly indexes
@@ -994,16 +744,6 @@ pub const Node = packed struct {
         };
     }
 
-    pub fn emit(this: Node, plot: *Plot, tree: *Tree) error{
-        WriteFailed,
-        Unimplemented,
-        MazePathUnderflow,
-    }!void {
-        switch (this.look()) {
-            inline else => |value| try value.emit(plot, tree),
-        }
-    }
-
     pub fn repr(this: Node) u32 {
         return @bitCast(this);
     }
@@ -1068,416 +808,6 @@ pub const Pair = packed struct {
     }
 };
 
-pub const Task = struct {
-    expr: Node,
-    crux: Context,
-    link: ?*Task = null,
-
-    pub fn eval(expr: Node) Task {
-        return .{
-            .expr = expr,
-            .crux = .{},
-        };
-    }
-
-    pub const halt: Task = .{
-        .expr = .halt,
-        .crux = .{},
-    };
-
-    pub fn isHalt(this: Task) bool {
-        return this.expr.repr() == Task.halt.expr.repr() and this.link == null;
-    }
-};
-
-pub const Step = union(enum) {
-    exec: Task,
-    fork: [2]Task,
-    halt: void,
-
-    pub fn just(step: Task) Step {
-        return both(step, Task.halt);
-    }
-
-    pub fn both(head: Task, tail: Task) Step {
-        return if (head.isHalt())
-            .{ .halt = {} }
-        else if (tail.isHalt())
-            .{ .exec = head }
-        else
-            .{ .fork = [2]Task{ head, tail } };
-    }
-
-    /// To execute the task `e ; k` is to evaluate `e` and then execute `k`.
-    ///
-    /// The *flap* function defines the expansion of a task into a step
-    /// with subtasks for subexpressions, linked correctly to the shared
-    /// continuation task.  Like a debugger's single step operation.
-    ///
-    /// For simple expressions, `flap(e ; k)` is just `e ; k`.
-    ///
-    /// For concat, `flap((a + b) ; k)` is `a ; (b ; k)`.
-    ///
-    /// For choice, `flap((a | b) ; k)` is `(a ; k) & (b ; k)`.
-    ///
-    /// Completely applying this expansion to a syntax tree is known as
-    /// the *continuation-passing style transformation*, or CPS transform.
-    ///
-    /// Such an expansion has no nested expressions in the usual sense.
-    /// In the absence of forking choice, it linearizes expressions into
-    /// sequential chains of terminals in the order of actual evaluation.
-    /// In the presence of forking choice, rather than a linear task chain,
-    /// we get a directed acyclic graph of tasks.
-    ///
-    /// This clarifies what it means to have a forking choice nested within
-    /// a more complex expression.  The part of the expression evaluated
-    /// before the fork becomes a sequential prefix in the graph, which
-    /// then splits into two child tasks and eventually merges again;
-    /// for example
-    ///
-    ///     a + b + ((c + d) | (e + f)) + g + h
-    ///
-    /// becomes the task graph
-    ///
-    ///           c → d
-    ///          ↗     ↘
-    ///     a → b        g → h ⇥ ⊤
-    ///          ↘     ↗
-    ///           e → f
-    ///
-    /// where `⊤` is the exit task.  Note that an expression always
-    /// expands to a task graph with a single entry and single exit;
-    /// a document full of choice denotes a single coherent element
-    /// in the relevant model of evaluation.
-    ///
-    /// This program does `flap` as it evaluates instead of up front.
-    /// Doing it up front is probably better.  That's why compilers
-    /// transform into CPS or SSA; with explicit execution graphs,
-    /// it's easier to optimize the execution.
-    ///
-    /// One optimization of the execution graph that seems relevant
-    /// for this library is compacting the node structure so that
-    /// linear chains are sorted contiguously in memory and stored
-    /// as slices.  This is basically like compiling the document
-    /// program into a graph of basic blocks.
-    ///
-    /// This whole way of thinking can transform the algebraic,
-    /// functional, denotational semantics of the PDF papers
-    /// into an operational semantics, a small-step execution
-    /// engine, an abstract machine.
-    ///
-    /// The classic strategy, formalized by Danvy and Filinski
-    /// in the 1990s but rooted in lore and practice going back
-    /// at least to Gordon Plotkin in the 1970s, goes like this.
-    ///
-    /// You start with some beautiful denotational semantic
-    /// function of an algebraic syntax type, a function from
-    /// syntax to value that concisely defines the *meaning*
-    /// of any valid expression, like
-    ///
-    ///     eval(x)            = x
-    ///     eval(Plus(e1, e2)) = eval(e1) + eval(e2)
-    ///
-    /// or
-    ///
-    ///     emit(s)            = s
-    ///     emit(Cons(e1, e2)) = append(emit(e1), emit(e2))
-    ///
-    /// or what have you.  This is your basis for equational
-    /// reasoning, proving various things, sanity checking
-    /// different properties, and so on.
-    ///
-    /// Of course you can directly implement such functions.
-    /// In fact that is one of the more useful definitions of
-    /// what it even means to practice *functional programming*:
-    /// it's writing programs as pure functions from inductive
-    /// syntactic domains into semantic models.
-    ///
-    /// Haskell is basically designed to let academics transcribe
-    /// interesting ACM Functional Pearl papers into source code
-    /// that GHC turns into remarkably adequate machine code.
-    ///
-    /// One thing Haskell does to enable that is lazy evaluation.
-    /// Beautiful semantic functions transcribed to code, without
-    /// any low level mechanics, can skip entire subcomputations
-    /// which turn out to be unneeded for the final result,
-    /// and functions that look like they duplicate computation
-    /// can execute as clever shared mutable thunk graphs.
-    ///
-    /// Of course the most fundamental language feature that allows
-    /// this kind of thing is just garbage collection. The semantic
-    /// equations are blissfully oblivious of allocators, stack and heap,
-    /// cache lines, pointer invalidation, etc, for the basic reason
-    /// that they are *completely unrelated to computers*.
-    ///
-    /// Letting any aspect of your concrete computing machine taint
-    /// your denotational semantics is like trying to define the
-    /// meaning of a quadratic polynomial in terms of the Super Nintendo
-    /// math coprocessor; it's not just bad style, it makes no sense.
-    ///
-    /// But fundamentally what a language like Haskell promises is
-    /// to faithfully and elegantly preserve the functional *meaning*
-    /// of the equational definitions you write down as code.  This
-    /// brackets out the question of what the actual computer is doing,
-    /// and how we can make it stop doing that.
-    pub fn flap(heap: *Heap, bank: Bank, task: Task) !Step {
-        switch (task.expr.look()) {
-            .cons => |cons| {
-                // To step into `a <> b` with a continuation `c`,
-                // we step into `a` with a new continuation `b <> c`.
-                const pair = heap.cons.items[cons.item];
-
-                var child_base: u16 = task.crux.base;
-                if (cons.frob.warp == 1)
-                    child_base = task.crux.head;
-                if (cons.frob.nest != 0) {
-                    const addend: u16 = @intCast(cons.frob.nest);
-                    const widened = @as(u32, child_base) + @as(u32, addend);
-                    const limit = @as(u32, std.math.maxInt(u16));
-                    child_base = @intCast(@min(widened, limit));
-                }
-
-                const tail_ptr = try heap.work.push(bank, .{
-                    .expr = pair.tail,
-                    .crux = .{
-                        .head = task.crux.head,
-                        .base = child_base,
-                        .rows = task.crux.rows,
-                        .tainted = task.crux.tainted,
-                    },
-                    .link = task.link,
-                });
-
-                return .just(
-                    .{
-                        .expr = pair.head,
-                        .crux = .{
-                            .head = task.crux.head,
-                            .base = child_base,
-                            .rows = task.crux.rows,
-                            .tainted = task.crux.tainted,
-                        },
-                        .link = tail_ptr,
-                    },
-                );
-            },
-            .fork => |fork| {
-                const pair = heap.fork.items[fork.item];
-
-                var branch_base: u16 = task.crux.base;
-                if (fork.frob.warp == 1)
-                    branch_base = task.crux.head;
-                if (fork.frob.nest != 0) {
-                    const addend: u16 = @intCast(fork.frob.nest);
-                    const widened = @as(u32, branch_base) + @as(u32, addend);
-                    const limit = @as(u32, std.math.maxInt(u16));
-                    branch_base = @intCast(@min(widened, limit));
-                }
-
-                return .both(
-                    .{
-                        .expr = pair.head,
-                        .crux = .{
-                            .head = task.crux.head,
-                            .base = branch_base,
-                            .rows = task.crux.rows,
-                            .tainted = task.crux.tainted,
-                        },
-                        .link = task.link,
-                    },
-                    .{
-                        .expr = pair.tail,
-                        .crux = .{
-                            .head = task.crux.head,
-                            .base = branch_base,
-                            .rows = task.crux.rows,
-                            .tainted = task.crux.tainted,
-                        },
-                        .link = task.link,
-                    },
-                );
-            },
-            else => return .just(task),
-        }
-    }
-};
-
-/// A *road* is one task in the maze walk.
-pub const Road = struct {
-    /// The path taken; the prefix of actuality.
-    past: Path = .{},
-    /// The road ahead; the suffix of potential.
-    plan: Task,
-    /// The crux of it.
-    crux: Context,
-
-    fn init(plan: Task) @This() {
-        return .{
-            .plan = plan,
-            .crux = plan.crux,
-        };
-    }
-
-    fn copy(self: *const @This(), bank: Bank) !@This() {
-        return .{
-            .past = try self.past.copy(bank),
-            .plan = self.plan,
-            .crux = self.crux,
-        };
-    }
-
-    fn free(self: *@This(), bank: Bank) void {
-        self.past.deinit(bank);
-    }
-};
-
-pub const Maze = struct {
-    pub fn best(
-        tree: *Tree,
-        bank: Bank,
-        conf: anytype,
-        root: Node,
-        info: ?*std.Io.Writer,
-    ) !Path {
-        const Rank = @TypeOf(conf).Rank;
-
-        var path: ?Path = null;
-        var peak: ?Rank = null;
-        var work: std.ArrayList(Road) = try std.ArrayList(Road).initCapacity(bank, 4096);
-
-        defer work.deinit(bank);
-        defer for (work.items) |*c| c.free(bank);
-        errdefer if (path) |*p| p.deinit(bank);
-
-        try work.append(bank, .init(.eval(root)));
-
-        if (info) |w| {
-            try w.print(
-                "  ╔═════════════════╤═══════════════════╗\n",
-                .{},
-            );
-        }
-
-        while (work.pop()) |task| {
-            var road = task;
-            defer road.free(bank);
-
-            while (true) {
-                // if (road.crux.head > 40) {
-                //     if (info) |w| {
-                //         try w.print(
-                //             "{s} ║ {f}\n{any}\n",
-                //             .{
-                //                 "- ",
-                //                 road.past,
-                //                 road.crux,
-                //             },
-                //         );
-                //     }
-                //     continue :hunt;
-                // }
-                road.plan.crux = road.crux;
-                switch (try tree.flap(road.plan)) {
-                    .halt => break,
-                    .exec => |plan| {
-                        road.plan = plan;
-                        road.crux = plan.crux;
-                        switch (plan.expr.look()) {
-                            .rune => |rune| {
-                                if (!rune.isEmpty()) {
-                                    for (0..rune.reps) |_| {
-                                        if (rune.code == '\n') {
-                                            road.crux.head = road.crux.base;
-                                            road.crux.rows +|= 1;
-                                        } else {
-                                            road.crux.head +|= 1;
-                                        }
-                                    }
-                                }
-                            },
-                            .span => |span| {
-                                const tail = tree.heap.text.items[span.text..];
-                                const text = std.mem.sliceTo(tail, 0);
-                                road.crux.head +|= @intCast(text.len);
-                                if (span.char == '\n' and span.side == .rchr) {
-                                    road.crux.head = road.crux.base;
-                                    road.crux.rows +|= 1;
-                                }
-                            },
-                            .quad => |quad| {
-                                const chars = [_]u7{ quad.ch0, quad.ch1, quad.ch2, quad.ch3 };
-                                for (chars) |c| {
-                                    if (c == 0) break;
-                                    road.crux.head +|= 1;
-                                }
-                            },
-                            else => {},
-                        }
-                        // Choiceless step.
-                        if (road.plan.expr.isTerminal()) {
-                            if (road.plan.link) |link| {
-                                link.crux.head = road.crux.head;
-                                link.crux.base = road.crux.base;
-                                link.crux.rows = road.crux.rows;
-                            road.plan = link.*;
-                            road.crux = road.plan.crux;
-                        } else {
-                            break;
-                        }
-                        }
-                    },
-                    .fork => |ways| {
-                        // Branching step; enqueue the road not taken.
-                        try work.append(bank, .{
-                            .past = try road.past.turn(bank, 1),
-                            .plan = ways[1],
-                            .crux = ways[1].crux,
-                        });
-
-                        try road.past.push(bank, 0);
-                        road.plan = ways[0];
-                        road.crux = road.plan.crux;
-                    },
-                }
-            }
-
-            // This road is fully explored; rank it and move on.
-
-            const rank = try tree.rank(conf, road.past, root);
-            const hype = peak == null or conf.wins(rank, peak.?);
-
-            if (info) |w| {
-                if (hype)
-                    try w.print(
-                        "{s} ║ {f} │ {f} {B: >6.1} ║ {any}\n",
-                        .{
-                            if (hype) "★" else " ",
-                            road.past,
-                            rank,
-                            tree.heap.work.size(),
-                            road.plan.expr.tag,
-                        },
-                    );
-            }
-
-            if (hype) {
-                if (path) |*p| p.deinit(bank);
-                path = try road.past.copy(bank);
-                peak = rank;
-            }
-        }
-
-        if (info) |w| {
-            try w.print(
-                "  ╚═════════════════╧═══════════════════╝\n",
-                .{},
-            );
-        }
-
-        return path orelse return error.MazeNoLayouts;
-    }
-};
-
 pub fn List(Elem: type) type {
     return struct {
         pool: std.heap.MemoryPool(Elem),
@@ -1507,13 +837,11 @@ pub const Heap = struct {
     text: std.ArrayList(u8) = .empty,
     cons: std.ArrayList(Pair) = .empty,
     fork: std.ArrayList(Pair) = .empty,
-    work: List(Task),
 
     pub fn deinit(this: *@This(), alloc: Bank) void {
         this.text.deinit(alloc);
         this.cons.deinit(alloc);
         this.fork.deinit(alloc);
-        this.work.deinit();
     }
 };
 
@@ -1532,7 +860,7 @@ pub const Tree = struct {
     pub fn init(bank: Bank) Tree {
         return .{
             .bank = bank,
-            .heap = .{ .work = .init(bank) },
+            .heap = .{},
             .flatten_cache = std.AutoHashMap(u32, Node).init(bank),
         };
     }
@@ -1540,31 +868,6 @@ pub const Tree = struct {
     pub fn deinit(tree: *Tree) void {
         tree.heap.deinit(tree.bank);
         tree.flatten_cache.deinit();
-    }
-
-    pub fn render(tree: *Tree, buffer: []u8, node: Node) ![]const u8 {
-        var w = std.Io.Writer.fixed(buffer);
-        var it = Plot{ .sink = &w };
-        try node.emit(&it, tree);
-        return it.sink.buffered();
-    }
-
-    pub fn flap(tree: *Tree, road: Task) !Step {
-        return try Step.flap(&tree.heap, tree.bank, road);
-    }
-
-    pub fn emit(tree: *Tree, sink: *std.Io.Writer, node: Node) !void {
-        var it = Plot{ .sink = sink };
-        try node.emit(&it, tree);
-    }
-
-    pub fn rank(
-        tree: *Tree,
-        conf: anytype,
-        path: Path,
-        node: Node,
-    ) !@TypeOf(conf).Rank {
-        return try Gist(@TypeOf(conf)).eval(conf, tree, path, node);
     }
 
     pub fn best(
@@ -1641,7 +944,7 @@ pub const Tree = struct {
                     else => {},
                 }
 
-                try machineStep(Cost, tree, conf, &frames, &machine, &memo, &stats);
+                try machineStep(Cost, tree, conf, &frames, &machine, &memo, &stats, null);
             }
         }
 
@@ -1680,17 +983,94 @@ pub const Tree = struct {
         return error.MazeNoLayouts;
     }
 
-    pub fn renderWithPath(
+    pub fn rank(
         tree: *Tree,
-        sink: *std.Io.Writer,
+        conf: anytype,
+        _: Path,
         node: Node,
-        path: *const Path,
-    ) !void {
-        var plot = Plot{
-            .sink = sink,
-            .path = path.walk(),
-        };
-        try node.emit(&plot, tree);
+    ) !@TypeOf(conf).Rank {
+        const outcome = try tree.best(tree.bank, conf, node, null);
+        return outcome.measure.rank;
+    }
+
+    pub fn emit(tree: *Tree, sink: *std.Io.Writer, node: Node) !void {
+        var ctx = Context{};
+        try tree.emitNode(sink, node, &ctx);
+    }
+
+    fn emitNode(tree: *Tree, sink: *std.Io.Writer, node: Node, ctx: *Context) !void {
+        switch (node.look()) {
+            .rune => |rune| {
+                if (rune.reps == 0 or rune.code == 0) return;
+                if (rune.code == '\n') {
+                    for (0..rune.reps) |_| {
+                        try sink.writeByte('\n');
+                        if (ctx.base != 0)
+                            try sink.splatByteAll(' ', ctx.base);
+                    }
+                    ctx.head = ctx.base;
+                    ctx.rows +|= rune.reps;
+                } else {
+                    var buffer: [4]u8 = undefined;
+                    const len = std.unicode.utf8Encode(rune.code, &buffer) catch unreachable;
+                    for (0..rune.reps) |_| try sink.writeAll(buffer[0..len]);
+                    ctx.head +|= @intCast(len * rune.reps);
+                }
+            },
+            .span => |span| {
+                if (span.char != 0 and span.side == .lchr)
+                    try emitChar(sink, ctx, span.char);
+
+                const tail = tree.heap.text.items[span.text..];
+                const slice = std.mem.sliceTo(tail, 0);
+                if (slice.len != 0) {
+                    try sink.writeAll(slice);
+                    ctx.head +|= @intCast(slice.len);
+                }
+
+                if (span.char != 0 and span.side == .rchr)
+                    try emitChar(sink, ctx, span.char);
+            },
+            .quad => |quad| {
+                const chars = [_]u7{ quad.ch0, quad.ch1, quad.ch2, quad.ch3 };
+                for (chars) |c| {
+                    if (c == 0) break;
+                    try emitChar(sink, ctx, c);
+                }
+            },
+            .cons => |oper| {
+                const pair = tree.heap.cons.items[oper.item];
+
+                var child_ctx = ctx.*;
+                if (oper.frob.warp == 1)
+                    child_ctx.base = child_ctx.head;
+                if (oper.frob.nest != 0)
+                    child_ctx.nest(oper.frob.nest);
+
+                try tree.emitNode(sink, pair.head, &child_ctx);
+
+                var right_ctx = child_ctx;
+                try tree.emitNode(sink, pair.tail, &right_ctx);
+
+                ctx.head = right_ctx.head;
+                ctx.rows = right_ctx.rows;
+            },
+            .fork => return error.EmitEncounteredFork,
+            .trip => return error.Unimplemented,
+        }
+    }
+
+    fn emitChar(sink: *std.Io.Writer, ctx: *Context, char: u7) !void {
+        if (char == '\n') {
+            try sink.writeByte('\n');
+            if (ctx.base != 0)
+                try sink.splatByteAll(' ', ctx.base);
+            ctx.head = ctx.base;
+            ctx.rows +|= 1;
+        } else {
+            try sink.writeByte(char);
+            ctx.head +|= 1;
+        }
     }
 
     pub fn flat(tree: *Tree, doc: Node) !Node {
@@ -2040,7 +1420,9 @@ fn expectEmitString(tree: *Tree, text: []const u8, node: Node) !void {
     const buffer = try std.testing.allocator.alloc(u8, text.len * 2);
     defer std.testing.allocator.free(buffer);
 
-    try expectEqualStrings(text, try tree.render(buffer, node));
+    var writer = std.Io.Writer.fixed(buffer);
+    try tree.emit(&writer, node);
+    try expectEqualStrings(text, writer.buffered());
 }
 
 test "show tiny" {
@@ -2139,28 +1521,6 @@ test "fuse nl <> text" {
     }
     try expectEqual(0, t.heap.cons.items.len);
     try expectEmitString(&t, "\nHello, world!", fused);
-}
-
-test "maze small-step plus" {
-    var tree = Tree.init(std.testing.allocator);
-    defer tree.deinit();
-
-    const left = try tree.text("A");
-    const right = try tree.text("B");
-    const doc = try tree.plus(left, right);
-
-    const start = Task.eval(doc);
-    const first = try tree.flap(start);
-    const emit = first.exec;
-
-    try expectEqual(left.repr(), emit.expr.repr());
-    try expect(emit.link != null);
-
-    const second = try tree.flap(emit.link.?.*);
-    const again = second.exec;
-
-    try expectEqual(right.repr(), again.expr.repr());
-    try expect(again.link == null);
 }
 
 test "maze evaluation chooses best layout" {

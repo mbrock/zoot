@@ -150,7 +150,7 @@ pub fn main() !void {
 
         if (stop) break;
 
-        pp.machineStep(Cost, &t, cost_model, &frames, &machine, null, null) catch |err| {
+        pp.machineStep(Cost, &t, cost_model, &frames, &machine, null, null, null) catch |err| {
             try writer.print("┃   step error: {s}\n", .{@errorName(err)});
             break;
         };
