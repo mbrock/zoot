@@ -132,7 +132,6 @@ pub fn machineStep(
     machine: *MachineType(Cost),
     memo: ?*MemoType(Cost),
     stats: ?*MachineStats,
-    sink: ?*std.Io.Writer,
 ) !void {
     const Measure = MeasureType(Cost);
     const Frame = KFrameType(Cost);
@@ -164,21 +163,11 @@ pub fn machineStep(
                             rows = rune.reps;
                             last = eval_state.ctx.base;
                             for (0..rune.reps) |_| {
-                                if (sink) |w| {
-                                    try w.writeByte('\n');
-                                    if (eval_state.ctx.base != 0)
-                                        try w.splatByteAll(' ', eval_state.ctx.base);
-                                }
                                 rank = cf.plus(rank, cf.line());
                             }
                         } else {
                             const width_per = std.unicode.utf8CodepointSequenceLength(rune.code) catch 1;
                             const total: u32 = @intCast(@as(u32, width_per) * rune.reps);
-                            if (sink) |w| {
-                                var buffer: [4]u8 = undefined;
-                                const len = std.unicode.utf8Encode(rune.code, &buffer) catch unreachable;
-                                for (0..rune.reps) |_| try w.writeAll(buffer[0..len]);
-                            }
                             rank = cf.plus(rank, cf.text(eval_state.ctx.head, @intCast(total)));
                             const widened = @as(u32, eval_state.ctx.head) + total;
                             const limit = @as(u32, std.math.maxInt(u16));
@@ -206,14 +195,8 @@ pub fn machineStep(
                         if (span.char == '\n') {
                             rows +|= 1;
                             head = eval_state.ctx.base;
-                            if (sink) |w| {
-                                try w.writeByte('\n');
-                                if (eval_state.ctx.base != 0)
-                                    try w.splatByteAll(' ', eval_state.ctx.base);
-                            }
                             rank = cf.plus(rank, cf.line());
                         } else {
-                            if (sink) |w| try w.writeByte(span.char);
                             rank = cf.plus(rank, cf.text(head, 1));
                             head +|= 1;
                         }
@@ -223,7 +206,6 @@ pub fn machineStep(
                     const text = std.mem.sliceTo(tail, 0);
                     const text_len: u16 = @intCast(text.len);
                     if (text_len != 0) {
-                        if (sink) |w| try w.writeAll(text);
                         rank = cf.plus(rank, cf.text(head, text_len));
                         head +|= text_len;
                     }
@@ -232,14 +214,8 @@ pub fn machineStep(
                         if (span.char == '\n') {
                             rows +|= 1;
                             rank = cf.plus(rank, cf.line());
-                            if (sink) |w| {
-                                try w.writeByte('\n');
-                                if (eval_state.ctx.base != 0)
-                                    try w.splatByteAll(' ', eval_state.ctx.base);
-                            }
                             head = eval_state.ctx.base;
                         } else {
-                            if (sink) |w| try w.writeByte(span.char);
                             rank = cf.plus(rank, cf.text(head, 1));
                             head +|= 1;
                         }
@@ -256,24 +232,18 @@ pub fn machineStep(
                     if (memo) |m| try m.put(key, meas);
                     machine.* = .{ .ret = .{ .meas = meas, .k = eval_state.k } };
                 },
-            .quad => |quad| {
-                var head = eval_state.ctx.head;
-                var rows: u16 = 0;
-                var rank: Cost.Rank = .{};
-                const chars = [_]u7{ quad.ch0, quad.ch1, quad.ch2, quad.ch3 };
-                for (chars) |c| {
+                .quad => |quad| {
+                    var head = eval_state.ctx.head;
+                    var rows: u16 = 0;
+                    var rank: Cost.Rank = .{};
+                    const chars = [_]u7{ quad.ch0, quad.ch1, quad.ch2, quad.ch3 };
+                    for (chars) |c| {
                         if (c == 0) break;
                         if (c == '\n') {
                             rows +|= 1;
                             head = eval_state.ctx.base;
-                            if (sink) |w| {
-                                try w.writeByte('\n');
-                                if (eval_state.ctx.base != 0)
-                                    try w.splatByteAll(' ', eval_state.ctx.base);
-                            }
                             rank = cf.plus(rank, cf.line());
                         } else {
-                            if (sink) |w| try w.writeByte(c);
                             rank = cf.plus(rank, cf.text(head, 1));
                             head +|= 1;
                         }
@@ -303,16 +273,10 @@ pub fn machineStep(
                         for (0..repeats) |_| {
                             for (glyph[0..glyph_len]) |byte| {
                                 if (byte == '\n') {
-                                    if (sink) |w| {
-                                        try w.writeByte('\n');
-                                        if (eval_state.ctx.base != 0)
-                                            try w.splatByteAll(' ', eval_state.ctx.base);
-                                    }
                                     rows +|= 1;
                                     head = eval_state.ctx.base;
                                     rank = cf.plus(rank, cf.line());
                                 } else {
-                                    if (sink) |w| try w.writeByte(byte);
                                     rank = cf.plus(rank, cf.text(head, 1));
                                     head +|= 1;
                                 }
@@ -1008,7 +972,7 @@ pub const Tree = struct {
                     else => {},
                 }
 
-                try machineStep(Cost, tree, conf, &frames, &machine, &memo, &stats, null);
+                try machineStep(Cost, tree, conf, &frames, &machine, &memo, &stats);
             }
         }
 
