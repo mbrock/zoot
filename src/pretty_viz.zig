@@ -131,7 +131,7 @@ pub fn graphviz(t1: *Tree, sink: *std.Io.Writer, node: Node) !void {
     try t2.emit(sink, doc);
 }
 
-fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
+fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) !Node {
     const id = node.repr();
 
     const label = switch (node.look()) {

@@ -46,6 +46,7 @@ pub const Path = struct {
             const bit = this.bits.isSet(index);
             try writer.writeAll(if (bit) "╱" else "╲");
         }
+        try writer.splatByteAll(' ', 15 -| this.bits.bit_length);
     }
 
     /// Dense iterator over bit values
@@ -71,6 +72,17 @@ pub const Path = struct {
             return this.bits.bit_length - this.curr;
         }
     };
+};
+
+pub const Crux = packed struct {
+    kind: u3 = 0b100,
+    flat: u1 = 0,
+    spam: u12 = 0,
+    head: u16 = 0,
+    base: u16 = 0,
+    rows: u16 = 0,
+    cost: f32 = 0,
+    node: Node,
 };
 
 pub const Plot = struct {
@@ -133,13 +145,16 @@ pub const Plot = struct {
 /// addition that behaves monotonically, and an order.
 pub fn Gist(Cost: type) type {
     return struct {
-        head: u16 = 0,
+        crux: Crux,
         rank: Cost.Rank,
         cost: Cost,
         sink: std.Io.Writer,
 
         pub fn init(buffer: []u8, cost: Cost) @This() {
             return .{
+                .crux = .{
+                    .node = Node.halt,
+                },
                 .cost = cost,
                 .rank = cost.text(0, 0),
                 .sink = .{
@@ -153,7 +168,7 @@ pub fn Gist(Cost: type) type {
         }
 
         pub fn eval(cost: Cost, tree: *Tree, path: Path, node: Node) !Cost.Rank {
-            var note: [256]u8 = undefined;
+            var note: [0]u8 = undefined;
             var this = init(&note, cost);
             var work = Plot{
                 .sink = &this.sink,
@@ -176,10 +191,10 @@ pub fn Gist(Cost: type) type {
                 // dispatching only on `nl` vs anything else.
                 if (c == '\n') {
                     this.rank = this.cost.plus(this.rank, this.cost.line());
-                    this.head = 0;
+                    this.crux.head = 0;
                 } else {
-                    this.rank = this.cost.plus(this.rank, this.cost.text(this.head, 1));
-                    this.head += 1;
+                    this.rank = this.cost.plus(this.rank, this.cost.text(this.crux.head, 1));
+                    this.crux.head += 1;
                 }
             }
         }
@@ -206,12 +221,10 @@ pub fn Gist(Cost: type) type {
             }
 
             const bulk = data[data.len - 1];
-            for (0..splat) |_| {
+            for (0..splat) |_|
                 try this.scan(bulk);
-                took += bulk.len;
-            }
 
-            return took;
+            return took + bulk.len * splat;
         }
     };
 }
@@ -235,8 +248,14 @@ pub const F1 = struct {
             return (@as(u32, rank.o) << 16) | rank.h;
         }
 
-        pub fn format(self: @This(), writer: *std.Io.Writer) std.Io.Writer.Error!void {
-            try writer.print("{d: >4} debt {d: >4} rows", .{ self.o, self.h });
+        pub fn format(
+            self: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            try writer.print("{d: >5.1}  {d: >3}", .{
+                std.math.sqrt(@as(f32, @floatFromInt(self.o))),
+                self.h,
+            });
         }
     };
 
@@ -257,7 +276,7 @@ pub const F1 = struct {
     }
 
     pub fn wins(_: @This(), a: Rank, b: Rank) bool {
-        return a.key() <= b.key();
+        return a.key() < b.key();
     }
 };
 
@@ -281,6 +300,16 @@ pub const F2 = struct {
 
         pub fn key(snap: Rank) u48 {
             return (snap.o << 16) | snap.h;
+        }
+
+        pub fn format(
+            self: @This(),
+            writer: *std.Io.Writer,
+        ) std.Io.Writer.Error!void {
+            try writer.print("{d: >5.1}  {d: >3}", .{
+                std.math.sqrt(@as(f32, @floatFromInt(self.o))),
+                self.h,
+            });
         }
     };
 
@@ -308,7 +337,7 @@ pub const F2 = struct {
     }
 
     pub fn wins(_: @This(), a: Rank, b: Rank) bool {
-        return a.key() <= b.key();
+        return a.key() < b.key();
     }
 };
 
@@ -613,35 +642,20 @@ pub const Pair = packed struct {
 
 pub const Task = packed struct {
     expr: Node,
-    link: Link = .halt,
-
-    pub const Link = packed struct {
-        kind: enum(u1) { link, pink },
-        item: u21,
-
-        pub const halt: Link = .{
-            .kind = .link,
-            .item = std.math.maxInt(u21),
-        };
-
-        pub fn load(this: @This(), heap: *const Heap) Task {
-            if (this == Link.halt)
-                return Task.halt;
-            return heap.work.list.items[this.item];
-        }
-    };
-
-    pub const Slot = u21;
-
-    pub fn into(slot: Slot) Link {
-        return .{ .kind = .link, .item = slot };
-    }
+    crux: Crux,
+    link: ?*Task = null,
 
     pub fn eval(expr: Node) Task {
-        return .{ .expr = expr };
+        return .{
+            .expr = expr,
+            .crux = .{ .node = expr },
+        };
     }
 
-    pub const halt: Task = .{ .expr = .halt };
+    pub const halt: Task = .{
+        .expr = .halt,
+        .crux = .{ .node = Node.halt },
+    };
 };
 
 pub const Step = union(enum) {
@@ -774,8 +788,6 @@ pub const Step = union(enum) {
     /// of the equational definitions you write down as code.  This
     /// brackets out the question of what the actual computer is doing,
     /// and how we can make it stop doing that.
-    ///
-    ///
     pub fn flap(heap: *Heap, bank: Bank, task: Task) !Step {
         switch (task.expr.look()) {
             .cons => |cons| {
@@ -785,9 +797,15 @@ pub const Step = union(enum) {
                 return .just(
                     .{
                         .expr = pair.head,
+                        .crux = .{
+                            .node = pair.head,
+                        },
                         .link = try heap.work.push(bank, .{
                             .expr = pair.tail,
                             .link = task.link,
+                            .crux = .{
+                                .node = pair.tail,
+                            },
                         }),
                     },
                 );
@@ -795,8 +813,16 @@ pub const Step = union(enum) {
             .fork => |fork| {
                 const pair = heap.fork.items[fork.item];
                 return .both(
-                    .{ .expr = pair.head, .link = task.link },
-                    .{ .expr = pair.tail, .link = task.link },
+                    .{
+                        .expr = pair.head,
+                        .crux = .{ .node = pair.head },
+                        .link = task.link,
+                    },
+                    .{
+                        .expr = pair.tail,
+                        .crux = .{ .node = pair.tail },
+                        .link = task.link,
+                    },
                 );
             },
             else => return .just(task),
@@ -810,9 +836,14 @@ pub const Road = struct {
     past: Path = .{},
     /// The road ahead; the suffix of potential.
     plan: Task,
+    /// The crux of it.
+    crux: Crux,
 
     fn init(plan: Task) @This() {
-        return .{ .plan = plan };
+        return .{
+            .plan = plan,
+            .crux = plan.crux,
+        };
     }
 
     fn copy(self: *const @This(), bank: Bank) !@This() {
@@ -847,18 +878,75 @@ pub const Maze = struct {
 
         try work.append(bank, .init(.eval(root)));
 
+        if (info) |w| {
+            try w.print(
+                "  ╔═════════════════╤═══════════════════╗\n",
+                .{},
+            );
+        }
+
         while (work.pop()) |task| {
             var road = task;
             defer road.free(bank);
 
             while (true) {
+                // if (road.crux.head > 40) {
+                //     if (info) |w| {
+                //         try w.print(
+                //             "{s} ║ {f}\n{any}\n",
+                //             .{
+                //                 "- ",
+                //                 road.past,
+                //                 road.crux,
+                //             },
+                //         );
+                //     }
+                //     continue :hunt;
+                // }
                 switch (try tree.flap(road.plan)) {
                     .halt => break,
                     .exec => |plan| {
+                        switch (plan.expr.look()) {
+                            .rune => |rune| {
+                                if (!rune.isEmpty()) {
+                                    for (0..rune.reps) |_| {
+                                        if (rune.code == '\n' and road.crux.flat == 0) {
+                                            road.crux.head = road.crux.base;
+                                            road.crux.rows +|= 1;
+                                        } else {
+                                            road.crux.head +|= 1;
+                                        }
+                                    }
+                                }
+                            },
+                            .span => |span| {
+                                const tail = tree.heap.text.items[span.text..];
+                                const text = std.mem.sliceTo(tail, 0);
+                                road.crux.head +|= @intCast(text.len);
+                                if (span.char == '\n' and span.side == .rchr) {
+                                    road.crux.head = road.crux.base;
+                                    road.crux.rows +|= 1;
+                                }
+                            },
+                            .quad => |quad| {
+                                const chars = [_]u7{ quad.ch0, quad.ch1, quad.ch2, quad.ch3 };
+                                for (chars) |c| {
+                                    if (c == 0) break;
+                                    road.crux.head +|= 1;
+                                }
+                            },
+                            .cons => |cons| {
+                                if (cons.frob.warp == 1)
+                                    road.crux.base = road.crux.head;
+                                road.crux.base +|= cons.frob.nest;
+                                road.crux.flat = cons.frob.flat;
+                            },
+                            else => {},
+                        }
                         // Choiceless step.
                         road.plan = if (plan.expr.isTerminal())
                             // No subexpressions; jump to continuation.
-                            plan.link.load(&tree.heap)
+                            (if (plan.link) |link| link.* else break)
                         else
                             // Nonterminal operator.
                             plan;
@@ -868,6 +956,7 @@ pub const Maze = struct {
                         try work.append(bank, .{
                             .past = try road.past.turn(bank, 1),
                             .plan = ways[1],
+                            .crux = road.crux,
                         });
 
                         try road.past.push(bank, 0);
@@ -882,15 +971,17 @@ pub const Maze = struct {
             const hype = peak == null or conf.wins(rank, peak.?);
 
             if (info) |w| {
-                try w.print(
-                    "{s} {f} {f}  {d: >4} maze\n",
-                    .{
-                        if (hype) "★" else " ",
-                        road.past,
-                        rank,
-                        tree.heap.work.size(),
-                    },
-                );
+                if (hype)
+                    try w.print(
+                        "{s} ║ {f} │ {f} {B: >6.1} ║ {any}\n",
+                        .{
+                            if (hype) "★" else " ",
+                            road.past,
+                            rank,
+                            tree.heap.work.size(),
+                            road.plan.crux.node.tag,
+                        },
+                    );
             }
 
             if (hype) {
@@ -900,31 +991,77 @@ pub const Maze = struct {
             }
         }
 
+        if (info) |w| {
+            try w.print(
+                "  ╚═════════════════╧═══════════════════╝\n",
+                .{},
+            );
+        }
+
+        return path orelse return error.MazeNoLayouts;
+    }
+
+    pub fn hest(
+        tree: *Tree,
+        bank: Bank,
+        conf: anytype,
+        root: Node,
+        info: ?*std.Io.Writer,
+    ) !Path {
+        const Rank = @TypeOf(conf).Rank;
+
+        var path: ?Path = null;
+        var peak: ?Rank = null;
+        errdefer if (path) |*p| p.deinit(bank);
+
+        var road = Path.none;
+        try road.bits.resize(bank, 15, false);
+        for (0..std.math.maxInt(u15)) |tick| {
+            road.bits.masks[0] = tick;
+            const rank = try tree.rank(conf, road, root);
+            const hype = (peak == null or conf.wins(rank, peak.?));
+            if (hype) {
+                path = road;
+                peak = rank;
+            }
+            if (info) |w| {
+                try w.print(
+                    "{s} {f} {f}  {d: >4} maze\n",
+                    .{
+                        if (hype) "★" else " ",
+                        road,
+                        rank,
+                        tree.heap.work.size(),
+                    },
+                );
+            }
+        }
+
         return path orelse return error.MazeNoLayouts;
     }
 };
 
 pub fn List(Elem: type) type {
     return struct {
-        list: std.ArrayList(Elem) = .empty,
+        pool: std.heap.MemoryPool(Elem),
 
-        pub const empty: @This() = .{};
-
-        pub fn deinit(this: *@This(), bank: Bank) void {
-            this.list.deinit(bank);
+        pub fn init(bank: Bank) @This() {
+            return .{ .pool = std.heap.MemoryPool(Elem).init(bank) };
         }
 
-        pub fn push(this: *@This(), bank: Bank, elem: Elem) !Elem.Link {
-            if (std.math.cast(Elem.Slot, this.list.items.len)) |slot| {
-                try this.list.append(bank, elem);
-                return Elem.into(slot);
-            } else {
-                return error.ListFull;
-            }
+        pub fn deinit(this: *@This()) void {
+            this.pool.deinit();
         }
 
-        pub fn size(this: *const @This()) Elem.Slot {
-            return @intCast(this.list.items.len);
+        pub fn push(this: *@This(), bank: Bank, elem: Elem) !*Elem {
+            _ = bank;
+            const ptr = try this.pool.create();
+            ptr.* = elem;
+            return ptr;
+        }
+
+        pub fn size(this: *const @This()) usize {
+            return this.pool.arena.queryCapacity();
         }
     };
 }
@@ -933,13 +1070,13 @@ pub const Heap = struct {
     text: std.ArrayList(u8) = .empty,
     cons: std.ArrayList(Pair) = .empty,
     fork: std.ArrayList(Pair) = .empty,
-    work: List(Task) = .empty,
+    work: List(Task),
 
     pub fn deinit(this: *@This(), alloc: Bank) void {
         this.text.deinit(alloc);
         this.cons.deinit(alloc);
         this.fork.deinit(alloc);
-        this.work.deinit(alloc);
+        this.work.deinit();
     }
 };
 
@@ -952,10 +1089,10 @@ pub const Heap = struct {
 /// It is also used to rank layouts, and to actually print them.
 pub const Tree = struct {
     bank: Bank,
-    heap: Heap = .{},
+    heap: Heap,
 
-    pub fn init(alloc: Bank) Tree {
-        return .{ .bank = alloc };
+    pub fn init(bank: Bank) Tree {
+        return .{ .bank = bank, .heap = .{ .work = .init(bank) } };
     }
 
     pub fn deinit(tree: *Tree) void {
@@ -1191,9 +1328,14 @@ pub const Tree = struct {
         const start_len = tree.heap.text.items.len;
 
         // Format directly into the slab
-        try tree.heap.text.writer(tree.bank).print(fmt ++ "\x00", args);
+        var slab = std.Io.Writer.Allocating.fromArrayList(
+            tree.bank,
+            &tree.heap.text,
+        );
+        try slab.writer.print(fmt ++ "\x00", args);
 
         // Now use text() which will do the deduplication logic for us
+        tree.heap.text = slab.toArrayList();
         const written = tree.heap.text.items[start_len .. tree.heap.text.items.len - 1 :0];
         const node = try tree.text(written);
 
@@ -1436,14 +1578,13 @@ test "maze small-step plus" {
     const emit = first.exec;
 
     try expectEqual(left.repr(), emit.expr.repr());
-    try expect(emit.link != Task.Link.halt);
+    try expect(emit.link != null);
 
-    const second = try tree.flap(emit.link.load(&tree.heap));
+    const second = try tree.flap(emit.link.?.*);
     const again = second.exec;
 
     try expectEqual(right.repr(), again.expr.repr());
-    try expect(again.link == Task.Link.halt);
-    try expect(again.link.load(&tree.heap) == Task.halt);
+    try expect(again.link == null);
 }
 
 test "maze evaluation chooses best layout" {

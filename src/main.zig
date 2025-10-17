@@ -23,7 +23,7 @@ const Pipeline = struct {
 };
 
 pub fn main() !void {
-    var gpa = std.heap.ArenaAllocator.init(std.heap.c_allocator);
+    var gpa = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -41,7 +41,16 @@ pub fn main() !void {
         Step{
             .run = .{
                 .tool = "zig",
-                .args = &.{ "build", "-Drelease-safe=true" },
+                .args = &.{
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                },
             },
         },
         Step{ .wait = 30 },
@@ -70,16 +79,21 @@ pub fn main() !void {
     const doc = try dump.dump(&t, pipeline);
     const t0 = time.lap();
 
-    try t.heap.work.list.ensureUnusedCapacity(allocator, 1024 * 32);
-
-    var best = try t.best(allocator, pp.F1.init(40), doc, null);
+    var best = try t.best(allocator, pp.F2.init(40), doc, writer);
     defer best.deinit(allocator);
     const t1 = time.lap();
 
+    // var hest = try pp.Maze.hest(&t, allocator, pp.F2.init(40), doc, writer);
+    // defer hest.deinit(allocator);
+    const t2 = time.lap();
+
     try t.renderWithPath(writer, doc, &best);
-    const t2 = time.read();
+    const t3 = time.read();
     try writer.print("\n\n  (measured 2^{d} variants)\n", .{best.bits.bit_length});
-    try writer.print("  (dump {D}; maze {D}; emit {D})\n\n", .{ t0, t1, t2 });
+    try writer.print(
+        "  (dump {D}; best {D}; hest {D}; emit {D})\n\n",
+        .{ t0, t1, t2, t3 },
+    );
     try writer.flush();
 
     // {
