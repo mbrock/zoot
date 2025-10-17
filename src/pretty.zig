@@ -256,12 +256,12 @@ pub fn machineStep(
                     if (memo) |m| try m.put(key, meas);
                     machine.* = .{ .ret = .{ .meas = meas, .k = eval_state.k } };
                 },
-                .quad => |quad| {
-                    var head = eval_state.ctx.head;
-                    var rows: u16 = 0;
-                    var rank: Cost.Rank = .{};
-                    const chars = [_]u7{ quad.ch0, quad.ch1, quad.ch2, quad.ch3 };
-                    for (chars) |c| {
+            .quad => |quad| {
+                var head = eval_state.ctx.head;
+                var rows: u16 = 0;
+                var rank: Cost.Rank = .{};
+                const chars = [_]u7{ quad.ch0, quad.ch1, quad.ch2, quad.ch3 };
+                for (chars) |c| {
                         if (c == 0) break;
                         if (c == '\n') {
                             rows +|= 1;
@@ -276,6 +276,47 @@ pub fn machineStep(
                             if (sink) |w| try w.writeByte(c);
                             rank = cf.plus(rank, cf.text(head, 1));
                             head +|= 1;
+                        }
+                    }
+
+                    const meas = Measure{
+                        .layout = eval_state.node,
+                        .last = head,
+                        .rows = rows,
+                        .rank = rank,
+                        .tainted = rankTainted(rank),
+                    };
+
+                    if (memo) |m| try m.put(key, meas);
+                    machine.* = .{ .ret = .{ .meas = meas, .k = eval_state.k } };
+                },
+                .trip => |trip| {
+                    var head = eval_state.ctx.head;
+                    var rows: u16 = 0;
+                    var rank: Cost.Rank = .{};
+
+                    const glyph = trip.slice();
+                    const glyph_len = trip.unitLen();
+                    const repeats = trip.repeatCount();
+
+                    if (glyph_len != 0 and repeats != 0) {
+                        for (0..repeats) |_| {
+                            for (glyph[0..glyph_len]) |byte| {
+                                if (byte == '\n') {
+                                    if (sink) |w| {
+                                        try w.writeByte('\n');
+                                        if (eval_state.ctx.base != 0)
+                                            try w.splatByteAll(' ', eval_state.ctx.base);
+                                    }
+                                    rows +|= 1;
+                                    head = eval_state.ctx.base;
+                                    rank = cf.plus(rank, cf.line());
+                                } else {
+                                    if (sink) |w| try w.writeByte(byte);
+                                    rank = cf.plus(rank, cf.text(head, 1));
+                                    head +|= 1;
+                                }
+                            }
                         }
                     }
 
@@ -334,7 +375,6 @@ pub fn machineStep(
                         .right = .{ .node = pair.tail, .ctx = right_ctx, .k = eval_state.k },
                     } };
                 },
-                .trip => return error.Unimplemented,
             }
         },
         .ret => |*ret_state| switch (ret_state.k.*) {
@@ -636,6 +676,30 @@ pub const Trip = packed struct {
     byte0: u8 = 0,
     byte1: u8 = 0,
     byte2: u8 = 0,
+
+    pub fn repeatCount(this: Trip) usize {
+        return this.reps;
+    }
+
+    pub fn byte(this: Trip, idx: usize) u8 {
+        return switch (idx) {
+            0 => this.byte0,
+            1 => this.byte1,
+            2 => this.byte2,
+            else => 0,
+        };
+    }
+
+    pub fn slice(this: Trip) [3]u8 {
+        return .{ this.byte0, this.byte1, this.byte2 };
+    }
+
+    pub fn unitLen(this: Trip) usize {
+        if (this.byte0 == 0) return 0;
+        if (this.byte1 == 0) return 1;
+        if (this.byte2 == 0) return 2;
+        return 3;
+    }
 };
 
 pub const Rune = packed struct {
@@ -1038,6 +1102,18 @@ pub const Tree = struct {
                     try emitChar(sink, ctx, c);
                 }
             },
+            .trip => |trip| {
+                const glyph = trip.slice();
+                const glyph_len = trip.unitLen();
+                const repeats = trip.repeatCount();
+                if (glyph_len != 0 and repeats != 0) {
+                    for (0..repeats) |_| {
+                        for (glyph[0..glyph_len]) |byte| {
+                            try emitChar(sink, ctx, byte);
+                        }
+                    }
+                }
+            },
             .cons => |oper| {
                 const pair = tree.heap.cons.items[oper.item];
 
@@ -1056,11 +1132,10 @@ pub const Tree = struct {
                 ctx.rows = right_ctx.rows;
             },
             .fork => return error.EmitEncounteredFork,
-            .trip => return error.Unimplemented,
         }
     }
 
-    fn emitChar(sink: *std.Io.Writer, ctx: *Context, char: u7) !void {
+    fn emitChar(sink: *std.Io.Writer, ctx: *Context, char: u8) !void {
         if (char == '\n') {
             try sink.writeByte('\n');
             if (ctx.base != 0)
