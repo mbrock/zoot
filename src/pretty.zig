@@ -22,33 +22,60 @@ pub const Context = struct {
     }
 };
 
-pub fn MeasureType(comptime Cost: type) type {
-    return struct {
-        last: u16 = 0,
-        rows: u16 = 0,
-        tainted: bool = false,
-        rank: Cost.Rank = .{},
-        layout: Node = Node.halt,
-    };
-}
+/// Cost factory vtable for runtime polymorphism over different cost metrics.
+/// All ranks are now standardized to u64.
+pub const CostFactory = struct {
+    ptr: *const anyopaque,
+    plusFn: *const fn (ptr: *const anyopaque, lhs: u64, rhs: u64) u64,
+    lineFn: *const fn (ptr: *const anyopaque) u64,
+    textFn: *const fn (ptr: *const anyopaque, c: u16, l: u16) u64,
+    winsFn: *const fn (ptr: *const anyopaque, a: u64, b: u64) bool,
+    taintedFn: *const fn (ptr: *const anyopaque, rank: u64) bool,
+
+    pub fn plus(self: CostFactory, lhs: u64, rhs: u64) u64 {
+        return self.plusFn(self.ptr, lhs, rhs);
+    }
+
+    pub fn line(self: CostFactory) u64 {
+        return self.lineFn(self.ptr);
+    }
+
+    pub fn text(self: CostFactory, c: u16, l: u16) u64 {
+        return self.textFn(self.ptr, c, l);
+    }
+
+    pub fn wins(self: CostFactory, a: u64, b: u64) bool {
+        return self.winsFn(self.ptr, a, b);
+    }
+
+    pub fn tainted(self: CostFactory, rank: u64) bool {
+        return self.taintedFn(self.ptr, rank);
+    }
+};
+
+pub const Measure = struct {
+    last: u16 = 0,
+    rows: u16 = 0,
+    tainted: bool = false,
+    layout: Node = Node.halt,
+    rank: u64 = 0,
+};
 
 pub const MachineStats = struct {
     memo_hits: usize = 0,
     memo_misses: usize = 0,
 };
 
-pub fn BestOutcomeType(comptime Cost: type) type {
-    return struct {
-        measure: MeasureType(Cost),
-        completions: usize = 0,
-        memo_hits: usize = 0,
-        memo_misses: usize = 0,
-        memo_entries: usize = 0,
-        frontier_non_tainted: usize = 0,
-        tainted_kept: bool = false,
-        queue_peak: usize = 0,
-    };
-}
+pub const BestOutcome = struct {
+    measure: Measure,
+    completions: usize = 0,
+    memo_hits: usize = 0,
+    memo_misses: usize = 0,
+    memo_entries: usize = 0,
+    frontier_non_tainted: usize = 0,
+    tainted_kept: bool = false,
+    queue_peak: usize = 0,
+};
 
 pub const MemoKey = packed struct {
     node: u32,
@@ -56,83 +83,70 @@ pub const MemoKey = packed struct {
     base: u16,
 };
 
-pub fn MemoType(comptime Cost: type) type {
-    return std.AutoHashMap(MemoKey, MeasureType(Cost));
-}
+pub const Memo = std.AutoHashMap(MemoKey, Measure);
 
-pub fn KFrameType(comptime Cost: type) type {
-    const Measure = MeasureType(Cost);
-    return union(enum) {
-        done,
-        after_left: AfterLeft,
-        after_right: AfterRight,
+pub const KFrame = union(enum) {
+    done,
+    after_left: AfterLeft,
+    after_right: AfterRight,
 
-        const Self = @This();
+    const Self = @This();
 
-        pub const AfterLeft = struct {
-            node: Node,
-            rhs: Node,
-            right_base: u16,
-            head: u16,
-            base: u16,
-            next: *Self,
-        };
-
-        pub const AfterRight = struct {
-            node: Node,
-            head: u16,
-            base: u16,
-            left: Measure,
-            next: *Self,
-        };
+    pub const AfterLeft = struct {
+        node: Node,
+        rhs: Node,
+        right_base: u16,
+        head: u16,
+        base: u16,
+        next: *Self,
     };
-}
 
-pub fn MachineType(comptime Cost: type) type {
-    const Measure = MeasureType(Cost);
-    const Frame = KFrameType(Cost);
+    pub const AfterRight = struct {
+        node: Node,
+        head: u16,
+        base: u16,
+        left: Measure,
+        next: *Self,
+    };
+};
 
-    return union(enum) {
-        eval: struct {
+pub const Machine = union(enum) {
+    eval: struct {
+        node: Node,
+        ctx: Context,
+        k: *KFrame,
+    },
+    fork: struct {
+        left: struct {
             node: Node,
             ctx: Context,
-            k: *Frame,
+            k: *KFrame,
         },
-        fork: struct {
-            left: struct {
-                node: Node,
-                ctx: Context,
-                k: *Frame,
-            },
-            right: struct {
-                node: Node,
-                ctx: Context,
-                k: *Frame,
-            },
+        right: struct {
+            node: Node,
+            ctx: Context,
+            k: *KFrame,
         },
-        ret: struct {
-            meas: Measure,
-            k: *Frame,
-        },
-        done: struct {
-            meas: Measure,
-        },
-    };
-}
+    },
+    ret: struct {
+        meas: Measure,
+        k: *KFrame,
+    },
+    done: struct {
+        meas: Measure,
+    },
+};
 
 pub fn machineStep(
-    comptime Cost: type,
     tree: *Tree,
-    cf: Cost,
-    frames: *List(KFrameType(Cost)),
-    machine: *MachineType(Cost),
-    memo: ?*MemoType(Cost),
+    cf: CostFactory,
+    frames: *List(KFrame),
+    machine: *Machine,
+    memo: ?*Memo,
     stats: ?*MachineStats,
 ) !void {
-    const Measure = MeasureType(Cost);
-    const Frame = KFrameType(Cost);
     switch (machine.*) {
-        .eval => |*eval_state| {
+        .eval => |eval_state| {
             const key = MemoKey{
                 .node = eval_state.node.repr(),
                 .head = eval_state.ctx.head,
@@ -152,7 +166,7 @@ pub fn machineStep(
                 .rune => |rune| {
                     var last = eval_state.ctx.head;
                     var rows: u16 = 0;
-                    var rank: Cost.Rank = .{};
+                    var rank: u64 = 0;
 
                     if (rune.reps != 0) {
                         if (rune.code == '\n') {
@@ -176,7 +190,7 @@ pub fn machineStep(
                         .last = last,
                         .rows = rows,
                         .rank = rank,
-                        .tainted = rankTainted(rank),
+                        .tainted = cf.tainted(rank),
                     };
 
                     if (memo) |m| try m.put(key, meas);
@@ -185,7 +199,7 @@ pub fn machineStep(
                 .span => |span| {
                     var head = eval_state.ctx.head;
                     var rows: u16 = 0;
-                    var rank: Cost.Rank = .{};
+                    var rank: u64 = 0;
 
                     if (span.char != 0 and span.side == .lchr) {
                         if (span.char == '\n') {
@@ -222,7 +236,7 @@ pub fn machineStep(
                         .last = head,
                         .rows = rows,
                         .rank = rank,
-                        .tainted = rankTainted(rank),
+                        .tainted = cf.tainted(rank),
                     };
 
                     if (memo) |m| try m.put(key, meas);
@@ -231,7 +245,7 @@ pub fn machineStep(
                 .quad => |quad| {
                     var head = eval_state.ctx.head;
                     var rows: u16 = 0;
-                    var rank: Cost.Rank = .{};
+                    var rank: u64 = 0;
                     const chars = [_]u7{ quad.ch0, quad.ch1, quad.ch2, quad.ch3 };
                     for (chars) |c| {
                         if (c == 0) break;
@@ -250,7 +264,7 @@ pub fn machineStep(
                         .last = head,
                         .rows = rows,
                         .rank = rank,
-                        .tainted = rankTainted(rank),
+                        .tainted = cf.tainted(rank),
                     };
 
                     if (memo) |m| try m.put(key, meas);
@@ -259,7 +273,7 @@ pub fn machineStep(
                 .trip => |trip| {
                     var head = eval_state.ctx.head;
                     var rows: u16 = 0;
-                    var rank: Cost.Rank = .{};
+                    var rank: u64 = 0;
 
                     const glyph = trip.slice();
                     const glyph_len = trip.unitLen();
@@ -285,7 +299,7 @@ pub fn machineStep(
                         .last = head,
                         .rows = rows,
                         .rank = rank,
-                        .tainted = rankTainted(rank),
+                        .tainted = cf.tainted(rank),
                     };
 
                     if (memo) |m| try m.put(key, meas);
@@ -300,7 +314,7 @@ pub fn machineStep(
                     if (oper.frob.nest != 0)
                         child_ctx.nest(oper.frob.nest);
 
-                    const cont = try frames.push(tree.bank, Frame{
+                    const cont = try frames.push(tree.bank, KFrame{
                         .after_left = .{
                             .node = eval_state.node,
                             .rhs = pair.tail,
@@ -337,7 +351,7 @@ pub fn machineStep(
                 },
             }
         },
-        .ret => |*ret_state| switch (ret_state.k.*) {
+        .ret => |ret_state| switch (ret_state.k.*) {
             .done => {
                 machine.* = .{ .done = .{ .meas = ret_state.meas } };
             },
@@ -348,7 +362,7 @@ pub fn machineStep(
                 const orig_base = after.base;
                 const next = after.next;
 
-                const frame = try frames.push(tree.bank, Frame{
+                const frame = try frames.push(tree.bank, KFrame{
                     .after_right = .{
                         .node = after.node,
                         .head = orig_head,
@@ -395,7 +409,7 @@ pub fn machineStep(
                     .last = ret_state.meas.last,
                     .rows = left.rows +| ret_state.meas.rows,
                     .rank = combined_rank,
-                    .tainted = left.tainted or ret_state.meas.tainted or rankTainted(combined_rank),
+                    .tainted = left.tainted or ret_state.meas.tainted or cf.tainted(combined_rank),
                 };
 
                 if (memo) |m| {
@@ -420,43 +434,32 @@ pub fn machineStep(
     }
 }
 
-fn rankTainted(rank: anytype) bool {
-    const RankType = @TypeOf(rank);
-    if (@hasField(RankType, "o")) {
-        return @field(rank, "o") != 0;
-    }
-    return false;
-}
-
 fn costBetter(
-    comptime Cost: type,
-    conf: Cost,
-    lhs: MeasureType(Cost),
-    rhs: MeasureType(Cost),
+    cf: CostFactory,
+    lhs: Measure,
+    rhs: Measure,
 ) bool {
-    return conf.wins(lhs.rank, rhs.rank);
+    return cf.wins(lhs.rank, rhs.rank);
 }
 
 fn dominates(
-    comptime Cost: type,
-    conf: Cost,
-    lhs: MeasureType(Cost),
-    rhs: MeasureType(Cost),
+    cf: CostFactory,
+    lhs: Measure,
+    rhs: Measure,
 ) bool {
     if (!lhs.tainted and rhs.tainted) return true;
     if (lhs.tainted and !rhs.tainted) return false;
-    const lhs_wins = conf.wins(lhs.rank, rhs.rank);
-    const rhs_wins = conf.wins(rhs.rank, lhs.rank);
+    const lhs_wins = cf.wins(lhs.rank, rhs.rank);
+    const rhs_wins = cf.wins(rhs.rank, lhs.rank);
     return lhs_wins and !rhs_wins;
 }
 
 fn updateFrontier(
-    comptime Cost: type,
-    conf: Cost,
+    cf: CostFactory,
     bank: Bank,
-    frontier: *std.ArrayList(MeasureType(Cost)),
-    tainted_best: *?MeasureType(Cost),
-    meas: MeasureType(Cost),
+    frontier: *std.ArrayList(Measure),
+    tainted_best: *?Measure,
+    meas: Measure,
 ) !void {
     if (!meas.tainted) {
         tainted_best.* = null;
@@ -464,10 +467,10 @@ fn updateFrontier(
         var i: usize = 0;
         while (i < frontier.items.len) {
             const existing = frontier.items[i];
-            if (dominates(Cost, conf, existing, meas)) {
+            if (dominates(cf, existing, meas)) {
                 return;
             }
-            if (dominates(Cost, conf, meas, existing)) {
+            if (dominates(cf, meas, existing)) {
                 _ = frontier.swapRemove(i);
                 continue;
             }
@@ -481,8 +484,8 @@ fn updateFrontier(
     if (frontier.items.len != 0) return;
 
     if (tainted_best.*) |existing| {
-        if (dominates(Cost, conf, existing, meas)) return;
-        if (dominates(Cost, conf, meas, existing) or costBetter(Cost, conf, meas, existing)) {
+        if (dominates(cf, existing, meas)) return;
+        if (dominates(cf, meas, existing) or costBetter(cf, meas, existing)) {
             tainted_best.* = meas;
         }
     } else {
@@ -507,6 +510,17 @@ pub const F1 = struct {
 
         pub fn key(rank: Rank) u32 {
             return (@as(u32, rank.o) << 16) | rank.h;
+        }
+
+        pub fn toU64(self: Rank) u64 {
+            return @as(u64, self.o) << 16 | self.h;
+        }
+
+        pub fn fromU64(val: u64) Rank {
+            return .{
+                .o = @intCast((val >> 16) & 0xFFFF),
+                .h = @intCast(val & 0xFFFF),
+            };
         }
 
         pub fn format(
@@ -539,6 +553,42 @@ pub const F1 = struct {
     pub fn wins(_: @This(), a: Rank, b: Rank) bool {
         return a.key() < b.key();
     }
+
+    fn plusFn(self: *const F1, lhs: u64, rhs: u64) u64 {
+        const lhs_rank = Rank.fromU64(lhs);
+        const rhs_rank = Rank.fromU64(rhs);
+        return self.plus(lhs_rank, rhs_rank).toU64();
+    }
+
+    fn lineFn(self: *const F1) u64 {
+        return self.line().toU64();
+    }
+
+    fn textFn(self: *const F1, c: u16, l: u16) u64 {
+        return self.text(c, l).toU64();
+    }
+
+    fn winsFn(self: *const F1, a: u64, b: u64) bool {
+        const a_rank = Rank.fromU64(a);
+        const b_rank = Rank.fromU64(b);
+        return self.wins(a_rank, b_rank);
+    }
+
+    fn taintedFn(_: *const F1, rank: u64) bool {
+        const r = Rank.fromU64(rank);
+        return r.o != 0;
+    }
+
+    pub fn factory(self: *const F1) CostFactory {
+        return .{
+            .ptr = self,
+            .plusFn = @ptrCast(&plusFn),
+            .lineFn = @ptrCast(&lineFn),
+            .textFn = @ptrCast(&textFn),
+            .winsFn = @ptrCast(&winsFn),
+            .taintedFn = @ptrCast(&taintedFn),
+        };
+    }
 };
 
 /// Example 3.5. in *A Pretty Expressive Printer*.
@@ -551,16 +601,23 @@ pub const F1 = struct {
 /// > This is (essentially) the default cost factory that our implementation,
 /// > *PrettyExpressive*, employs.
 pub const F2 = struct {
-    w: u16,
+    w: u64,
 
     pub const Rank = struct {
         /// the sum of squared overflows
         o: u32 = 0,
         /// the number of newlines
-        h: u16 = 0,
+        h: u32 = 0,
 
-        pub fn key(snap: Rank) u48 {
-            return (snap.o << 16) | snap.h;
+        pub fn toU64(self: Rank) u64 {
+            return @as(u64, self.o) << 32 | self.h;
+        }
+
+        pub fn fromU64(val: u64) Rank {
+            return .{
+                .o = @intCast((val >> 32) & 0xFFFFFFFF),
+                .h = @intCast(val & 0xFFFFFFFF),
+            };
         }
 
         pub fn format(
@@ -583,7 +640,7 @@ pub const F2 = struct {
     }
 
     pub fn text(this: @This(), c: u16, l: u16) Rank {
-        const w = this.w;
+        const w: u16 = @intCast(this.w);
 
         const a = @max(w, c) -| w;
         const b = (c + l) -| @max(w, c);
@@ -598,7 +655,43 @@ pub const F2 = struct {
     }
 
     pub fn wins(_: @This(), a: Rank, b: Rank) bool {
-        return a.key() < b.key();
+        return a.toU64() < b.toU64();
+    }
+
+    fn plusFn(self: *const F2, lhs: u64, rhs: u64) u64 {
+        const lhs_rank = Rank.fromU64(lhs);
+        const rhs_rank = Rank.fromU64(rhs);
+        return self.plus(lhs_rank, rhs_rank).toU64();
+    }
+
+    fn lineFn(self: *const F2) u64 {
+        return self.line().toU64();
+    }
+
+    fn textFn(self: *const F2, c: u16, l: u16) u64 {
+        return self.text(c, l).toU64();
+    }
+
+    fn winsFn(self: *const F2, a: u64, b: u64) bool {
+        const a_rank = Rank.fromU64(a);
+        const b_rank = Rank.fromU64(b);
+        return self.wins(a_rank, b_rank);
+    }
+
+    fn taintedFn(_: *const F2, rank: u64) bool {
+        const r = Rank.fromU64(rank);
+        return r.o != 0;
+    }
+
+    pub fn factory(self: *const F2) CostFactory {
+        return .{
+            .ptr = self,
+            .plusFn = @ptrCast(&plusFn),
+            .lineFn = @ptrCast(&lineFn),
+            .textFn = @ptrCast(&textFn),
+            .winsFn = @ptrCast(&winsFn),
+            .taintedFn = @ptrCast(&taintedFn),
+        };
     }
 };
 
@@ -897,24 +990,17 @@ pub const Tree = struct {
     pub fn best(
         tree: *Tree,
         bank: Bank,
-        conf: anytype,
+        cf: CostFactory,
         node: Node,
         info: ?*std.Io.Writer,
-    ) !BestOutcomeType(@TypeOf(conf)) {
+    ) !BestOutcome {
         _ = info;
-
-        const Cost = @TypeOf(conf);
-        const Measure = MeasureType(Cost);
-        const Machine = MachineType(Cost);
-        const Frame = KFrameType(Cost);
-        const Memo = MemoType(Cost);
-        const Outcome = BestOutcomeType(Cost);
 
         const SearchState = struct {
             machine: Machine,
         };
 
-        var frames = List(Frame).init(bank);
+        var frames = List(KFrame).init(bank);
         defer frames.deinit();
 
         var memo = Memo.init(bank);
@@ -923,7 +1009,7 @@ pub const Tree = struct {
         var work = try std.ArrayList(SearchState).initCapacity(bank, 64);
         defer work.deinit(bank);
 
-        const k_done = try frames.push(bank, Frame{ .done = {} });
+        const k_done = try frames.push(bank, KFrame{ .done = {} });
         try work.append(bank, .{ .machine = Machine{
             .eval = .{
                 .node = node,
@@ -971,14 +1057,14 @@ pub const Tree = struct {
                         continue;
                     },
                     .done => |done| {
-                        try updateFrontier(Cost, conf, bank, &non_tainted, &tainted_best, done.meas);
+                        try updateFrontier(cf, bank, &non_tainted, &tainted_best, done.meas);
                         completions += 1;
                         break;
                     },
                     else => {},
                 }
 
-                try machineStep(Cost, tree, conf, &frames, &machine, &memo, &stats);
+                try machineStep(tree, cf, &frames, &machine, &memo, &stats);
             }
         }
 
@@ -987,9 +1073,9 @@ pub const Tree = struct {
         if (non_tainted.items.len != 0) {
             var optimal = non_tainted.items[0];
             for (non_tainted.items[1..]) |candidate| {
-                if (costBetter(Cost, conf, candidate, optimal)) optimal = candidate;
+                if (costBetter(cf, candidate, optimal)) optimal = candidate;
             }
-            return Outcome{
+            return BestOutcome{
                 .measure = optimal,
                 .completions = completions,
                 .memo_hits = stats.memo_hits,
@@ -1002,7 +1088,7 @@ pub const Tree = struct {
         }
 
         if (tainted_best) |tainted| {
-            return Outcome{
+            return BestOutcome{
                 .measure = tainted,
                 .completions = completions,
                 .memo_hits = stats.memo_hits,
@@ -1019,10 +1105,10 @@ pub const Tree = struct {
 
     pub fn rank(
         tree: *Tree,
-        conf: anytype,
+        cf: CostFactory,
         node: Node,
-    ) !@TypeOf(conf).Rank {
-        const outcome = try tree.best(tree.bank, conf, node, null);
+    ) !u64 {
+        const outcome = try tree.best(tree.bank, cf, node, null);
         return outcome.measure.rank;
     }
 
@@ -1586,7 +1672,7 @@ test "maze evaluation chooses best layout" {
     const doc = try tree.fork(inline_doc, multiline);
 
     const cost = F1.init(10);
-    const result = try tree.best(std.testing.allocator, cost, doc, null);
+    const result = try tree.best(std.testing.allocator, cost.factory(), doc, null);
 
     const buf = try std.testing.allocator.alloc(u8, 64);
     defer std.testing.allocator.free(buf);
@@ -1629,8 +1715,9 @@ test "nest braces cost" {
     var t = Tree.init(std.testing.allocator);
     defer t.deinit();
 
-    const s1 = try t.rank(
-        F1.init(32),
+    const cost = F1.init(32);
+    const rank = try t.rank(
+        cost.factory(),
         try t.plus(
             try t.plus(
                 try t.text("foo {"),
@@ -1643,6 +1730,7 @@ test "nest braces cost" {
         ),
     );
 
+    const s1 = F1.Rank.fromU64(rank);
     try expectEqual(2, s1.h);
     try expectEqual(0, s1.o);
 }
@@ -1654,7 +1742,9 @@ test "F2 cost matches example" {
     // See Example 3.5. and Figure 7 in *A Pretty Expressive Printer*.
 
     const d1 = try t.text("   = func( pretty, print )");
-    const c1 = try t.rank(F2.init(6), d1);
+    const cost = F2.init(6);
+    const rank1 = try t.rank(cost.factory(), d1);
+    const c1 = F2.Rank.fromU64(rank1);
 
     try expectEqual(0, c1.h);
     try expectEqual(20 * 20, c1.o);
@@ -1680,7 +1770,8 @@ test "F2 cost matches example" {
         \\)
     , d2);
 
-    const c2 = try t.rank(F2.init(6), d2);
+    const rank2 = try t.rank(cost.factory(), d2);
+    const c2 = F2.Rank.fromU64(rank2);
 
     try expectEqual(3, c2.h);
     try expectEqual(4 * 4 + 3 * 3 + 1, c2.o);

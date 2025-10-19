@@ -101,6 +101,7 @@ pub fn build(b: *std.Build) void {
     const graphviz_exe = b.addExecutable(.{
         .name = "zoot-graphviz",
         .root_module = graphviz_mod,
+        .use_llvm = true,
     });
 
     b.installArtifact(graphviz_exe);

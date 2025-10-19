@@ -163,14 +163,13 @@ pub fn main() !void {
     try writer.print("┏━ CEK debug ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{});
     const Cost = pp.F2;
     const cost_model = Cost.init(80);
-    const Frame = pp.KFrameType(Cost);
-    const Machine = pp.MachineType(Cost);
+    const cost_factory = cost_model.factory();
 
-    var frames = pp.List(Frame).init(allocator);
+    var frames = pp.List(pp.KFrame).init(allocator);
     defer frames.deinit();
 
     const k_done = try frames.push(allocator, .{ .done = {} });
-    var machine = Machine{
+    var machine = pp.Machine{
         .eval = .{
             .node = doc,
             .ctx = .{},
@@ -231,14 +230,14 @@ pub fn main() !void {
 
         if (stop) break;
 
-        pp.machineStep(Cost, &t, cost_model, &frames, &machine, null, null) catch |err| {
+        pp.machineStep(&t, cost_factory, &frames, &machine, null, null) catch |err| {
             try writer.print("┃   step error: {s}\n", .{@errorName(err)});
             break;
         };
     }
     try writer.print("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n", .{});
 
-    const best = try t.best(allocator, cost_model, doc, writer);
+    const best = try t.best(allocator, cost_factory, doc, writer);
     const t1 = time.lap();
 
     // var hest = try pp.Maze.hest(&t, allocator, pp.F2.init(40), doc, writer);
@@ -246,10 +245,11 @@ pub fn main() !void {
     const t2 = time.lap();
 
     const measure = best.measure;
+    const rank = Cost.Rank.fromU64(measure.rank);
 
     try writer.print(
         "  rank: overflow={d} height={d} tainted={}\n",
-        .{ measure.rank.o, measure.rank.h, measure.tainted },
+        .{ rank.o, rank.h, measure.tainted },
     );
     try writer.print(
         "  layouts: completions={d} frontier={d} tainted_kept={} queue_peak={d}\n",

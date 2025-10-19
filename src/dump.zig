@@ -295,7 +295,8 @@ test "dump struct inline by default" {
     const Data = struct { x: u8, y: u8 };
     const doc = try dump(&tree, Data{ .x = 1, .y = 2 });
 
-    const layout = try tree.best(std.testing.allocator, pretty.F1.init(80), doc, null);
+    const cost = pretty.F1.init(80);
+    const layout = try tree.best(std.testing.allocator, cost.factory(), doc, null);
 
     var buffer: [64]u8 = undefined;
     var writer = std.Io.Writer.fixed(buffer[0..]);
@@ -321,7 +322,8 @@ test "dump chooses multiline layout when narrow" {
         },
     );
 
-    const layout = try tree.best(std.testing.allocator, pretty.F1.init(18), doc, null);
+    const cost = pretty.F1.init(18);
+    const layout = try tree.best(std.testing.allocator, cost.factory(), doc, null);
 
     var buffer: [256]u8 = undefined;
     var writer = std.Io.Writer.fixed(buffer[0..]);
