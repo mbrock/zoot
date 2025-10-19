@@ -4,6 +4,448 @@ const log = std.log;
 
 pub const Bank = std.mem.Allocator;
 
+pub const Loop = struct {
+    tree: *Tree,
+    bank: Bank,
+    cost: CostFactory,
+    node: Node,
+    info: ?*std.Io.Writer,
+
+    pub fn machineStep(
+        self: *@This(),
+        work: *List(Kont),
+        exec: *Exec,
+        memo: ?*Memo,
+        stats: ?*MachineStats,
+    ) !void {
+        switch (exec.*) {
+            .eval => |eval| {
+                const key = MemoKey{
+                    .node = eval.node.repr(),
+                    .head = eval.crux.head,
+                    .base = eval.crux.base,
+                };
+
+                if (memo) |m| {
+                    if (m.get(key)) |idea| {
+                        if (stats) |s| s.memo_hits += 1;
+                        exec.* = .{
+                            .give = .{
+                                .idea = idea,
+                                .then = eval.then,
+                            },
+                        };
+                        return;
+                    }
+                }
+                if (stats) |s| s.memo_misses += 1;
+
+                switch (eval.node.look()) {
+                    .rune => |rune| {
+                        var last = eval.crux.head;
+                        var rows: u16 = 0;
+                        var rank: u64 = 0;
+
+                        if (rune.reps != 0) {
+                            if (rune.code == '\n') {
+                                rows = rune.reps;
+                                last = eval.crux.base;
+                                for (0..rune.reps) |_| {
+                                    rank = self.cost.plus(rank, self.cost.line());
+                                }
+                            } else {
+                                const width_per = std.unicode.utf8CodepointSequenceLength(rune.code) catch 1;
+                                const total: u32 = @intCast(@as(u32, width_per) * rune.reps);
+                                rank = self.cost.plus(rank, self.cost.text(eval.crux.head, @intCast(total)));
+                                const widened = @as(u32, eval.crux.head) + total;
+                                const limit = @as(u32, std.math.maxInt(u16));
+                                last = @intCast(@min(widened, limit));
+                            }
+                        }
+
+                        const idea = Idea{
+                            .node = eval.node,
+                            .last = last,
+                            .rows = rows,
+                            .rank = rank,
+                            .icky = self.cost.tainted(rank),
+                        };
+
+                        if (memo) |m| try m.put(key, idea);
+                        exec.* = .{
+                            .give = .{
+                                .idea = idea,
+                                .then = eval.then,
+                            },
+                        };
+                    },
+                    .span => |span| {
+                        var head = eval.crux.head;
+                        var rows: u16 = 0;
+                        var rank: u64 = 0;
+
+                        if (span.char != 0 and span.side == .lchr) {
+                            if (span.char == '\n') {
+                                rows +|= 1;
+                                head = eval.crux.base;
+                                rank = self.cost.plus(rank, self.cost.line());
+                            } else {
+                                rank = self.cost.plus(rank, self.cost.text(head, 1));
+                                head +|= 1;
+                            }
+                        }
+
+                        const tail = self.tree.heap.text.items[span.text..];
+                        const text = std.mem.sliceTo(tail, 0);
+                        const text_len: u16 = @intCast(text.len);
+                        if (text_len != 0) {
+                            rank = self.cost.plus(rank, self.cost.text(head, text_len));
+                            head +|= text_len;
+                        }
+
+                        if (span.char != 0 and span.side == .rchr) {
+                            if (span.char == '\n') {
+                                rows +|= 1;
+                                rank = self.cost.plus(rank, self.cost.line());
+                                head = eval.crux.base;
+                            } else {
+                                rank = self.cost.plus(rank, self.cost.text(head, 1));
+                                head +|= 1;
+                            }
+                        }
+
+                        const idea = Idea{
+                            .node = eval.node,
+                            .last = head,
+                            .rows = rows,
+                            .rank = rank,
+                            .icky = self.cost.tainted(rank),
+                        };
+
+                        if (memo) |m| try m.put(key, idea);
+                        exec.* = .{
+                            .give = .{
+                                .idea = idea,
+                                .then = eval.then,
+                            },
+                        };
+                    },
+                    .quad => |quad| {
+                        var head = eval.crux.head;
+                        var rows: u16 = 0;
+                        var rank: u64 = 0;
+                        const chars = [_]u7{ quad.ch0, quad.ch1, quad.ch2, quad.ch3 };
+                        for (chars) |c| {
+                            if (c == 0) break;
+                            if (c == '\n') {
+                                rows +|= 1;
+                                head = eval.crux.base;
+                                rank = self.cost.plus(rank, self.cost.line());
+                            } else {
+                                rank = self.cost.plus(rank, self.cost.text(head, 1));
+                                head +|= 1;
+                            }
+                        }
+
+                        const idea = Idea{
+                            .node = eval.node,
+                            .last = head,
+                            .rows = rows,
+                            .rank = rank,
+                            .icky = self.cost.tainted(rank),
+                        };
+
+                        if (memo) |m| try m.put(key, idea);
+                        exec.* = .{
+                            .give = .{
+                                .idea = idea,
+                                .then = eval.then,
+                            },
+                        };
+                    },
+                    .trip => |trip| {
+                        var head = eval.crux.head;
+                        var rows: u16 = 0;
+                        var rank: u64 = 0;
+
+                        const glyph = trip.slice();
+                        const glyph_len = trip.unitLen();
+                        const repeats = trip.repeatCount();
+
+                        if (glyph_len != 0 and repeats != 0) {
+                            for (0..repeats) |_| {
+                                for (glyph[0..glyph_len]) |byte| {
+                                    if (byte == '\n') {
+                                        rows +|= 1;
+                                        head = eval.crux.base;
+                                        rank = self.cost.plus(rank, self.cost.line());
+                                    } else {
+                                        rank = self.cost.plus(rank, self.cost.text(head, 1));
+                                        head +|= 1;
+                                    }
+                                }
+                            }
+                        }
+
+                        const idea = Idea{
+                            .node = eval.node,
+                            .last = head,
+                            .rows = rows,
+                            .rank = rank,
+                            .icky = self.cost.tainted(rank),
+                        };
+
+                        if (memo) |m| try m.put(key, idea);
+                        exec.* = .{
+                            .give = .{
+                                .idea = idea,
+                                .then = eval.then,
+                            },
+                        };
+                    },
+                    .cons => |oper| {
+                        const pair = self.tree.heap.cons.items[oper.item];
+
+                        var child_ctx = eval.crux;
+                        if (oper.frob.warp == 1)
+                            child_ctx.warp();
+                        if (oper.frob.nest != 0)
+                            child_ctx.nest(oper.frob.nest);
+
+                        exec.* = .{
+                            .eval = .{
+                                .node = pair.head,
+                                .crux = child_ctx,
+                                .then = try work.push(self.tree.bank, Kont{
+                                    .after_left = .{
+                                        .node = eval.node,
+                                        .rhs = pair.tail,
+                                        .right_base = child_ctx.base,
+                                        .head = eval.crux.head,
+                                        .base = eval.crux.base,
+                                        .next = eval.then,
+                                    },
+                                }),
+                            },
+                        };
+                    },
+                    .fork => |oper| {
+                        const pair = self.tree.heap.fork.items[oper.item];
+
+                        var left_ctx = eval.crux;
+                        if (oper.frob.warp == 1)
+                            left_ctx.warp();
+                        if (oper.frob.nest != 0)
+                            left_ctx.nest(oper.frob.nest);
+
+                        const right_ctx = left_ctx;
+
+                        exec.* = .{
+                            .fork = .{
+                                .left = .{
+                                    .node = pair.head,
+                                    .crux = left_ctx,
+                                    .then = eval.then,
+                                },
+                                .right = .{
+                                    .node = pair.tail,
+                                    .crux = right_ctx,
+                                    .then = eval.then,
+                                },
+                            },
+                        };
+                    },
+                }
+            },
+            .give => |give| {
+                switch (give.then.*) {
+                    .done => {
+                        exec.* = Exec{ .done = .{ .idea = give.idea } };
+                    },
+                    .after_left => |frame| {
+                        const right_ctx = Crux{
+                            .head = give.idea.last,
+                            .base = frame.right_base,
+                            .rows = give.idea.rows,
+                        };
+
+                        exec.* = .{
+                            .eval = .{
+                                .node = frame.rhs,
+                                .crux = right_ctx,
+                                .then = try work.push(self.tree.bank, Kont{
+                                    .after_right = .{
+                                        .node = frame.node,
+                                        .head = frame.head,
+                                        .base = frame.base,
+                                        .left = give.idea,
+                                        .next = frame.next,
+                                    },
+                                }),
+                            },
+                        };
+                    },
+                    .after_right => |frame| {
+                        const left = frame.left;
+                        const next = frame.next;
+
+                        const rank = self.cost.plus(left.rank, give.idea.rank);
+
+                        const oper = switch (frame.node.look()) {
+                            .cons => |oper| oper,
+                            else => unreachable,
+                        };
+
+                        const cons_index: u21 = @intCast(self.tree.heap.cons.items.len);
+                        try self.tree.heap.cons.append(self.tree.bank, .{
+                            .head = left.node,
+                            .tail = give.idea.node,
+                        });
+
+                        const layout = Node.fromOper(.cons, oper.frob, cons_index);
+
+                        const idea = Idea{
+                            .node = layout,
+                            .last = give.idea.last,
+                            .rows = left.rows +| give.idea.rows,
+                            .rank = rank,
+                            .icky = left.icky or give.idea.icky or self.cost.tainted(rank),
+                        };
+
+                        if (memo) |m| {
+                            const key = MemoKey{
+                                .node = frame.node.repr(),
+                                .head = frame.head,
+                                .base = frame.base,
+                            };
+                            try m.put(key, idea);
+                        }
+
+                        exec.* = .{
+                            .give = .{
+                                .idea = idea,
+                                .then = next,
+                            },
+                        };
+                    },
+                }
+            },
+
+            // TODO: the dense node representation allows shortcuts.
+            //
+            // When A and B are tiny texts, A + B is often also a tiny text.
+
+            else => {},
+        }
+    }
+
+    pub fn best(this: *@This()) !BestOutcome {
+        _ = this.info;
+
+        var konts = List(Kont).init(this.bank);
+        defer konts.deinit();
+
+        var memo = Memo.init(this.bank);
+        defer memo.deinit();
+
+        var work = try std.ArrayList(Exec).initCapacity(this.bank, 64);
+        defer work.deinit(this.bank);
+
+        try work.append(this.bank, Exec{
+            .eval = .{
+                .node = this.node,
+                .crux = .{},
+                .then = try konts.push(this.bank, Kont{ .done = {} }),
+            },
+        });
+
+        var peak: usize = work.items.len;
+        var completions: usize = 0;
+        var stats = MachineStats{};
+
+        var good = try std.ArrayList(Idea).initCapacity(this.bank, 4);
+        defer good.deinit(this.bank);
+
+        var tainted_best: ?Idea = null;
+
+        while (work.pop()) |next| {
+            var exec = next;
+            while (true) {
+                if (good.items.len > 0) {
+                    switch (exec) {
+                        .eval => |e| {
+                            if (e.crux.icky)
+                                break;
+                        },
+                        else => {},
+                    }
+                }
+
+                switch (exec) {
+                    .fork => |branches| {
+                        try work.append(this.bank, .{ .eval = .{
+                            .node = branches.right.node,
+                            .crux = branches.right.crux,
+                            .then = branches.right.then,
+                        } });
+                        if (work.items.len > peak) peak = work.items.len;
+                        exec = .{
+                            .eval = .{
+                                .node = branches.left.node,
+                                .crux = branches.left.crux,
+                                .then = branches.left.then,
+                            },
+                        };
+                        continue;
+                    },
+                    .done => |done| {
+                        try updateFrontier(this.cost, this.bank, &good, &tainted_best, done.idea);
+                        completions += 1;
+                        break;
+                    },
+                    else => {},
+                }
+
+                try this.machineStep(&konts, &exec, &memo, &stats);
+            }
+        }
+
+        const memo_entries = memo.count();
+
+        if (good.items.len != 0) {
+            var optimal = good.items[0];
+            for (good.items[1..]) |candidate| {
+                if (costBetter(this.cost, candidate, optimal)) optimal = candidate;
+            }
+            return BestOutcome{
+                .measure = optimal,
+                .completions = completions,
+                .memo_hits = stats.memo_hits,
+                .memo_misses = stats.memo_misses,
+                .memo_entries = memo_entries,
+                .frontier_non_tainted = good.items.len,
+                .tainted_kept = false,
+                .queue_peak = peak,
+            };
+        }
+
+        if (tainted_best) |tainted| {
+            return BestOutcome{
+                .measure = tainted,
+                .completions = completions,
+                .memo_hits = stats.memo_hits,
+                .memo_misses = stats.memo_misses,
+                .memo_entries = memo_entries,
+                .frontier_non_tainted = 0,
+                .tainted_kept = true,
+                .queue_peak = peak,
+            };
+        }
+
+        return error.MazeNoLayouts;
+    }
+};
+
 pub const Crux = struct {
     head: u16 = 0,
     base: u16 = 0,
@@ -136,338 +578,6 @@ pub const Exec = union(enum) {
         idea: Idea,
     },
 };
-
-pub fn machineStep(
-    tree: *Tree,
-    cf: CostFactory,
-    work: *List(Kont),
-    exec: *Exec,
-    memo: ?*Memo,
-    stats: ?*MachineStats,
-) !void {
-    switch (exec.*) {
-        .eval => |eval| {
-            const key = MemoKey{
-                .node = eval.node.repr(),
-                .head = eval.crux.head,
-                .base = eval.crux.base,
-            };
-
-            if (memo) |m| {
-                if (m.get(key)) |idea| {
-                    if (stats) |s| s.memo_hits += 1;
-                    exec.* = .{
-                        .give = .{
-                            .idea = idea,
-                            .then = eval.then,
-                        },
-                    };
-                    return;
-                }
-            }
-            if (stats) |s| s.memo_misses += 1;
-
-            switch (eval.node.look()) {
-                .rune => |rune| {
-                    var last = eval.crux.head;
-                    var rows: u16 = 0;
-                    var rank: u64 = 0;
-
-                    if (rune.reps != 0) {
-                        if (rune.code == '\n') {
-                            rows = rune.reps;
-                            last = eval.crux.base;
-                            for (0..rune.reps) |_| {
-                                rank = cf.plus(rank, cf.line());
-                            }
-                        } else {
-                            const width_per = std.unicode.utf8CodepointSequenceLength(rune.code) catch 1;
-                            const total: u32 = @intCast(@as(u32, width_per) * rune.reps);
-                            rank = cf.plus(rank, cf.text(eval.crux.head, @intCast(total)));
-                            const widened = @as(u32, eval.crux.head) + total;
-                            const limit = @as(u32, std.math.maxInt(u16));
-                            last = @intCast(@min(widened, limit));
-                        }
-                    }
-
-                    const idea = Idea{
-                        .node = eval.node,
-                        .last = last,
-                        .rows = rows,
-                        .rank = rank,
-                        .icky = cf.tainted(rank),
-                    };
-
-                    if (memo) |m| try m.put(key, idea);
-                    exec.* = .{
-                        .give = .{
-                            .idea = idea,
-                            .then = eval.then,
-                        },
-                    };
-                },
-                .span => |span| {
-                    var head = eval.crux.head;
-                    var rows: u16 = 0;
-                    var rank: u64 = 0;
-
-                    if (span.char != 0 and span.side == .lchr) {
-                        if (span.char == '\n') {
-                            rows +|= 1;
-                            head = eval.crux.base;
-                            rank = cf.plus(rank, cf.line());
-                        } else {
-                            rank = cf.plus(rank, cf.text(head, 1));
-                            head +|= 1;
-                        }
-                    }
-
-                    const tail = tree.heap.text.items[span.text..];
-                    const text = std.mem.sliceTo(tail, 0);
-                    const text_len: u16 = @intCast(text.len);
-                    if (text_len != 0) {
-                        rank = cf.plus(rank, cf.text(head, text_len));
-                        head +|= text_len;
-                    }
-
-                    if (span.char != 0 and span.side == .rchr) {
-                        if (span.char == '\n') {
-                            rows +|= 1;
-                            rank = cf.plus(rank, cf.line());
-                            head = eval.crux.base;
-                        } else {
-                            rank = cf.plus(rank, cf.text(head, 1));
-                            head +|= 1;
-                        }
-                    }
-
-                    const idea = Idea{
-                        .node = eval.node,
-                        .last = head,
-                        .rows = rows,
-                        .rank = rank,
-                        .icky = cf.tainted(rank),
-                    };
-
-                    if (memo) |m| try m.put(key, idea);
-                    exec.* = .{
-                        .give = .{
-                            .idea = idea,
-                            .then = eval.then,
-                        },
-                    };
-                },
-                .quad => |quad| {
-                    var head = eval.crux.head;
-                    var rows: u16 = 0;
-                    var rank: u64 = 0;
-                    const chars = [_]u7{ quad.ch0, quad.ch1, quad.ch2, quad.ch3 };
-                    for (chars) |c| {
-                        if (c == 0) break;
-                        if (c == '\n') {
-                            rows +|= 1;
-                            head = eval.crux.base;
-                            rank = cf.plus(rank, cf.line());
-                        } else {
-                            rank = cf.plus(rank, cf.text(head, 1));
-                            head +|= 1;
-                        }
-                    }
-
-                    const idea = Idea{
-                        .node = eval.node,
-                        .last = head,
-                        .rows = rows,
-                        .rank = rank,
-                        .icky = cf.tainted(rank),
-                    };
-
-                    if (memo) |m| try m.put(key, idea);
-                    exec.* = .{
-                        .give = .{
-                            .idea = idea,
-                            .then = eval.then,
-                        },
-                    };
-                },
-                .trip => |trip| {
-                    var head = eval.crux.head;
-                    var rows: u16 = 0;
-                    var rank: u64 = 0;
-
-                    const glyph = trip.slice();
-                    const glyph_len = trip.unitLen();
-                    const repeats = trip.repeatCount();
-
-                    if (glyph_len != 0 and repeats != 0) {
-                        for (0..repeats) |_| {
-                            for (glyph[0..glyph_len]) |byte| {
-                                if (byte == '\n') {
-                                    rows +|= 1;
-                                    head = eval.crux.base;
-                                    rank = cf.plus(rank, cf.line());
-                                } else {
-                                    rank = cf.plus(rank, cf.text(head, 1));
-                                    head +|= 1;
-                                }
-                            }
-                        }
-                    }
-
-                    const idea = Idea{
-                        .node = eval.node,
-                        .last = head,
-                        .rows = rows,
-                        .rank = rank,
-                        .icky = cf.tainted(rank),
-                    };
-
-                    if (memo) |m| try m.put(key, idea);
-                    exec.* = .{
-                        .give = .{
-                            .idea = idea,
-                            .then = eval.then,
-                        },
-                    };
-                },
-                .cons => |oper| {
-                    const pair = tree.heap.cons.items[oper.item];
-
-                    var child_ctx = eval.crux;
-                    if (oper.frob.warp == 1)
-                        child_ctx.warp();
-                    if (oper.frob.nest != 0)
-                        child_ctx.nest(oper.frob.nest);
-
-                    exec.* = .{
-                        .eval = .{
-                            .node = pair.head,
-                            .crux = child_ctx,
-                            .then = try work.push(tree.bank, Kont{
-                                .after_left = .{
-                                    .node = eval.node,
-                                    .rhs = pair.tail,
-                                    .right_base = child_ctx.base,
-                                    .head = eval.crux.head,
-                                    .base = eval.crux.base,
-                                    .next = eval.then,
-                                },
-                            }),
-                        },
-                    };
-                },
-                .fork => |oper| {
-                    const pair = tree.heap.fork.items[oper.item];
-
-                    var left_ctx = eval.crux;
-                    if (oper.frob.warp == 1)
-                        left_ctx.warp();
-                    if (oper.frob.nest != 0)
-                        left_ctx.nest(oper.frob.nest);
-
-                    const right_ctx = left_ctx;
-
-                    exec.* = .{
-                        .fork = .{
-                            .left = .{
-                                .node = pair.head,
-                                .crux = left_ctx,
-                                .then = eval.then,
-                            },
-                            .right = .{
-                                .node = pair.tail,
-                                .crux = right_ctx,
-                                .then = eval.then,
-                            },
-                        },
-                    };
-                },
-            }
-        },
-        .give => |give| {
-            switch (give.then.*) {
-                .done => {
-                    exec.* = .{
-                        .done = .{ .idea = give.idea },
-                    };
-                },
-                .after_left => |after| {
-                    const rhs = after.rhs;
-                    const right_base = after.right_base;
-                    const orig_head = after.head;
-                    const orig_base = after.base;
-                    const next = after.next;
-
-                    exec.* = .{
-                        .eval = .{
-                            .node = rhs,
-                            .crux = .{
-                                .head = give.idea.last,
-                                .base = right_base,
-                                .rows = give.idea.rows,
-                                .icky = give.idea.icky,
-                            },
-                            .then = try work.push(tree.bank, Kont{
-                                .after_right = .{
-                                    .node = after.node,
-                                    .head = orig_head,
-                                    .base = orig_base,
-                                    .left = give.idea,
-                                    .next = next,
-                                },
-                            }),
-                        },
-                    };
-                },
-                .after_right => |after| {
-                    const left = after.left;
-                    const next = after.next;
-
-                    const rank = cf.plus(left.rank, give.idea.rank);
-
-                    const oper = switch (after.node.look()) {
-                        .cons => |oper| oper,
-                        else => unreachable,
-                    };
-
-                    const cons_index: u21 = @intCast(tree.heap.cons.items.len);
-                    try tree.heap.cons.append(tree.bank, .{
-                        .head = left.node,
-                        .tail = give.idea.node,
-                    });
-
-                    const layout = Node.fromOper(.cons, oper.frob, cons_index);
-
-                    const idea = Idea{
-                        .node = layout,
-                        .last = give.idea.last,
-                        .rows = left.rows +| give.idea.rows,
-                        .rank = rank,
-                        .icky = left.icky or give.idea.icky or cf.tainted(rank),
-                    };
-
-                    if (memo) |m| {
-                        const key = MemoKey{
-                            .node = after.node.repr(),
-                            .head = after.head,
-                            .base = after.base,
-                        };
-                        try m.put(key, idea);
-                    }
-
-                    exec.* = .{
-                        .give = .{
-                            .idea = idea,
-                            .then = next,
-                        },
-                    };
-                },
-            }
-        },
-        .done => {},
-        .fork => {},
-    }
-}
 
 fn costBetter(
     cf: CostFactory,
@@ -1029,109 +1139,14 @@ pub const Tree = struct {
         node: Node,
         info: ?*std.Io.Writer,
     ) !BestOutcome {
-        _ = info;
-
-        var konts = List(Kont).init(bank);
-        defer konts.deinit();
-
-        var memo = Memo.init(bank);
-        defer memo.deinit();
-
-        var work = try std.ArrayList(Exec).initCapacity(bank, 64);
-        defer work.deinit(bank);
-
-        try work.append(bank, Exec{
-            .eval = .{
-                .node = node,
-                .crux = .{},
-                .then = try konts.push(bank, Kont{ .done = {} }),
-            },
-        });
-
-        var peak: usize = work.items.len;
-        var completions: usize = 0;
-        var stats = MachineStats{};
-
-        var good = try std.ArrayList(Idea).initCapacity(bank, 4);
-        defer good.deinit(bank);
-
-        var tainted_best: ?Idea = null;
-
-        while (work.pop()) |next| {
-            var exec = next;
-            while (true) {
-                if (good.items.len > 0) {
-                    switch (exec) {
-                        .eval => |e| {
-                            if (e.crux.icky)
-                                break;
-                        },
-                        else => {},
-                    }
-                }
-
-                switch (exec) {
-                    .fork => |branches| {
-                        try work.append(bank, .{ .eval = .{
-                            .node = branches.right.node,
-                            .crux = branches.right.crux,
-                            .then = branches.right.then,
-                        } });
-                        if (work.items.len > peak) peak = work.items.len;
-                        exec = .{
-                            .eval = .{
-                                .node = branches.left.node,
-                                .crux = branches.left.crux,
-                                .then = branches.left.then,
-                            },
-                        };
-                        continue;
-                    },
-                    .done => |done| {
-                        try updateFrontier(cost, bank, &good, &tainted_best, done.idea);
-                        completions += 1;
-                        break;
-                    },
-                    else => {},
-                }
-
-                try machineStep(tree, cost, &konts, &exec, &memo, &stats);
-            }
-        }
-
-        const memo_entries = memo.count();
-
-        if (good.items.len != 0) {
-            var optimal = good.items[0];
-            for (good.items[1..]) |candidate| {
-                if (costBetter(cost, candidate, optimal)) optimal = candidate;
-            }
-            return BestOutcome{
-                .measure = optimal,
-                .completions = completions,
-                .memo_hits = stats.memo_hits,
-                .memo_misses = stats.memo_misses,
-                .memo_entries = memo_entries,
-                .frontier_non_tainted = good.items.len,
-                .tainted_kept = false,
-                .queue_peak = peak,
-            };
-        }
-
-        if (tainted_best) |tainted| {
-            return BestOutcome{
-                .measure = tainted,
-                .completions = completions,
-                .memo_hits = stats.memo_hits,
-                .memo_misses = stats.memo_misses,
-                .memo_entries = memo_entries,
-                .frontier_non_tainted = 0,
-                .tainted_kept = true,
-                .queue_peak = peak,
-            };
-        }
-
-        return error.MazeNoLayouts;
+        var loop = Loop{
+            .tree = tree,
+            .bank = bank,
+            .cost = cost,
+            .node = node,
+            .info = info,
+        };
+        return try loop.best();
     }
 
     pub fn rank(

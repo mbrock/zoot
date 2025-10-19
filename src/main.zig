@@ -177,6 +177,14 @@ pub fn main() !void {
         },
     };
 
+    var loop = pp.Loop{
+        .tree = &t,
+        .bank = allocator,
+        .cost = cost_factory,
+        .node = doc,
+        .info = null,
+    };
+
     const debug_limit: usize = 12;
     var step_index: usize = 0;
     while (step_index < debug_limit) : (step_index += 1) {
@@ -230,7 +238,7 @@ pub fn main() !void {
 
         if (stop) break;
 
-        pp.machineStep(&t, cost_factory, &frames, &machine, null, null) catch |err| {
+        loop.machineStep(&frames, &machine, null, null) catch |err| {
             try writer.print("┃   step error: {s}\n", .{@errorName(err)});
             break;
         };
