@@ -1031,26 +1031,22 @@ pub const Tree = struct {
     ) !BestOutcome {
         _ = info;
 
-        const SearchState = struct {
-            exec: Exec,
-        };
-
         var konts = List(Kont).init(bank);
         defer konts.deinit();
 
         var memo = Memo.init(bank);
         defer memo.deinit();
 
-        var work = try std.ArrayList(SearchState).initCapacity(bank, 64);
+        var work = try std.ArrayList(Exec).initCapacity(bank, 64);
         defer work.deinit(bank);
 
-        try work.append(bank, .{ .exec = Exec{
+        try work.append(bank, Exec{
             .eval = .{
                 .node = node,
                 .crux = .{},
                 .then = try konts.push(bank, Kont{ .done = {} }),
             },
-        } });
+        });
 
         var peak: usize = work.items.len;
         var completions: usize = 0;
@@ -1061,9 +1057,8 @@ pub const Tree = struct {
 
         var tainted_best: ?Idea = null;
 
-        while (work.pop()) |state| {
-            var exec = state.exec;
-
+        while (work.pop()) |next| {
+            var exec = next;
             while (true) {
                 if (good.items.len > 0) {
                     switch (exec) {
@@ -1077,17 +1072,19 @@ pub const Tree = struct {
 
                 switch (exec) {
                     .fork => |branches| {
-                        try work.append(bank, .{ .exec = Exec{ .eval = .{
+                        try work.append(bank, .{ .eval = .{
                             .node = branches.right.node,
                             .crux = branches.right.crux,
                             .then = branches.right.then,
-                        } } });
+                        } });
                         if (work.items.len > peak) peak = work.items.len;
-                        exec = Exec{ .eval = .{
-                            .node = branches.left.node,
-                            .crux = branches.left.crux,
-                            .then = branches.left.then,
-                        } };
+                        exec = .{
+                            .eval = .{
+                                .node = branches.left.node,
+                                .crux = branches.left.crux,
+                                .then = branches.left.then,
+                            },
+                        };
                         continue;
                     },
                     .done => |done| {
