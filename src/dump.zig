@@ -280,8 +280,8 @@ fn container(tree: *Tree, items: []const Node) !Node {
         );
 
     return tree.fork(
-        try tree.flat(block_doc),
         block_doc,
+        try tree.flat(block_doc),
     );
 }
 

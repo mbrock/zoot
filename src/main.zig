@@ -65,6 +65,87 @@ pub fn main() !void {
                 },
             },
         },
+        Step{
+            .run = .{
+                .tool = "zig",
+                .args = &.{
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                },
+            },
+        },
+        Step{ .wait = 30 },
+        Step{
+            .parallel = &.{
+                Step{ .run = .{ .tool = "zig", .args = &.{"test"} } },
+                Step{
+                    .run = .{
+                        .tool = "deploy",
+                        .args = &.{ "us-west", "blue" },
+                    },
+                },
+            },
+        },
+        Step{
+            .run = .{
+                .tool = "zig",
+                .args = &.{
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                },
+            },
+        },
+        Step{ .wait = 30 },
+        Step{
+            .parallel = &.{
+                Step{ .run = .{ .tool = "zig", .args = &.{"test"} } },
+                Step{
+                    .run = .{
+                        .tool = "deploy",
+                        .args = &.{ "us-west", "blue" },
+                    },
+                },
+            },
+        },
+        Step{
+            .run = .{
+                .tool = "zig",
+                .args = &.{
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                },
+            },
+        },
+        Step{ .wait = 30 },
+        Step{
+            .parallel = &.{
+                Step{ .run = .{ .tool = "zig", .args = &.{"test"} } },
+                Step{
+                    .run = .{
+                        .tool = "deploy",
+                        .args = &.{ "us-west", "blue" },
+                    },
+                },
+            },
+        },
     };
 
     const pipeline = Pipeline{
@@ -81,7 +162,7 @@ pub fn main() !void {
 
     try writer.print("┏━ CEK debug ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{});
     const Cost = pp.F2;
-    const cost_model = Cost.init(40);
+    const cost_model = Cost.init(80);
     const Frame = pp.KFrameType(Cost);
     const Machine = pp.MachineType(Cost);
 

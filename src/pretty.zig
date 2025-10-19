@@ -949,6 +949,16 @@ pub const Tree = struct {
             var machine = state.machine;
 
             while (true) {
+                if (non_tainted.items.len > 0) {
+                    switch (machine) {
+                        .eval => |e| {
+                            if (e.ctx.tainted)
+                                break;
+                        },
+                        else => {},
+                    }
+                }
+
                 switch (machine) {
                     .fork => |branches| {
                         try work.append(bank, .{ .machine = Machine{ .eval = .{
