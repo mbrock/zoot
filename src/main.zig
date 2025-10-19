@@ -165,15 +165,15 @@ pub fn main() !void {
     const cost_model = Cost.init(80);
     const cost_factory = cost_model.factory();
 
-    var frames = pp.List(pp.KFrame).init(allocator);
+    var frames = pp.List(pp.Kont).init(allocator);
     defer frames.deinit();
 
     const k_done = try frames.push(allocator, .{ .done = {} });
-    var machine = pp.Machine{
+    var machine = pp.Exec{
         .eval = .{
             .node = doc,
-            .ctx = .{},
-            .k = k_done,
+            .crux = .{},
+            .then = k_done,
         },
     };
 
@@ -189,19 +189,19 @@ pub fn main() !void {
                     "┃   eval node={s} head={d} base={d} rows={d}\n",
                     .{
                         @tagName(state.node.tag),
-                        state.ctx.head,
-                        state.ctx.base,
-                        state.ctx.rows,
+                        state.crux.head,
+                        state.crux.base,
+                        state.crux.rows,
                     },
                 );
             },
-            .ret => |state| {
+            .give => |state| {
                 try writer.print(
                     "┃   ret last={d} rows={d} taint={}\n",
                     .{
-                        state.meas.last,
-                        state.meas.rows,
-                        state.meas.tainted,
+                        state.idea.last,
+                        state.idea.rows,
+                        state.idea.icky,
                     },
                 );
             },
@@ -219,9 +219,9 @@ pub fn main() !void {
                 try writer.print(
                     "┃   done last={d} rows={d} taint={}\n",
                     .{
-                        state.meas.last,
-                        state.meas.rows,
-                        state.meas.tainted,
+                        state.idea.last,
+                        state.idea.rows,
+                        state.idea.icky,
                     },
                 );
                 stop = true;
@@ -249,7 +249,7 @@ pub fn main() !void {
 
     try writer.print(
         "  rank: overflow={d} height={d} tainted={}\n",
-        .{ rank.o, rank.h, measure.tainted },
+        .{ rank.o, rank.h, measure.icky },
     );
     try writer.print(
         "  layouts: completions={d} frontier={d} tainted_kept={} queue_peak={d}\n",
@@ -260,7 +260,7 @@ pub fn main() !void {
         .{ best.memo_hits, best.memo_misses, best.memo_entries },
     );
 
-    try t.emit(writer, measure.layout);
+    try t.emit(writer, measure.node);
     const t3 = time.read();
     try writer.print(
         "  (dump {D}; best {D}; hest {D}; emit {D})\n\n",
