@@ -4,10 +4,6 @@ const log = std.log;
 
 pub const Bank = std.mem.Allocator;
 
-pub const Path = struct {
-    pub const none: Path = .{};
-};
-
 pub const Context = struct {
     head: u16 = 0,
     base: u16 = 0,
@@ -1024,7 +1020,6 @@ pub const Tree = struct {
     pub fn rank(
         tree: *Tree,
         conf: anytype,
-        _: Path,
         node: Node,
     ) !@TypeOf(conf).Rank {
         const outcome = try tree.best(tree.bank, conf, node, null);
@@ -1636,7 +1631,6 @@ test "nest braces cost" {
 
     const s1 = try t.rank(
         F1.init(32),
-        .none,
         try t.plus(
             try t.plus(
                 try t.text("foo {"),
@@ -1660,7 +1654,7 @@ test "F2 cost matches example" {
     // See Example 3.5. and Figure 7 in *A Pretty Expressive Printer*.
 
     const d1 = try t.text("   = func( pretty, print )");
-    const c1 = try t.rank(F2.init(6), .none, d1);
+    const c1 = try t.rank(F2.init(6), d1);
 
     try expectEqual(0, c1.h);
     try expectEqual(20 * 20, c1.o);
@@ -1686,7 +1680,7 @@ test "F2 cost matches example" {
         \\)
     , d2);
 
-    const c2 = try t.rank(F2.init(6), .none, d2);
+    const c2 = try t.rank(F2.init(6), d2);
 
     try expectEqual(3, c2.h);
     try expectEqual(4 * 4 + 3 * 3 + 1, c2.o);
