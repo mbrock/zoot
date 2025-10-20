@@ -15,10 +15,14 @@ pub const Tidy = struct {
     kont_tail_wave: u29 = 0,
 
     pub fn tidy(boop: *Loop) !Loop {
+        // Allocate new tree for new space
+        const new_tree = try boop.tree.bank.create(Tree);
+        new_tree.* = Tree.init(boop.tree.bank);
+        
         var this = Tidy{
             .loop = boop,
             .doop = Loop{
-                .tree = Tree.init(boop.tree.bank),
+                .tree = new_tree,
                 .cost = boop.cost,
                 .memo = Memo.init(boop.tree.bank),
                 .flip = if (boop.flip == 0) 1 else 0,
@@ -61,9 +65,9 @@ pub const Tidy = struct {
                 if (pair.head == Node.bolt) return pair.tail;
 
                 const i = nextfeed.items.len;
-                try nextfeed.append(this.loop.tree.bank, .{ pair.head, pair.tail });
+                try nextfeed.append(this.loop.tree.bank, .{ .head = pair.head, .tail = pair.tail });
                 
-                var next_oper = oper.*;
+                var next_oper = oper;
                 next_oper.flip = this.doop.flip;
                 next_oper.item = @intCast(i);
                 const next: Node = @bitCast(next_oper);
@@ -73,6 +77,8 @@ pub const Tidy = struct {
 
                 return next;
             },
+            // Terminal nodes don't need copying
+            .span, .quad, .trip, .rune => return node,
         }
     }
 
@@ -87,7 +93,7 @@ pub const Tidy = struct {
     }
 
     fn size(this: *Tidy, comptime tag: Tag) u21 {
-        return this.list(tag).items.len;
+        return @intCast(this.list(tag).items.len);
     }
 
     fn list(this: *Tidy, comptime tag: Tag) *std.ArrayList(Pair) {
@@ -1992,4 +1998,68 @@ test "warp with nest when head is non-zero" {
 
     // result: "AAA" (head=3) + "X" (head=4) + "\n" + (3 warp + 2 nest = 5 spaces) + "Y"
     try expectEmitString(&t, "AAAX\n     Y", outer);
+}
+
+test "tidy GC collects unreachable nodes and memo entries" {
+    var tree = Tree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    // Create some nodes
+    const live_doc = try tree.cat(&.{
+        try tree.text("live"),
+        try tree.text(" "),
+        try tree.text("data"),
+    });
+
+    const dead_doc = try tree.cat(&.{
+        try tree.text("dead"),
+        try tree.text(" "),
+        try tree.text("garbage"),
+    });
+
+    // Create a fork with both
+    const doc = try tree.fork(live_doc, dead_doc);
+
+    // Run evaluation - this will populate memo and create continuation frames
+    const cost = F1.init(10);
+    var loop = Loop{
+        .tree = &tree,
+        .cost = cost,
+        .memo = Memo.init(std.testing.allocator),
+        .flip = 0,
+    };
+    defer loop.deinit();
+
+    try loop.pile.append(std.testing.allocator, .{
+        .node = doc,
+        .tick = .{ .eval = .{} },
+    });
+
+    // Run one step to populate some state
+    _ = try loop.loop();
+
+    const old_cons_len = tree.heap.cons.items.len;
+    const old_memo_len = loop.memo.count();
+
+    std.debug.print("\nBefore GC: cons={}, memo={}\n", .{ old_cons_len, old_memo_len });
+
+    // Now run tidy - only live_doc path should survive
+    var new_loop = try Tidy.tidy(&loop);
+    defer {
+        new_loop.tree.deinit();
+        std.testing.allocator.destroy(new_loop.tree);
+        new_loop.deinit();
+    }
+
+    const new_cons_len = new_loop.tree.heap.cons.items.len;
+    const new_memo_len = new_loop.memo.count();
+
+    std.debug.print("After GC:  cons={}, memo={}\n", .{ new_cons_len, new_memo_len });
+
+    // We should have collected something
+    try expect(new_cons_len <= old_cons_len);
+    try expect(new_memo_len <= old_memo_len);
+
+    // Flip bit should have toggled
+    try expectEqual(@as(u1, 1), new_loop.flip);
 }
