@@ -300,7 +300,7 @@ test "dump struct inline by default" {
 
     var buffer: [64]u8 = undefined;
     var writer = std.Io.Writer.fixed(buffer[0..]);
-    try tree.emit(&writer, layout.measure.node);
+    try tree.emit(&writer, layout.idea.node);
     const rendered = writer.buffered();
     try expectEqualStrings(".{ .x = 1, .y = 2, }", rendered);
 }
@@ -327,7 +327,7 @@ test "dump chooses multiline layout when narrow" {
 
     var buffer: [256]u8 = undefined;
     var writer = std.Io.Writer.fixed(buffer[0..]);
-    try tree.emit(&writer, layout.measure.node);
+    try tree.emit(&writer, layout.idea.node);
     const rendered = writer.buffered();
 
     try expect(std.mem.indexOf(u8, rendered, "\n") != null);

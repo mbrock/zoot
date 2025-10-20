@@ -7,11 +7,19 @@ const Pool = std.heap.MemoryPool;
 pub const Loop = struct {
     tree: *Tree,
     cost: Cost,
-    memo: *Memo,
-    stat: *Stat,
+    memo: Memo,
+    pool: Pool(Kont),
+    stat: Stat = .{},
+    pile: std.ArrayList(Exec) = .empty,
+    best: std.ArrayList(Idea) = .empty,
+    icky: ?Idea = null,
 
-    pool: *std.heap.MemoryPool(Kont),
-    pile: *std.ArrayList(Exec),
+    pub fn deinit(this: *@This()) void {
+        this.best.deinit(this.tree.bank);
+        this.pile.deinit(this.tree.bank);
+        this.memo.deinit();
+        this.pool.deinit();
+    }
 
     pub fn pick(
         tree: *Tree,
@@ -19,65 +27,65 @@ pub const Loop = struct {
         cost: Cost,
         node: Node,
     ) !Best {
-        var pile = try std.ArrayList(Exec).initCapacity(bank, 256);
-        defer pile.deinit(bank);
+        var this = @This(){
+            .tree = tree,
+            .cost = cost,
+            .memo = .init(bank),
+            .pool = .init(bank),
+        };
+        defer this.deinit();
 
-        var icky: ?Idea = null;
-        var peak: usize = 0;
-        var stat = Stat{};
-
-        var pool = Pool(Kont).init(bank);
-        var memo = Memo.init(bank);
-        var best = std.ArrayList(Idea).empty;
-
-        defer pool.deinit();
-        defer memo.deinit();
-        defer best.deinit(bank);
-
-        pile.appendAssumeCapacity(.{
+        try this.pile.append(bank, .{
             .node = node,
             .tick = .{ .eval = .{} },
         });
 
-        var this = @This(){
-            .tree = tree,
-            .cost = cost,
-            .memo = &memo,
-            .stat = &stat,
-            .pool = &pool,
-            .pile = &pile,
-        };
+        return this.loop();
+    }
 
-        work: while (pile.pop()) |next| {
+    pub fn loop(this: *@This()) !Best {
+        try this.ickyloop();
+        try this.goodloop();
+
+        this.stat.size = this.best.items.len;
+        this.stat.memo_entries = this.memo.count();
+
+        if (this.best.items.len != 0) {
+            var boss = this.best.items[0];
+            for (this.best.items[1..]) |chap| {
+                if (this.cost.wins(chap.gist.rank, boss.gist.rank))
+                    boss = chap;
+            }
+
+            return Best{ .idea = boss, .stat = this.stat };
+        }
+
+        if (this.icky) |icky| {
+            return Best{ .idea = icky, .stat = this.stat };
+        }
+
+        std.debug.panic("zero layouts discovered", .{});
+    }
+
+    fn ickyloop(this: *@This()) !void {
+        while (this.pile.pop()) |next| {
             var exec = next;
             while (true) {
-                if (pile.items.len > peak) peak = pile.items.len;
+                if (this.pile.items.len > this.stat.peak)
+                    this.stat.peak = this.pile.items.len;
 
                 switch (exec.tick) {
                     .give => |gist| {
                         if (exec.then == null) {
                             const idea: Idea = .{ .gist = gist, .node = exec.node };
-                            try meld(cost, bank, &best, idea);
-                            stat.completions += 1;
+                            try this.meld(idea);
 
-                            if (best.items.len > 0) break :work;
-
-                            if (icky) |existing| {
-                                if (dominates(
-                                    cost,
-                                    idea.gist,
-                                    existing.gist,
-                                ) or cost.wins(
-                                    idea.gist.rank,
-                                    existing.gist.rank,
-                                )) {
-                                    icky = idea;
-                                }
+                            if (this.best.items.len > 0) {
+                                return;
                             } else {
-                                icky = idea;
+                                this.icky = this.icky orelse idea;
+                                break;
                             }
-
-                            continue :work;
                         }
                     },
                     .eval => {},
@@ -86,17 +94,20 @@ pub const Loop = struct {
                 try this.step(&exec, true);
             }
         }
+    }
 
-        work: while (pile.pop()) |next| {
+    fn goodloop(this: *@This()) !void {
+        while (this.pile.pop()) |next| {
             var exec = next;
             while (true) {
-                if (pile.items.len > peak) peak = pile.items.len;
+                if (this.pile.items.len > this.stat.peak)
+                    this.stat.peak = this.pile.items.len;
+
                 switch (exec.tick) {
                     .give => |gist| {
                         if (exec.then == null) {
-                            try meld(cost, bank, &best, .{ .gist = gist, .node = exec.node });
-                            stat.completions += 1;
-                            continue :work;
+                            try this.meld(.{ .gist = gist, .node = exec.node });
+                            break;
                         }
                     },
                     else => {},
@@ -104,50 +115,15 @@ pub const Loop = struct {
 
                 if (this.step(&exec, false)) {} else |e| {
                     switch (e) {
-                        error.Icky => continue :work,
+                        error.Icky => break,
                         else => return e,
                     }
                 }
             }
         }
-
-        const memo_entries = memo.count();
-
-        if (best.items.len != 0) {
-            var optimal = best.items[0];
-            for (1..best.items.len) |i| {
-                const candidate = best.items[i];
-                if (cost.wins(candidate.gist.rank, optimal.gist.rank)) optimal = candidate;
-            }
-            return Best{
-                .measure = optimal,
-                .completions = stat.completions,
-                .memo_hits = stat.memo_hits,
-                .memo_misses = stat.memo_misses,
-                .memo_entries = memo_entries,
-                .frontier_non_tainted = best.items.len,
-                .tainted_kept = false,
-                .queue_peak = peak,
-            };
-        }
-
-        if (icky) |tainted| {
-            return Best{
-                .measure = tainted,
-                .completions = stat.completions,
-                .memo_hits = stat.memo_hits,
-                .memo_misses = stat.memo_misses,
-                .memo_entries = memo_entries,
-                .frontier_non_tainted = 0,
-                .tainted_kept = true,
-                .queue_peak = peak,
-            };
-        }
-
-        std.debug.panic("zero layouts discovered", .{});
     }
 
-    pub fn punt(this: *const @This(), kont: Kont) !*Kont {
+    pub fn punt(this: *@This(), kont: Kont) !*Kont {
         const that = try this.pool.create();
         that.* = kont;
         return that;
@@ -157,7 +133,7 @@ pub const Loop = struct {
     ///
     /// If `icks` is true, we are still interested in icky ideas,
     /// since we have not yet found any good ideas.
-    pub fn step(this: @This(), exec: *Exec, icks: bool) !void {
+    pub fn step(this: *@This(), exec: *Exec, icks: bool) !void {
         switch (exec.tick) {
             .eval => |eval| {
                 // We are about to evaluate a node.
@@ -355,34 +331,19 @@ pub const Loop = struct {
         }
     }
 
-    fn dominates(cost: Cost, a: Gist, b: Gist) bool {
-        if (!cost.icky(a.rank) and cost.icky(b.rank)) return true;
-        if (cost.icky(a.rank) and !cost.icky(b.rank)) return false;
-        const lhs_wins = cost.wins(a.rank, b.rank);
-        const rhs_wins = cost.wins(b.rank, a.rank);
-        return lhs_wins and !rhs_wins;
+    fn wins(cost: Cost, a: Gist, b: Gist) bool {
+        return cost.wins(a.rank, b.rank) and !cost.wins(b.rank, a.rank);
     }
 
-    fn meld(
-        cost: Cost,
-        bank: Bank,
-        best: *std.ArrayList(Idea),
-        idea: Idea,
-    ) !void {
-        var i: usize = 0;
-        while (i < best.items.len) {
-            const existing = best.items[i];
-            if (dominates(cost, existing.gist, idea.gist)) {
-                return;
-            }
-            if (dominates(cost, idea.gist, existing.gist)) {
-                _ = best.swapRemove(i);
-                continue;
-            }
-            i += 1;
+    fn meld(this: *@This(), idea: Idea) !void {
+        for (0..this.best.items.len) |i| {
+            const item = this.best.items[i];
+            if (wins(this.cost, item.gist, idea.gist)) return;
+            if (wins(this.cost, idea.gist, item.gist)) _ = this.best.swapRemove(i);
         }
 
-        try best.append(bank, idea);
+        try this.best.append(this.tree.bank, idea);
+        this.stat.completions += 1;
     }
 };
 
@@ -518,13 +479,6 @@ pub const Rank = packed struct {
         return @as(u64, self.o) << 32 | self.h;
     }
 
-    pub fn fromU64(val: u64) Rank {
-        return .{
-            .o = @intCast((val >> 32) & 0xFFFFFFFF),
-            .h = @intCast(val & 0xFFFFFFFF),
-        };
-    }
-
     pub fn bump(this: *Rank, that: Rank, cost: Cost) void {
         const both = cost.plus(this.*, that);
         this.* = both;
@@ -542,20 +496,17 @@ pub const Rank = packed struct {
 };
 
 pub const Stat = struct {
-    completions: usize = 0,
-    memo_hits: usize = 0,
-    memo_misses: usize = 0,
-};
-
-pub const Best = struct {
-    measure: Idea,
+    peak: usize = 0,
     completions: usize = 0,
     memo_hits: usize = 0,
     memo_misses: usize = 0,
     memo_entries: usize = 0,
-    frontier_non_tainted: usize = 0,
-    tainted_kept: bool = false,
-    queue_peak: usize = 0,
+    size: usize = 0,
+};
+
+pub const Best = struct {
+    idea: Idea,
+    stat: Stat,
 };
 
 /// Example 3.4. in *A Pretty Expressive Printer*.
@@ -1012,7 +963,7 @@ pub const Tree = struct {
         node: Node,
     ) !Rank {
         const outcome = try tree.pick(tree.bank, cf, node);
-        return outcome.measure.gist.rank;
+        return outcome.idea.gist.rank;
     }
 
     pub fn emit(tree: *Tree, sink: *std.Io.Writer, node: Node) !void {
@@ -1570,7 +1521,7 @@ test "maze evaluation chooses best layout" {
     const buf = try std.testing.allocator.alloc(u8, 64);
     defer std.testing.allocator.free(buf);
     var sink = std.Io.Writer.fixed(buf);
-    try tree.emit(&sink, result.measure.node);
+    try tree.emit(&sink, result.idea.node);
     try expectEqualStrings("foo bar", sink.buffered());
 }
 

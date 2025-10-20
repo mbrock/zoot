@@ -86,23 +86,23 @@ pub fn main() !void {
     const best = try t.pick(allocator, cost_factory, doc);
     const t1 = time.lap();
 
-    const measure = best.measure;
-    const rank = measure.gist.rank;
+    const idea = best.idea;
+    const rank = idea.gist.rank;
 
     try writer.print(
         "  rank: overflow={d} height={d} tainted={}\n",
         .{ rank.o, rank.h, cost_factory.icky(rank) },
     );
     try writer.print(
-        "  layouts: completions={d} frontier={d} tainted_kept={} queue_peak={d}\n",
-        .{ best.completions, best.frontier_non_tainted, best.tainted_kept, best.queue_peak },
+        "  layouts: completions={d} frontier={d} queue_peak={d}\n",
+        .{ best.stat.completions, best.stat.size, best.stat.peak },
     );
     try writer.print(
         "  memo: hits={d} misses={d} entries={d}\n\n",
-        .{ best.memo_hits, best.memo_misses, best.memo_entries },
+        .{ best.stat.memo_hits, best.stat.memo_misses, best.stat.memo_entries },
     );
 
-    try t.emit(writer, measure.node);
+    try t.emit(writer, idea.node);
     const t3 = time.read();
     try writer.print(
         "  (dump {D}; best {D}; emit {D})\n\n",
