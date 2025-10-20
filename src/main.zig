@@ -67,7 +67,7 @@ pub fn main() !void {
         },
     };
 
-    const pipelines = try allocator.alloc(Pipeline, 100);
+    const pipelines = try allocator.alloc(Pipeline, 1000);
     for (pipelines, 0..) |*p, i| {
         p.* = .{
             .name = try std.fmt.allocPrint(allocator, "pipeline-{d}", .{i}),
@@ -102,7 +102,7 @@ pub fn main() !void {
         .{ best.stat.memo_hits, best.stat.memo_misses, best.stat.memo_entries },
     );
 
-    try t.emit(writer, idea.node);
+    //    try t.emit(writer, idea.node);
     const t3 = time.read();
     try writer.print(
         "  (dump {D}; best {D}; emit {D})\n\n",

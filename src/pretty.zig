@@ -15,21 +15,29 @@ pub const Tidy = struct {
     kont_tail_wave: u29 = 0,
 
     pub fn tidy(boop: *Loop) !Loop {
+        std.debug.assert(boop.tree.flip == boop.flip);
+        const new_flip: u1 = if (boop.flip == 0) 1 else 0;
+
         // Allocate new tree for new space
         const new_tree = try boop.tree.bank.create(Tree);
         new_tree.* = Tree.init(boop.tree.bank);
-        
+        new_tree.flip = new_flip;
+
+        // Copy the text heap wholesale - terminal nodes reference it
+        try new_tree.heap.text.appendSlice(boop.tree.bank, boop.tree.heap.text.items);
+
         var this = Tidy{
             .loop = boop,
             .doop = Loop{
                 .tree = new_tree,
                 .cost = boop.cost,
                 .memo = Memo.init(boop.tree.bank),
-                .flip = if (boop.flip == 0) 1 else 0,
+                .flip = new_flip,
             },
         };
 
         // Copy all roots: pile, best, and icky
+        // Note: we modify loop's collections in-place, then transfer to doop
         for (this.loop.pile.items) |*exec| {
             exec.node = try this.copy(exec.node);
             exec.then = try this.copy_kont(exec.then);
@@ -47,6 +55,11 @@ pub const Tidy = struct {
 
         // Rebuild memo, filtering out unreachable entries
         try this.rebuild_memo();
+
+        // Transfer updated collections to doop
+        this.doop.pile = this.loop.pile;
+        this.doop.best = this.loop.best;
+        this.doop.icky = this.loop.icky;
 
         return this.doop;
     }
@@ -66,7 +79,7 @@ pub const Tidy = struct {
 
                 const i = nextfeed.items.len;
                 try nextfeed.append(this.loop.tree.bank, .{ .head = pair.head, .tail = pair.tail });
-                
+
                 var next_oper = oper;
                 next_oper.flip = this.doop.flip;
                 next_oper.item = @intCast(i);
@@ -153,11 +166,16 @@ pub const Tidy = struct {
     fn copy_kont(this: *Tidy, handle: Handle) !Handle {
         if (handle.kind == .none) return Handle.none;
 
+        // If handle already has new flip bit, it's already in new space
+        if (handle.flip == this.doop.flip) return handle;
+
         return switch (handle.kind) {
             .head => blk: {
                 var kont = &this.loop.tree.heap.kont_head.items[handle.item];
-                if (kont.then.flip == this.doop.flip) {
-                    // Already forwarded, return the new handle stored in .then
+
+                // Check if already forwarded using sentinel marker
+                if (kont.node == Node.bolt) {
+                    // Forwarding address stored in .then
                     break :blk kont.then;
                 }
 
@@ -166,16 +184,19 @@ pub const Tidy = struct {
                 const new_kont = kont.*;
                 try this.doop.tree.heap.kont_head.append(this.loop.tree.bank, new_kont);
 
-                // Leave forwarding pointer
+                // Leave forwarding pointer (use bolt sentinel + new handle in .then)
                 const new_handle = Handle.make(.head, this.doop.flip, new_idx);
+                kont.node = Node.bolt;
                 kont.then = new_handle;
 
                 break :blk new_handle;
             },
             .tail => blk: {
                 var kont = &this.loop.tree.heap.kont_tail.items[handle.item];
-                if (kont.then.flip == this.doop.flip) {
-                    // Already forwarded, return the new handle stored in .then
+
+                // Check if already forwarded using sentinel marker
+                if (kont.idea.node == Node.bolt) {
+                    // Forwarding address stored in .then
                     break :blk kont.then;
                 }
 
@@ -184,8 +205,9 @@ pub const Tidy = struct {
                 const new_kont = kont.*;
                 try this.doop.tree.heap.kont_tail.append(this.loop.tree.bank, new_kont);
 
-                // Leave forwarding pointer
+                // Leave forwarding pointer (use bolt sentinel + new handle in .then)
                 const new_handle = Handle.make(.tail, this.doop.flip, new_idx);
+                kont.idea.node = Node.bolt;
                 kont.then = new_handle;
 
                 break :blk new_handle;
@@ -210,37 +232,47 @@ pub const Tidy = struct {
         this.kont_tail_wave = i;
     }
 
+    // fn drag_kont_head(this: *Tidy, item: u29) !void {
+    //     var kont = &this.doop.tree.heap.kont_head.items[item];
+
+    //     // Copy nodes inside the kont
+    //     kont.node = try this.copy(kont.node);
+    //     kont.item.node = try this.copy(kont.item.node);
+
+    //     // Copy the continuation chain
+    //     kont.then = try this.copy_kont(kont.then);
+    // }
+
     fn drag_kont_head(this: *Tidy, item: u29) !void {
-        var kont = &this.doop.tree.heap.kont_head.items[item];
-        
-        // Copy nodes inside the kont
-        kont.node = try this.copy(kont.node);
-        kont.item.node = try this.copy(kont.item.node);
-        
-        // Copy the continuation chain
-        kont.then = try this.copy_kont(kont.then);
+        const node = try this.copy(this.doop.tree.heap.kont_head.items[item].node);
+        const item_node = try this.copy(this.doop.tree.heap.kont_head.items[item].item.node);
+        const then = try this.copy_kont(this.doop.tree.heap.kont_head.items[item].then);
+
+        this.doop.tree.heap.kont_head.items[item].node = node;
+        this.doop.tree.heap.kont_head.items[item].item.node = item_node;
+        this.doop.tree.heap.kont_head.items[item].then = then;
     }
 
     fn drag_kont_tail(this: *Tidy, item: u29) !void {
+        const ideanode = try this.copy(this.doop.tree.heap.kont_tail.items[item].idea.node);
+        const itemnode = try this.copy(this.doop.tree.heap.kont_tail.items[item].item.node);
+        const then = try this.copy_kont(this.doop.tree.heap.kont_tail.items[item].then);
+
         var kont = &this.doop.tree.heap.kont_tail.items[item];
-        
-        // Copy nodes inside the kont
-        kont.idea.node = try this.copy(kont.idea.node);
-        kont.item.node = try this.copy(kont.item.node);
-        
-        // Copy the continuation chain
-        kont.then = try this.copy_kont(kont.then);
+
+        kont.idea.node = ideanode;
+        kont.item.node = itemnode;
+        kont.then = then;
     }
 
     fn was_forwarded(this: *Tidy, node: Node) ?Node {
         return switch (node.tag) {
             inline .cans, .cons, .fork => |tag| {
                 const oper = Node.view(Oper, node);
-                if (oper.flip != this.doop.flip) return null;
-                
                 const pastfeed = this.past(tag);
+                if (oper.item >= pastfeed.items.len) return null;
                 const pair = &pastfeed.items[oper.item];
-                
+
                 // Check if this was forwarded (bolt marker)
                 if (pair.head == Node.bolt) return pair.tail;
                 return null;
@@ -279,11 +311,68 @@ pub const Loop = struct {
     best: std.ArrayList(Idea) = .empty,
     icky: ?Idea = null,
     flip: u1 = 0,
+    gc_threshold: usize = 10000,
 
     pub fn deinit(this: *@This()) void {
         this.best.deinit(this.tree.bank);
         this.pile.deinit(this.tree.bank);
         this.memo.deinit();
+    }
+
+    fn should_gc(this: *@This()) bool {
+        const heap_size = this.tree.heap.cons.items.len +
+            this.tree.heap.fork.items.len +
+            this.tree.heap.cans.items.len;
+        return heap_size > this.gc_threshold;
+    }
+
+    fn maybe_gc(this: *@This()) !void {
+        if (!this.should_gc()) return;
+
+        log.info("GC triggered: heap_size={} threshold={}", .{
+            this.tree.heap.cons.items.len + this.tree.heap.fork.items.len + this.tree.heap.cans.items.len,
+            this.gc_threshold,
+        });
+
+        const old_heap_size = this.tree.heap.cons.items.len +
+            this.tree.heap.fork.items.len +
+            this.tree.heap.cans.items.len;
+        const old_memo_size = this.memo.count();
+
+        // Run GC
+        const new_loop = try Tidy.tidy(this);
+
+        // Replace our state with the new one
+        const old_tree = this.tree;
+        std.mem.swap(Tree, old_tree, new_loop.tree);
+        this.memo.deinit();
+        this.memo = new_loop.memo;
+        this.pile = new_loop.pile;
+        this.best = new_loop.best;
+        this.icky = new_loop.icky;
+        this.flip = new_loop.flip;
+        this.tree.flip = this.flip;
+
+        // The old tree now lives in new_loop.tree; clean it up.
+        new_loop.tree.deinit();
+        new_loop.tree.bank.destroy(new_loop.tree);
+
+        const new_heap_size = this.tree.heap.cons.items.len +
+            this.tree.heap.fork.items.len +
+            this.tree.heap.cans.items.len;
+        const new_memo_size = this.memo.count();
+
+        log.info("GC completed: heap {} -> {}, memo {} -> {}", .{
+            old_heap_size,
+            new_heap_size,
+            old_memo_size,
+            new_memo_size,
+        });
+
+        const growth = new_heap_size * 2;
+        const proposed_threshold = new_heap_size + growth;
+        if (proposed_threshold > this.gc_threshold)
+            this.gc_threshold = proposed_threshold;
     }
 
     pub fn pick(
@@ -296,6 +385,7 @@ pub const Loop = struct {
             .tree = tree,
             .cost = cost,
             .memo = .init(bank),
+            .flip = tree.flip,
         };
         defer this.deinit();
 
@@ -309,6 +399,7 @@ pub const Loop = struct {
 
     pub fn loop(this: *@This()) !Best {
         try this.ickyloop();
+        try this.maybe_gc();
         try this.goodloop();
 
         this.stat.size = this.best.items.len;
@@ -362,28 +453,32 @@ pub const Loop = struct {
 
     fn goodloop(this: *@This()) !void {
         while (this.pile.pop()) |next| {
-            var exec = next;
-            while (true) {
-                if (this.pile.items.len > this.stat.peak)
-                    this.stat.peak = this.pile.items.len;
+            {
+                var exec = next;
+                while (true) {
+                    if (this.pile.items.len > this.stat.peak)
+                        this.stat.peak = this.pile.items.len;
 
-                switch (exec.tick) {
-                    .give => |gist| {
-                        if (exec.then.kind == .none) {
-                            try this.meld(.{ .gist = gist, .node = exec.node });
-                            break;
+                    switch (exec.tick) {
+                        .give => |gist| {
+                            if (exec.then.kind == .none) {
+                                try this.meld(.{ .gist = gist, .node = exec.node });
+                                break;
+                            }
+                        },
+                        else => {},
+                    }
+
+                    if (this.step(&exec, false)) {} else |e| {
+                        switch (e) {
+                            error.Icky => break,
+                            else => return e,
                         }
-                    },
-                    else => {},
-                }
-
-                if (this.step(&exec, false)) {} else |e| {
-                    switch (e) {
-                        error.Icky => break,
-                        else => return e,
                     }
                 }
             }
+
+            try this.maybe_gc();
         }
     }
 
@@ -569,6 +664,19 @@ pub const Loop = struct {
 
                             // Both sides of the cons may have been forking nodes.
                             // Make a forkless cons node from the resolved head and tail nodes.
+                            if (std.debug.runtime_safety) {
+                                const cans_len = this.tree.heap.cans.items.len;
+                                if (cans_len > std.math.maxInt(u21)) {
+                                    log.err(
+                                        "pre-cans len overflow: len={} flip={} head_ptr={x}",
+                                        .{
+                                            cans_len,
+                                            this.tree.flip,
+                                            @intFromPtr(this.tree.heap.cans.items.ptr),
+                                        },
+                                    );
+                                }
+                            }
                             const oper = Node.view(Oper, cont.item.node);
                             const node = try this.tree.cans(oper.frob, past.node, exec.node);
 
@@ -685,6 +793,7 @@ pub const Handle = packed struct {
     item: u29 = 0,
 
     pub const none: Handle = .{ .kind = .none, .flip = 1, .item = std.math.maxInt(u29) };
+    pub const bolt: Handle = .{ .kind = .none, .flip = 0, .item = std.math.maxInt(u29) };
 
     pub fn make(kind: KontKind, flip: u1, idx: u29) Handle {
         return .{ .kind = kind, .flip = flip, .item = idx };
@@ -1163,10 +1272,11 @@ pub const Node = packed struct {
         return @bitCast(rune);
     }
 
-    pub fn fromOper(kind: Tag, frob: Frob, what: u21) Node {
+    pub fn fromOper(kind: Tag, frob: Frob, flip: u1, what: u21) Node {
         const oper: Oper = .{
             .kind = kind,
             .frob = frob,
+            .flip = flip,
             .item = what,
         };
         return @bitCast(oper);
@@ -1214,6 +1324,7 @@ pub const Heap = struct {
 pub const Tree = struct {
     bank: Bank,
     heap: Heap,
+    flip: u1 = 0,
     flatmemo: std.AutoHashMap(Node, Node),
     cansmemo: std.AutoHashMap(Pair, u22),
 
@@ -1221,6 +1332,7 @@ pub const Tree = struct {
         return .{
             .bank = bank,
             .heap = .{},
+            .flip = 0,
             .flatmemo = std.AutoHashMap(Node, Node).init(bank),
             .cansmemo = std.AutoHashMap(Pair, u22).init(bank),
         };
@@ -1236,14 +1348,14 @@ pub const Tree = struct {
         const pair = Pair{ .head = head, .tail = tail };
 
         if (tree.cansmemo.get(pair)) |idx| {
-            return Node.fromOper(.cans, frob, idx);
+            return Node.fromOper(.cans, frob, tree.flip, @intCast(idx));
         }
 
         const idx = tree.heap.cans.items.len;
         if (idx > std.math.maxInt(u22))
             return error.OutOfConses;
 
-        const node = Node.fromOper(.cans, frob, @intCast(idx));
+        const node = Node.fromOper(.cans, frob, tree.flip, @intCast(idx));
 
         try tree.heap.cans.append(tree.bank, pair);
         try tree.cansmemo.put(pair, @intCast(idx));
@@ -1401,7 +1513,7 @@ pub const Tree = struct {
                 const next: u21 = @intCast(tree.heap.fork.items.len);
                 try tree.heap.fork.append(tree.bank, .{ .head = head, .tail = tail });
 
-                break :blk Node.fromOper(.fork, oper.frob, next);
+                break :blk Node.fromOper(.fork, oper.frob, tree.flip, next);
             },
             .cans => unreachable,
         };
@@ -1469,13 +1581,24 @@ pub const Tree = struct {
     pub fn cons(tree: *Tree, frob: Frob, lhs: Node, rhs: Node) !Node {
         const next: u21 = @intCast(tree.heap.cons.items.len);
         try tree.heap.cons.append(tree.bank, .{ .head = lhs, .tail = rhs });
-        return Node.fromOper(.cons, frob, next);
+        return Node.fromOper(.cons, frob, tree.flip, next);
     }
 
     pub fn cans(tree: *Tree, frob: Frob, lhs: Node, rhs: Node) !Node {
-        const next: u21 = @intCast(tree.heap.cans.items.len);
+        const len = tree.heap.cans.items.len;
+        if (len > std.math.maxInt(u21)) {
+            log.err("cans heap overflow: len={} flip={} lhs={} rhs={} ptr={x}", .{
+                len,
+                tree.flip,
+                lhs.repr(),
+                rhs.repr(),
+                @intFromPtr(tree.heap.cans.items.ptr),
+            });
+            return error.OutOfConses;
+        }
+        const next: u21 = @intCast(len);
         try tree.heap.cans.append(tree.bank, .{ .head = lhs, .tail = rhs });
-        return Node.fromOper(.cans, frob, next);
+        return Node.fromOper(.cans, frob, tree.flip, next);
     }
 
     pub fn plus(tree: *Tree, lhs: Node, rhs: Node) !Node {
@@ -1517,7 +1640,7 @@ pub const Tree = struct {
     pub fn fork(tree: *Tree, lhs: Node, rhs: Node) !Node {
         const next: u21 = @intCast(tree.heap.fork.items.len);
         try tree.heap.fork.append(tree.bank, .{ .head = lhs, .tail = rhs });
-        return Node.fromOper(.fork, .{}, next);
+        return Node.fromOper(.fork, .{}, tree.flip, next);
     }
 
     /// Concatenate multiple nodes in sequence
@@ -2000,6 +2123,55 @@ test "warp with nest when head is non-zero" {
     try expectEmitString(&t, "AAAX\n     Y", outer);
 }
 
+test "GC runs during evaluation with low threshold" {
+    var tree = Tree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    // Create a document with many forks to stress the heap
+    var doc = try tree.text("start");
+    for (0..50) |i| {
+        const inline_ver = try tree.cat(&.{
+            try tree.text("inline"),
+            try tree.format(" {}", .{i}),
+        });
+        const multi_ver = try tree.cat(&.{
+            try tree.text("multi"),
+            Node.nl,
+            try tree.format(" {}", .{i}),
+        });
+        doc = try tree.plus(doc, try tree.fork(inline_ver, multi_ver));
+    }
+
+    const cost = F1.init(80);
+
+    // Use a very low GC threshold to force collection during evaluation
+    var loop = Loop{
+        .tree = &tree,
+        .cost = cost,
+        .memo = Memo.init(std.testing.allocator),
+        .flip = tree.flip,
+        .gc_threshold = 100, // Very low to trigger GC
+    };
+    defer loop.deinit();
+
+    try loop.pile.append(std.testing.allocator, .{
+        .node = doc,
+        .tick = .{ .eval = .{} },
+    });
+
+    std.debug.print("\n=== Running evaluation with GC enabled ===\n", .{});
+    const result = try loop.loop();
+
+    std.debug.print("Evaluation completed! Final heap: cons={} fork={} cans={}\n", .{
+        tree.heap.cons.items.len,
+        tree.heap.fork.items.len,
+        tree.heap.cans.items.len,
+    });
+
+    // Should have produced a result
+    try expect(result.idea.node != Node.halt);
+}
+
 test "tidy GC collects unreachable nodes and memo entries" {
     var tree = Tree.init(std.testing.allocator);
     defer tree.deinit();
@@ -2026,7 +2198,7 @@ test "tidy GC collects unreachable nodes and memo entries" {
         .tree = &tree,
         .cost = cost,
         .memo = Memo.init(std.testing.allocator),
-        .flip = 0,
+        .flip = tree.flip,
     };
     defer loop.deinit();
 
