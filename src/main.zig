@@ -67,7 +67,7 @@ pub fn main() !void {
         },
     };
 
-    const pipelines = try allocator.alloc(Pipeline, 1);
+    const pipelines = try allocator.alloc(Pipeline, 100);
     for (pipelines, 0..) |*p, i| {
         p.* = .{
             .name = try std.fmt.allocPrint(allocator, "pipeline-{d}", .{i}),

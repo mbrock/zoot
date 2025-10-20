@@ -1,8 +1,8 @@
 const std = @import("std");
-const TreePrinter = @import("TreePrinter.zig");
 const log = std.log;
 
 pub const Bank = std.mem.Allocator;
+const Pool = std.heap.MemoryPool;
 
 pub const Loop = struct {
     tree: *Tree,
@@ -19,32 +19,25 @@ pub const Loop = struct {
         cost: Cost,
         node: Node,
     ) !Best {
-        var pool = std.heap.MemoryPool(Kont).init(bank);
-        defer pool.deinit();
-
-        //        try pool.preheat(4096 * 64);
-
-        var memo = Memo.init(bank);
-        defer memo.deinit();
-
-        //        try memo.ensureTotalCapacity(4096);
-
         var pile = try std.ArrayList(Exec).initCapacity(bank, 256);
         defer pile.deinit(bank);
 
-        try pile.append(bank, .{
+        var icky: ?Idea = null;
+        var peak: usize = 0;
+        var stat = Stat{};
+
+        var pool = Pool(Kont).init(bank);
+        var memo = Memo.init(bank);
+        var best = std.ArrayList(Idea).empty;
+
+        defer pool.deinit();
+        defer memo.deinit();
+        defer best.deinit(bank);
+
+        pile.appendAssumeCapacity(.{
             .node = node,
             .tick = .{ .eval = .{} },
         });
-
-        var peak: usize = pile.items.len;
-        var stat = Stat{};
-
-        var best = std.ArrayList(Idea).empty;
-        defer best.deinit(bank);
-        try best.ensureTotalCapacity(bank, 16);
-
-        var icky: ?Idea = null;
 
         var this = @This(){
             .tree = tree,
