@@ -4,27 +4,346 @@ const log = std.log;
 pub const Bank = std.mem.Allocator;
 const Pool = std.heap.MemoryPool;
 
+pub const Pair = struct {
+    head: Node,
+    tail: Node,
+
+    pub const halt: Pair = just(.halt);
+
+    pub fn just(a: Node) Pair {
+        return .{ .head = a, .tail = .halt };
+    }
+
+    pub fn drag(node: *Node, room: *Room) !void {
+        try room.move(&node.head);
+        try room.move(&node.tail);
+    }
+};
+
+const Hack = struct {
+    mark: [:0]const u8,
+    word: [:0]const u8,
+
+    pub fn make(T: type) Hack {
+        switch (@typeInfo(T)) {
+            .@"struct" => |@"struct"| {
+                var mark: ?std.builtin.Type.StructField = null;
+                var word: ?std.builtin.Type.StructField = null;
+                for (@"struct".fields) |x| {
+                    if (@sizeOf(x.type) == 4) {
+                        if (mark == null)
+                            mark = x
+                        else if (word == null)
+                            word = x;
+                    }
+                }
+                if (mark != null and word != null)
+                    return .{ .mark = mark.?.name, .word = word.?.name };
+            },
+            else => {},
+        }
+        @compileError("need two 32 bit fields");
+    }
+};
+
+pub fn Rack(Elem: type) type {
+    const hack = Hack.make(Elem);
+
+    return struct {
+        list: std.ArrayList(Elem) = .empty,
+        scan: usize = 0,
+
+        pub const empty: @This() = .{};
+
+        pub fn burn(rack: *@This(), item: usize, word: u32) void {
+            var elem = &rack.list.items[item];
+            @as(*u32, @ptrCast(&@field(elem, hack.mark))).* = 0xffffaaaa;
+            @as(*u32, @ptrCast(&@field(elem, hack.word))).* = word;
+        }
+
+        pub fn look(rack: *@This(), item: usize) ?u32 {
+            const elem = rack.list.items[item];
+            return switch (@as(u32, @bitCast(@field(elem, hack.mark)))) {
+                0xffffaaaa => @as(u32, @bitCast(@field(elem, hack.word))),
+                else => null,
+            };
+        }
+
+        pub fn push(rack: *@This(), bank: Bank, elem: Elem) !u32 {
+            const item = rack.list.items.len;
+
+            try rack.list.append(bank, elem);
+            return @intCast(item);
+        }
+
+        pub fn calm(rack: @This()) bool {
+            return rack.scan == rack.list.items.len;
+        }
+
+        pub fn rift(rack: *@This()) []Elem {
+            return rack.list.items[rack.scan..];
+        }
+
+        pub fn pull(this: *@This(), room: *Room) !void {
+            for (this.rift()) |*elem| {
+                try elem.drag(room);
+                this.scan += 1;
+            }
+        }
+
+        pub fn deinit(rack: *@This(), bank: Bank) void {
+            rack.list.deinit(bank);
+        }
+    };
+}
+
+pub const Heap = struct {
+    cons: Rack(Pair) = .empty,
+    fork: Rack(Pair) = .empty,
+    cans: Rack(Pair) = .empty,
+    kone: Rack(Kone) = .empty,
+    ktwo: Rack(Ktwo) = .empty,
+
+    pub fn deinit(this: *@This(), alloc: Bank) void {
+        this.cons.deinit(alloc);
+        this.fork.deinit(alloc);
+        this.cans.deinit(alloc);
+        this.kone.deinit(alloc);
+        this.ktwo.deinit(alloc);
+    }
+
+    pub fn calm(this: @This()) bool {
+        return this.cons.calm() and
+            this.fork.calm() and
+            this.cans.calm() and
+            this.kone.calm() and
+            this.ktwo.calm();
+    }
+
+    pub fn pull(this: *@This(), room: *Room) !void {
+        try this.cons.pull(room);
+        try this.fork.pull(room);
+        try this.cans.pull(room);
+        try this.kone.pull(room);
+        try this.ktwo.pull(room);
+    }
+};
+
+pub const Room = struct {
+    heap: [2]Heap,
+    flap: u1 = 0,
+
+    pub fn move(room: *Room, bank: Bank, that: anytype) !void {
+        that.* = that.warp(room, bank);
+    }
+
+    pub fn pull(room: *Room) !void {
+        try room.heap[room.flap].pull(room);
+    }
+};
+
+/// 32-bit handle to either terminal or operation; implicitly indexes
+/// into some `Tree` aggregate.
+pub const Node = packed struct {
+    tag: Tag,
+    data: u29 = 0,
+
+    pub fn calm(this: Node, flap: u1) bool {
+        return switch (this.look()) {
+            .cons, .cans, .fork => view(Oper, this).flip == flap,
+            else => true,
+        };
+    }
+
+    pub fn warp(
+        word: Node,
+        room: *Room,
+        bank: Bank,
+    ) !Node {
+        if (word.calm(room.flap)) return word;
+
+        const heap = &room.heap[room.flap];
+        const leap = &room.heap[room.flap ^ 1];
+
+        const rack: *Rack(Pair) = word.rack(heap);
+        const wack: *Rack(Pair) = word.rack(leap);
+
+        if (rack.look(word.unit())) |turn|
+            return @bitCast(turn);
+
+        const data: Pair = rack.list.items[word.unit()];
+        const next = try wack.push(bank, data);
+
+        const bird: Node = word.onto(@intCast(next));
+
+        rack.burn(word.unit, @bitCast(bird));
+
+        return bird;
+    }
+
+    pub fn onto(this: Node, unit: u21) Node {
+        var oper = view(Oper, this);
+        oper.item = unit;
+        oper.flip ^= 1;
+        return oper;
+    }
+
+    pub const Form = Tag;
+
+    pub const Look = union(Tag) {
+        span: Span,
+        quad: Quad,
+        trip: Trip,
+        rune: Rune,
+        cons: Oper,
+        fork: Oper,
+        cans: Oper,
+    };
+
+    pub const Edit = union(Tag) {
+        span: *Span,
+        quad: *Quad,
+        trip: *Trip,
+        rune: *Rune,
+        cons: *Oper,
+        fork: *Oper,
+        cans: *Oper,
+    };
+
+    pub const halt = Node.fromRune(0, 0);
+
+    pub fn view(comptime T: type, this: Node) T {
+        return @bitCast(this);
+    }
+
+    fn mut(comptime T: type, this: *Node) *T {
+        return @ptrCast(@alignCast(this));
+    }
+
+    pub fn easy(this: Node) bool {
+        return this.tag != .cons and this.tag != .fork;
+    }
+
+    pub fn look(this: Node) Look {
+        return switch (this.tag) {
+            .span => .{ .span = view(Span, this) },
+            .quad => .{ .quad = view(Quad, this) },
+            .trip => .{ .trip = view(Trip, this) },
+            .rune => .{ .rune = view(Rune, this) },
+            .cons => .{ .cons = view(Oper, this) },
+            .fork => .{ .fork = view(Oper, this) },
+            .cans => .{ .cans = view(Oper, this) },
+        };
+    }
+
+    pub fn load(this: Node, heap: *const Heap) Pair {
+        return switch (this.look()) {
+            .cons => |cons| heap.cons.items[cons.item],
+            .fork => |fork| heap.fork.items[fork.item],
+            .cans => |cans| heap.cans.items[cans.item],
+            else => unreachable,
+        };
+    }
+
+    pub fn edit(this: *Node) Edit {
+        return switch (this.tag) {
+            .span => .{ .span = mut(Span, this) },
+            .quad => .{ .quad = mut(Quad, this) },
+            .trip => .{ .trip = mut(Trip, this) },
+            .rune => .{ .rune = mut(Rune, this) },
+            .cons => .{ .cons = mut(Oper, this) },
+            .fork => .{ .fork = mut(Oper, this) },
+            .cans => .{ .cans = mut(Oper, this) },
+        };
+    }
+
+    pub fn isTerminal(this: Node) bool {
+        return switch (this.tag) {
+            .span, .quad, .trip, .rune => true,
+            else => false,
+        };
+    }
+
+    pub fn isEmptyText(this: Node) bool {
+        return switch (this.look()) {
+            .rune => |rune| rune.isEmpty(),
+            else => false,
+        };
+    }
+
+    pub fn repr(this: Node) u32 {
+        return @bitCast(this);
+    }
+
+    pub fn fromSpan(side: Side, char: u7, text: u21) Node {
+        const span: Span = .{
+            .side = side,
+            .char = char,
+            .text = text,
+        };
+        return @bitCast(span);
+    }
+
+    pub fn fromQuad(chars: [4]u7) Node {
+        const quad: Quad = .{
+            .ch0 = chars[0],
+            .ch1 = chars[1],
+            .ch2 = chars[2],
+            .ch3 = chars[3],
+        };
+        return @bitCast(quad);
+    }
+
+    pub fn fromTrip(reps: u3, bytes: [3]u8) Node {
+        const trip: Trip = .{
+            .reps = reps,
+            .byte0 = bytes[0],
+            .byte1 = bytes[1],
+            .byte2 = bytes[2],
+        };
+        return @bitCast(trip);
+    }
+
+    pub fn fromRune(reps: u6, code: u21) Node {
+        const rune: Rune = .{
+            .reps = reps,
+            .code = code,
+        };
+        return @bitCast(rune);
+    }
+
+    pub fn fromOper(kind: Tag, frob: Frob, flip: u1, what: u21) Node {
+        const oper: Oper = .{
+            .kind = kind,
+            .frob = frob,
+            .flip = flip,
+            .item = what,
+        };
+        return @bitCast(oper);
+    }
+
+    pub const nl: Node = Node.fromRune(1, '\n');
+};
+
 /// Cheney-style compacting GC pass.
 pub const Tidy = struct {
     const tags: [3]Tag = .{ .cans, .cons, .fork };
 
     loop: *Loop,
     doop: Loop,
-    wave: std.EnumArray(Tag, u21) = .initFill(0),
-    kont_head_wave: u29 = 0,
-    kont_tail_wave: u29 = 0,
 
     pub fn tidy(boop: *Loop) !Loop {
         std.debug.assert(boop.tree.flip == boop.flip);
         const new_flip: u1 = if (boop.flip == 0) 1 else 0;
 
-        // Allocate new tree for new space
         const new_tree = try boop.tree.bank.create(Tree);
         new_tree.* = Tree.init(boop.tree.bank);
         new_tree.flip = new_flip;
 
-        // Copy the text heap wholesale - terminal nodes reference it
-        try new_tree.heap.text.appendSlice(boop.tree.bank, boop.tree.heap.text.items);
+        try new_tree.blob.appendSlice(
+            boop.tree.bank,
+            boop.tree.blob.items,
+        );
 
         var this = Tidy{
             .loop = boop,
@@ -74,19 +393,24 @@ pub const Tidy = struct {
                 var pastfeed = this.past(tag);
                 var nextfeed = this.list(tag);
 
-                var pair = &pastfeed.items[oper.item];
-                if (pair.head == Node.bolt) return pair.tail;
+                if (pastfeed.look(oper.item)) |turn| {
+                    return @bitCast(turn);
+                }
 
-                const i = nextfeed.items.len;
-                try nextfeed.append(this.loop.tree.bank, .{ .head = pair.head, .tail = pair.tail });
+                const i = try nextfeed.push(
+                    this.loop.tree.bank,
+                    pastfeed.list.items[oper.item],
+                );
 
                 var next_oper = oper;
                 next_oper.flip = this.doop.flip;
-                next_oper.item = @intCast(i);
+                if (std.math.cast(u21, i)) |j|
+                    next_oper.item = j
+                else
+                    std.debug.panic("big {d} for {t}", .{ i, tag });
                 const next: Node = @bitCast(next_oper);
 
-                pair.head = Node.bolt;
-                pair.tail = next;
+                pastfeed.burn(oper.item, @bitCast(next));
 
                 return next;
             },
@@ -106,10 +430,10 @@ pub const Tidy = struct {
     }
 
     fn size(this: *Tidy, comptime tag: Tag) u21 {
-        return @intCast(this.list(tag).items.len);
+        return @intCast(this.list(tag).list.items.len);
     }
 
-    fn list(this: *Tidy, comptime tag: Tag) *std.ArrayList(Pair) {
+    fn list(this: *Tidy, comptime tag: Tag) *Rack(Pair) {
         return switch (tag) {
             .cans => &this.doop.tree.heap.cans,
             .cons => &this.doop.tree.heap.cons,
@@ -118,7 +442,7 @@ pub const Tidy = struct {
         };
     }
 
-    fn past(this: *Tidy, comptime tag: Tag) *std.ArrayList(Pair) {
+    fn past(this: *Tidy, comptime tag: Tag) *Rack(Pair) {
         return switch (tag) {
             .cans => &this.loop.tree.heap.cans,
             .cons => &this.loop.tree.heap.cons,
@@ -129,14 +453,14 @@ pub const Tidy = struct {
 
     fn calm(this: *Tidy) bool {
         inline for (tags) |tag| {
-            if (this.wave.get(tag) < this.size(tag))
+            if (this.list(tag).scan < this.size(tag))
                 return false;
         }
 
-        if (this.kont_head_wave < this.doop.tree.heap.kont_head.items.len)
+        if (this.doop.tree.heap.kone.scan < this.doop.tree.heap.kone.list.items.len)
             return false;
 
-        if (this.kont_tail_wave < this.doop.tree.heap.kont_tail.items.len)
+        if (this.doop.tree.heap.ktwo.scan < this.doop.tree.heap.ktwo.list.items.len)
             return false;
 
         return true;
@@ -144,71 +468,64 @@ pub const Tidy = struct {
 
     fn pull(this: *Tidy, comptime tag: Tag) !void {
         const feed = this.list(tag);
-        var i = this.wave.get(tag);
-        while (i < feed.items.len) : (i += 1) {
+        var i: u21 = @intCast(feed.scan);
+        while (i < feed.list.items.len) : (i += 1) {
             try this.drag(feed, i);
         }
-        this.wave.set(tag, i);
+        feed.scan = i;
     }
 
     fn drag(
         this: *Tidy,
-        feed: *std.ArrayList(Pair),
+        feed: *Rack(Pair),
         item: u21,
     ) !void {
-        const head = try this.copy(feed.items[item].head);
-        feed.items[item].head = head;
+        const elem = feed.list.items[item];
+        const head = try this.copy(elem.head);
+        feed.list.items[item].head = head;
 
-        const tail = try this.copy(feed.items[item].tail);
-        feed.items[item].tail = tail;
+        const tail = try this.copy(elem.tail);
+        feed.list.items[item].tail = tail;
     }
 
-    fn copy_kont(this: *Tidy, handle: Handle) !Handle {
-        if (handle.kind == .none) return Handle.none;
+    fn copy_kont(this: *Tidy, handle: Kont) !Kont {
+        if (handle.kind == .none) return Kont.none;
 
         // If handle already has new flip bit, it's already in new space
         if (handle.flip == this.doop.flip) return handle;
 
         return switch (handle.kind) {
             .head => blk: {
-                var kont = &this.loop.tree.heap.kont_head.items[handle.item];
+                var rack = &this.loop.tree.heap.kone;
+                const kont = this.loop.tree.heap.kone.list.items[handle.item];
 
-                // Check if already forwarded using sentinel marker
-                if (kont.node == Node.bolt) {
-                    // Forwarding address stored in .then
-                    break :blk kont.then;
+                if (rack.look(handle.item)) |turn| {
+                    break :blk @bitCast(turn);
                 }
 
-                // Copy to new space
-                const new_idx: u29 = @intCast(this.doop.tree.heap.kont_head.items.len);
-                const new_kont = kont.*;
-                try this.doop.tree.heap.kont_head.append(this.loop.tree.bank, new_kont);
+                const new_idx: u29 = @intCast(
+                    try this.doop.tree.heap.kone.push(this.loop.tree.bank, kont),
+                );
 
-                // Leave forwarding pointer (use bolt sentinel + new handle in .then)
-                const new_handle = Handle.make(.head, this.doop.flip, new_idx);
-                kont.node = Node.bolt;
-                kont.then = new_handle;
+                const new_handle = Kont.make(.head, this.doop.flip, new_idx);
+                rack.burn(handle.item, @bitCast(new_handle));
 
                 break :blk new_handle;
             },
             .tail => blk: {
-                var kont = &this.loop.tree.heap.kont_tail.items[handle.item];
+                var rack = &this.loop.tree.heap.ktwo;
+                const kont = this.loop.tree.heap.ktwo.list.items[handle.item];
 
-                // Check if already forwarded using sentinel marker
-                if (kont.idea.node == Node.bolt) {
-                    // Forwarding address stored in .then
-                    break :blk kont.then;
+                if (rack.look(handle.item)) |turn| {
+                    break :blk @bitCast(turn);
                 }
 
-                // Copy to new space
-                const new_idx: u29 = @intCast(this.doop.tree.heap.kont_tail.items.len);
-                const new_kont = kont.*;
-                try this.doop.tree.heap.kont_tail.append(this.loop.tree.bank, new_kont);
+                const new_idx: u29 = @intCast(
+                    try this.doop.tree.heap.ktwo.push(this.loop.tree.bank, kont),
+                );
 
-                // Leave forwarding pointer (use bolt sentinel + new handle in .then)
-                const new_handle = Handle.make(.tail, this.doop.flip, new_idx);
-                kont.idea.node = Node.bolt;
-                kont.then = new_handle;
+                const new_handle = Kont.make(.tail, this.doop.flip, new_idx);
+                rack.burn(handle.item, @bitCast(new_handle));
 
                 break :blk new_handle;
             },
@@ -217,50 +534,41 @@ pub const Tidy = struct {
     }
 
     fn pull_kont_heads(this: *Tidy) !void {
-        var i = this.kont_head_wave;
-        while (i < this.doop.tree.heap.kont_head.items.len) : (i += 1) {
-            try this.drag_kont_head(i);
+        var i = this.doop.tree.heap.kone.scan;
+        while (i < this.doop.tree.heap.kone.list.items.len) : (i += 1) {
+            try this.drag_kont_head(@intCast(i));
         }
-        this.kont_head_wave = i;
+        this.doop.tree.heap.kone.scan = i;
     }
 
     fn pull_kont_tails(this: *Tidy) !void {
-        var i = this.kont_tail_wave;
-        while (i < this.doop.tree.heap.kont_tail.items.len) : (i += 1) {
-            try this.drag_kont_tail(i);
+        var i = this.doop.tree.heap.ktwo.scan;
+        while (i < this.doop.tree.heap.ktwo.list.items.len) : (i += 1) {
+            try this.drag_kont_tail(@intCast(i));
         }
-        this.kont_tail_wave = i;
+        this.doop.tree.heap.ktwo.scan = i;
     }
 
-    // fn drag_kont_head(this: *Tidy, item: u29) !void {
-    //     var kont = &this.doop.tree.heap.kont_head.items[item];
-
-    //     // Copy nodes inside the kont
-    //     kont.node = try this.copy(kont.node);
-    //     kont.item.node = try this.copy(kont.item.node);
-
-    //     // Copy the continuation chain
-    //     kont.then = try this.copy_kont(kont.then);
-    // }
-
     fn drag_kont_head(this: *Tidy, item: u29) !void {
-        const node = try this.copy(this.doop.tree.heap.kont_head.items[item].node);
-        const item_node = try this.copy(this.doop.tree.heap.kont_head.items[item].item.node);
-        const then = try this.copy_kont(this.doop.tree.heap.kont_head.items[item].then);
+        const elem = this.doop.tree.heap.kone.list.items[item];
+        const node = try this.copy(elem.node);
+        const item_node = try this.copy(elem.item.node);
+        const then = try this.copy_kont(elem.then);
 
-        this.doop.tree.heap.kont_head.items[item].node = node;
-        this.doop.tree.heap.kont_head.items[item].item.node = item_node;
-        this.doop.tree.heap.kont_head.items[item].then = then;
+        this.doop.tree.heap.kone.list.items[item].node = node;
+        this.doop.tree.heap.kone.list.items[item].item.node = item_node;
+        this.doop.tree.heap.kone.list.items[item].then = then;
     }
 
     fn drag_kont_tail(this: *Tidy, item: u29) !void {
-        const ideanode = try this.copy(this.doop.tree.heap.kont_tail.items[item].idea.node);
-        const itemnode = try this.copy(this.doop.tree.heap.kont_tail.items[item].item.node);
-        const then = try this.copy_kont(this.doop.tree.heap.kont_tail.items[item].then);
+        const elem = this.doop.tree.heap.ktwo.list.items[item];
+        const ideanode = try this.copy(elem.node);
+        const itemnode = try this.copy(elem.item.node);
+        const then = try this.copy_kont(elem.then);
 
-        var kont = &this.doop.tree.heap.kont_tail.items[item];
+        var kont = &this.doop.tree.heap.ktwo.list.items[item];
 
-        kont.idea.node = ideanode;
+        kont.node = ideanode;
         kont.item.node = itemnode;
         kont.then = then;
     }
@@ -270,12 +578,11 @@ pub const Tidy = struct {
             inline .cans, .cons, .fork => |tag| {
                 const oper = Node.view(Oper, node);
                 const pastfeed = this.past(tag);
-                if (oper.item >= pastfeed.items.len) return null;
-                const pair = &pastfeed.items[oper.item];
-
-                // Check if this was forwarded (bolt marker)
-                if (pair.head == Node.bolt) return pair.tail;
-                return null;
+                if (oper.item >= pastfeed.list.items.len) return null;
+                if (pastfeed.look(oper.item)) |turn|
+                    return @bitCast(turn)
+                else
+                    return null;
             },
             else => node, // Terminal nodes don't need forwarding
         };
@@ -320,9 +627,9 @@ pub const Loop = struct {
     }
 
     fn should_gc(this: *@This()) bool {
-        const heap_size = this.tree.heap.cons.items.len +
-            this.tree.heap.fork.items.len +
-            this.tree.heap.cans.items.len;
+        const heap_size = this.tree.heap.cons.list.items.len +
+            this.tree.heap.fork.list.items.len +
+            this.tree.heap.cans.list.items.len;
         return heap_size > this.gc_threshold;
     }
 
@@ -330,13 +637,13 @@ pub const Loop = struct {
         if (!this.should_gc()) return;
 
         log.info("GC triggered: heap_size={} threshold={}", .{
-            this.tree.heap.cons.items.len + this.tree.heap.fork.items.len + this.tree.heap.cans.items.len,
+            this.tree.heap.cons.list.items.len + this.tree.heap.fork.list.items.len + this.tree.heap.cans.list.items.len,
             this.gc_threshold,
         });
 
-        const old_heap_size = this.tree.heap.cons.items.len +
-            this.tree.heap.fork.items.len +
-            this.tree.heap.cans.items.len;
+        const old_heap_size = this.tree.heap.cons.list.items.len +
+            this.tree.heap.fork.list.items.len +
+            this.tree.heap.cans.list.items.len;
         const old_memo_size = this.memo.count();
 
         // Run GC
@@ -357,9 +664,9 @@ pub const Loop = struct {
         new_loop.tree.deinit();
         new_loop.tree.bank.destroy(new_loop.tree);
 
-        const new_heap_size = this.tree.heap.cons.items.len +
-            this.tree.heap.fork.items.len +
-            this.tree.heap.cans.items.len;
+        const new_heap_size = this.tree.heap.cons.list.items.len +
+            this.tree.heap.fork.list.items.len +
+            this.tree.heap.cans.list.items.len;
         const new_memo_size = this.memo.count();
 
         log.info("GC completed: heap {} -> {}, memo {} -> {}", .{
@@ -482,16 +789,14 @@ pub const Loop = struct {
         }
     }
 
-    pub fn punt_head(this: *@This(), kont: KontHead) !Handle {
-        const idx: u29 = @intCast(this.tree.heap.kont_head.items.len);
-        try this.tree.heap.kont_head.append(this.tree.bank, kont);
-        return Handle.make(.head, this.flip, idx);
+    pub fn punt_head(this: *@This(), kont: Kone) !Kont {
+        const idx: u29 = @intCast(try this.tree.heap.kone.push(this.tree.bank, kont));
+        return Kont.make(.head, this.flip, idx);
     }
 
-    pub fn punt_tail(this: *@This(), kont: KontTail) !Handle {
-        const idx: u29 = @intCast(this.tree.heap.kont_tail.items.len);
-        try this.tree.heap.kont_tail.append(this.tree.bank, kont);
-        return Handle.make(.tail, this.flip, idx);
+    pub fn punt_tail(this: *@This(), kont: Ktwo) !Kont {
+        const idx: u29 = @intCast(try this.tree.heap.ktwo.push(this.tree.bank, kont));
+        return Kont.make(.tail, this.flip, idx);
     }
 
     /// Advance the CEK machine by a single step.
@@ -551,7 +856,7 @@ pub const Loop = struct {
                         return;
                     },
                     .cons => |oper| {
-                        const cons = this.tree.heap.cons.items[oper.item];
+                        const cons = this.tree.heap.cons.list.items[oper.item];
 
                         // Apply local indent state to the crux.
                         if (oper.frob.warp == 1) crux.warp();
@@ -580,7 +885,7 @@ pub const Loop = struct {
                         return;
                     },
                     .fork => |fork| {
-                        const pair = this.tree.heap.fork.items[fork.item];
+                        const pair = this.tree.heap.fork.list.items[fork.item];
 
                         // Apply local indent state to the crux.
                         if (fork.frob.warp == 1) crux.warp();
@@ -610,7 +915,7 @@ pub const Loop = struct {
                     switch (exec.then.kind) {
                         .head => {
                             // We have evaluated the head of a cons.
-                            const cont = &this.tree.heap.kont_head.items[exec.then.item];
+                            const cont = &this.tree.heap.kone.list.items[exec.then.item];
 
                             const node = exec.node;
                             const gist = exec.tick.give;
@@ -628,10 +933,8 @@ pub const Loop = struct {
                                 // Remember the followup continuation.
                                 .then = cont.then,
                                 // Remember the evaluation result of the head.
-                                .idea = .{
-                                    .gist = gist,
-                                    .node = node,
-                                },
+                                .gist = gist,
+                                .node = node,
                             });
 
                             // Set the tail evaluation context.
@@ -652,9 +955,9 @@ pub const Loop = struct {
                         },
                         .tail => {
                             // We have evaluated both the head and the tail of a cons.
-                            const cont = &this.tree.heap.kont_tail.items[exec.then.item];
+                            const cont = &this.tree.heap.ktwo.list.items[exec.then.item];
 
-                            const past = cont.idea;
+                            const past = cont;
                             const curr = exec.tick.give;
 
                             // Combine the head & tail gists into a gist for the whole cons.
@@ -665,14 +968,14 @@ pub const Loop = struct {
                             // Both sides of the cons may have been forking nodes.
                             // Make a forkless cons node from the resolved head and tail nodes.
                             if (std.debug.runtime_safety) {
-                                const cans_len = this.tree.heap.cans.items.len;
+                                const cans_len = this.tree.heap.cans.list.items.len;
                                 if (cans_len > std.math.maxInt(u21)) {
                                     log.err(
                                         "pre-cans len overflow: len={} flip={} head_ptr={x}",
                                         .{
                                             cans_len,
                                             this.tree.flip,
-                                            @intFromPtr(this.tree.heap.cans.items.ptr),
+                                            @intFromPtr(this.tree.heap.cans.list.items.ptr),
                                         },
                                     );
                                 }
@@ -770,7 +1073,7 @@ pub const Exec = struct {
         eval: Crux,
         give: Gist,
     },
-    then: Handle = Handle.none,
+    then: Kont = Kont.none,
 };
 
 pub const Item = packed struct {
@@ -787,38 +1090,90 @@ pub const KontKind = enum(u2) {
     tail = 2,
 };
 
-pub const Handle = packed struct {
+pub const Kont = packed struct {
     kind: KontKind = .none,
     flip: u1 = 0,
     item: u29 = 0,
 
-    pub const none: Handle = .{ .kind = .none, .flip = 1, .item = std.math.maxInt(u29) };
-    pub const bolt: Handle = .{ .kind = .none, .flip = 0, .item = std.math.maxInt(u29) };
+    pub const none: Kont = .{ .kind = .none, .flip = 1, .item = std.math.maxInt(u29) };
 
-    pub fn make(kind: KontKind, flip: u1, idx: u29) Handle {
+    pub fn make(kind: KontKind, flip: u1, idx: u29) Kont {
         return .{ .kind = kind, .flip = flip, .item = idx };
+    }
+
+    pub fn calm(this: Kont, flap: u1) bool {
+        return this.flip == flap;
+    }
+
+    pub fn warp(
+        word: Kont,
+        room: *Room,
+        bank: Bank,
+    ) !Kont {
+        if (word.calm(room.flap)) return word;
+
+        const heap = &room.heap[room.flap];
+        const leap = &room.heap[room.flap ^ 1];
+
+        switch (word.kind) {
+            .head => {
+                const rack: *Rack(Kone) = &heap.kone;
+                const wack: *Rack(Kone) = &leap.kone;
+
+                if (rack.look(word.item)) |turn|
+                    return @bitCast(turn);
+
+                const data: Kone = rack.list.items[word.item];
+                const next = try wack.push(bank, data);
+
+                const bird: Kont = word.onto(@intCast(next));
+
+                rack.burn(word.item, @bitCast(bird));
+
+                return bird;
+            },
+
+            .tail => {
+                const rack: *Rack(Ktwo) = &heap.ktwo;
+                const wack: *Rack(Ktwo) = &leap.ktwo;
+
+                if (rack.look(word.item)) |turn|
+                    return @bitCast(turn);
+
+                const data: Ktwo = rack.list.items[word.item];
+                const next = try wack.push(bank, data);
+
+                const bird: Kont = word.onto(@intCast(next));
+
+                rack.burn(word.item, @bitCast(bird));
+
+                return bird;
+            },
+
+            else => return word,
+        }
+    }
+
+    pub fn onto(this: Kont, unit: u21) Kont {
+        var that = this;
+        that.item = unit;
+        that.flip ^= 1;
+        return that;
     }
 };
 
-pub const KontHead = packed struct {
+pub const Kone = struct {
     node: Node,
     base: u16,
     item: Item,
-    then: Handle,
-
-    comptime {
-        std.debug.assert(@sizeOf(KontHead) == 32);
-    }
+    then: Kont,
 };
 
-pub const KontTail = packed struct {
-    idea: Idea,
+pub const Ktwo = struct {
+    node: Node,
+    gist: Gist,
     item: Item,
-    then: Handle,
-
-    comptime {
-        std.debug.assert(@sizeOf(KontTail) == 32);
-    }
+    then: Kont,
 };
 
 /// Cost metric selection - either F1 (linear overflow) or F2 (squared overflow).
@@ -962,7 +1317,7 @@ pub const Span = packed struct {
             }
         }
 
-        const tail = tree.heap.text.items[self.text..];
+        const tail = tree.blob.items[self.text..];
         const text = std.mem.sliceTo(tail, 0);
         const text_len: u16 = @intCast(text.len);
         if (text_len != 0) {
@@ -1141,179 +1496,6 @@ pub const Oper = packed struct {
     item: u21 = 0,
 };
 
-/// 32-bit handle to either terminal or operation; implicitly indexes
-/// into some `Tree` aggregate.
-pub const Node = packed struct {
-    tag: Tag,
-    data: u29 = 0,
-
-    pub const Form = Tag;
-
-    pub const Look = union(Tag) {
-        span: Span,
-        quad: Quad,
-        trip: Trip,
-        rune: Rune,
-        cons: Oper,
-        fork: Oper,
-        cans: Oper,
-    };
-
-    pub const Edit = union(Tag) {
-        span: *Span,
-        quad: *Quad,
-        trip: *Trip,
-        rune: *Rune,
-        cons: *Oper,
-        fork: *Oper,
-        cans: *Oper,
-    };
-
-    pub const halt = Node.fromRune(0, 0);
-    pub const bolt = Node.fromRune(0, 0x1A);
-
-    pub fn view(comptime T: type, this: Node) T {
-        return @bitCast(this);
-    }
-
-    fn mut(comptime T: type, this: *Node) *T {
-        return @ptrCast(@alignCast(this));
-    }
-
-    pub fn easy(this: Node) bool {
-        return this.tag != .cons and this.tag != .fork;
-    }
-
-    pub fn look(this: Node) Look {
-        return switch (this.tag) {
-            .span => .{ .span = view(Span, this) },
-            .quad => .{ .quad = view(Quad, this) },
-            .trip => .{ .trip = view(Trip, this) },
-            .rune => .{ .rune = view(Rune, this) },
-            .cons => .{ .cons = view(Oper, this) },
-            .fork => .{ .fork = view(Oper, this) },
-            .cans => .{ .cans = view(Oper, this) },
-        };
-    }
-
-    pub fn load(this: Node, heap: *const Heap) Pair {
-        return switch (this.look()) {
-            .cons => |cons| heap.cons.items[cons.item],
-            .fork => |fork| heap.fork.items[fork.item],
-            .cans => |cans| heap.cans.items[cans.item],
-            else => unreachable,
-        };
-    }
-
-    pub fn edit(this: *Node) Edit {
-        return switch (this.tag) {
-            .span => .{ .span = mut(Span, this) },
-            .quad => .{ .quad = mut(Quad, this) },
-            .trip => .{ .trip = mut(Trip, this) },
-            .rune => .{ .rune = mut(Rune, this) },
-            .cons => .{ .cons = mut(Oper, this) },
-            .fork => .{ .fork = mut(Oper, this) },
-            .cans => .{ .cans = mut(Oper, this) },
-        };
-    }
-
-    pub fn isTerminal(this: Node) bool {
-        return switch (this.tag) {
-            .span, .quad, .trip, .rune => true,
-            else => false,
-        };
-    }
-
-    pub fn isEmptyText(this: Node) bool {
-        return switch (this.look()) {
-            .rune => |rune| rune.isEmpty(),
-            else => false,
-        };
-    }
-
-    pub fn repr(this: Node) u32 {
-        return @bitCast(this);
-    }
-
-    pub fn fromSpan(side: Side, char: u7, text: u21) Node {
-        const span: Span = .{
-            .side = side,
-            .char = char,
-            .text = text,
-        };
-        return @bitCast(span);
-    }
-
-    pub fn fromQuad(chars: [4]u7) Node {
-        const quad: Quad = .{
-            .ch0 = chars[0],
-            .ch1 = chars[1],
-            .ch2 = chars[2],
-            .ch3 = chars[3],
-        };
-        return @bitCast(quad);
-    }
-
-    pub fn fromTrip(reps: u3, bytes: [3]u8) Node {
-        const trip: Trip = .{
-            .reps = reps,
-            .byte0 = bytes[0],
-            .byte1 = bytes[1],
-            .byte2 = bytes[2],
-        };
-        return @bitCast(trip);
-    }
-
-    pub fn fromRune(reps: u6, code: u21) Node {
-        const rune: Rune = .{
-            .reps = reps,
-            .code = code,
-        };
-        return @bitCast(rune);
-    }
-
-    pub fn fromOper(kind: Tag, frob: Frob, flip: u1, what: u21) Node {
-        const oper: Oper = .{
-            .kind = kind,
-            .frob = frob,
-            .flip = flip,
-            .item = what,
-        };
-        return @bitCast(oper);
-    }
-
-    pub const nl: Node = Node.fromRune(1, '\n');
-};
-
-pub const Pair = packed struct {
-    head: Node,
-    tail: Node,
-
-    pub const halt: Pair = just(.halt);
-
-    pub fn just(a: Node) Pair {
-        return .{ .head = a, .tail = .halt };
-    }
-};
-
-pub const Heap = struct {
-    text: std.ArrayList(u8) = .empty,
-    cons: std.ArrayList(Pair) = .empty,
-    fork: std.ArrayList(Pair) = .empty,
-    cans: std.ArrayList(Pair) = .empty,
-    kont_head: std.ArrayList(KontHead) = .empty,
-    kont_tail: std.ArrayList(KontTail) = .empty,
-
-    pub fn deinit(this: *@This(), alloc: Bank) void {
-        this.text.deinit(alloc);
-        this.cons.deinit(alloc);
-        this.fork.deinit(alloc);
-        this.cans.deinit(alloc);
-        this.kont_head.deinit(alloc);
-        this.kont_tail.deinit(alloc);
-    }
-};
-
 /// This is the aggregate root of a pretty printing syntax tree,
 /// or a document layout specification.
 ///
@@ -1324,6 +1506,7 @@ pub const Heap = struct {
 pub const Tree = struct {
     bank: Bank,
     heap: Heap,
+    blob: std.ArrayList(u8),
     flip: u1 = 0,
     flatmemo: std.AutoHashMap(Node, Node),
     cansmemo: std.AutoHashMap(Pair, u22),
@@ -1332,6 +1515,7 @@ pub const Tree = struct {
         return .{
             .bank = bank,
             .heap = .{},
+            .blob = .empty,
             .flip = 0,
             .flatmemo = std.AutoHashMap(Node, Node).init(bank),
             .cansmemo = std.AutoHashMap(Pair, u22).init(bank),
@@ -1340,6 +1524,7 @@ pub const Tree = struct {
 
     pub fn deinit(tree: *Tree) void {
         tree.heap.deinit(tree.bank);
+        tree.blob.deinit(tree.bank);
         tree.flatmemo.deinit();
         tree.cansmemo.deinit();
     }
@@ -1403,7 +1588,7 @@ pub const Tree = struct {
                 if (span.char != 0 and span.side == .lchr)
                     try emitChar(sink, ctx, span.char);
 
-                const tail = tree.heap.text.items[span.text..];
+                const tail = tree.blob.items[span.text..];
                 const slice = std.mem.sliceTo(tail, 0);
                 if (slice.len != 0) {
                     try sink.writeAll(slice);
@@ -1433,7 +1618,7 @@ pub const Tree = struct {
                 }
             },
             .cons => |oper| {
-                const pair = tree.heap.cons.items[oper.item];
+                const pair = tree.heap.cons.list.items[oper.item];
 
                 var child_ctx = ctx.*;
                 if (oper.frob.warp == 1) child_ctx.base = child_ctx.last;
@@ -1446,7 +1631,7 @@ pub const Tree = struct {
                 ctx.rows = right_ctx.rows;
             },
             .cans => |oper| {
-                const pair = tree.heap.cans.items[oper.item];
+                const pair = tree.heap.cans.list.items[oper.item];
 
                 var child_ctx = ctx.*;
                 if (oper.frob.warp == 1) child_ctx.base = child_ctx.last;
@@ -1491,7 +1676,7 @@ pub const Tree = struct {
                 break :blk Node.fromRune(rune.reps, ' ');
             },
             .cons => |oper| blk: {
-                const pair = tree.heap.cons.items[oper.item];
+                const pair = tree.heap.cons.list.items[oper.item];
                 const head = try tree.flat(pair.head);
                 const tail = try tree.flat(pair.tail);
                 const changed =
@@ -1502,7 +1687,7 @@ pub const Tree = struct {
                 break :blk try tree.cons(oper.frob, head, tail);
             },
             .fork => |oper| blk: {
-                const pair = tree.heap.fork.items[oper.item];
+                const pair = tree.heap.fork.list.items[oper.item];
                 const head = try tree.flat(pair.head);
                 const tail = try tree.flat(pair.tail);
                 const changed =
@@ -1510,9 +1695,10 @@ pub const Tree = struct {
                     tail.repr() != pair.tail.repr();
                 if (!changed) break :blk doc;
 
-                const next: u21 = @intCast(tree.heap.fork.items.len);
-                try tree.heap.fork.append(tree.bank, .{ .head = head, .tail = tail });
-
+                const next: u21 = @intCast(try tree.heap.fork.push(
+                    tree.bank,
+                    .{ .head = head, .tail = tail },
+                ));
                 break :blk Node.fromOper(.fork, oper.frob, tree.flip, next);
             },
             .cans => unreachable,
@@ -1579,25 +1765,27 @@ pub const Tree = struct {
     }
 
     pub fn cons(tree: *Tree, frob: Frob, lhs: Node, rhs: Node) !Node {
-        const next: u21 = @intCast(tree.heap.cons.items.len);
-        try tree.heap.cons.append(tree.bank, .{ .head = lhs, .tail = rhs });
+        const next: u21 = @intCast(try tree.heap.cons.push(tree.bank, .{
+            .head = lhs,
+            .tail = rhs,
+        }));
         return Node.fromOper(.cons, frob, tree.flip, next);
     }
 
     pub fn cans(tree: *Tree, frob: Frob, lhs: Node, rhs: Node) !Node {
-        const len = tree.heap.cans.items.len;
+        const len = tree.heap.cans.list.items.len;
         if (len > std.math.maxInt(u21)) {
             log.err("cans heap overflow: len={} flip={} lhs={} rhs={} ptr={x}", .{
                 len,
                 tree.flip,
                 lhs.repr(),
                 rhs.repr(),
-                @intFromPtr(tree.heap.cans.items.ptr),
+                @intFromPtr(tree.heap.cans.list.items.ptr),
             });
             return error.OutOfConses;
         }
         const next: u21 = @intCast(len);
-        try tree.heap.cans.append(tree.bank, .{ .head = lhs, .tail = rhs });
+        try tree.heap.cans.list.append(tree.bank, .{ .head = lhs, .tail = rhs });
         return Node.fromOper(.cans, frob, tree.flip, next);
     }
 
@@ -1638,8 +1826,10 @@ pub const Tree = struct {
     }
 
     pub fn fork(tree: *Tree, lhs: Node, rhs: Node) !Node {
-        const next: u21 = @intCast(tree.heap.fork.items.len);
-        try tree.heap.fork.append(tree.bank, .{ .head = lhs, .tail = rhs });
+        const next: u21 = @intCast(try tree.heap.fork.push(tree.bank, .{
+            .head = lhs,
+            .tail = rhs,
+        }));
         return Node.fromOper(.fork, .{}, tree.flip, next);
     }
 
@@ -1699,18 +1889,18 @@ pub const Tree = struct {
 
     /// Format a string using std.fmt and add to the slab with deduplication
     pub fn format(tree: *Tree, comptime fmt: []const u8, args: anytype) !Node {
-        const start_len = tree.heap.text.items.len;
+        const start_len = tree.blob.items.len;
 
         // Format directly into the slab
         var slab = std.Io.Writer.Allocating.fromArrayList(
             tree.bank,
-            &tree.heap.text,
+            &tree.blob,
         );
         try slab.writer.print(fmt ++ "\x00", args);
 
         // Now use text() which will do the deduplication logic for us
-        tree.heap.text = slab.toArrayList();
-        const written = tree.heap.text.items[start_len .. tree.heap.text.items.len - 1 :0];
+        tree.blob = slab.toArrayList();
+        const written = tree.blob.items[start_len .. tree.blob.items.len - 1 :0];
         const node = try tree.text(written);
 
         // If text() didn't point to our new string, rewind the slab
@@ -1723,7 +1913,7 @@ pub const Tree = struct {
         };
 
         if (should_rewind) {
-            tree.heap.text.shrinkRetainingCapacity(start_len);
+            tree.blob.shrinkRetainingCapacity(start_len);
         }
 
         return node;
@@ -1810,11 +2000,11 @@ pub const Tree = struct {
         const spanz = span[0 .. span.len + 1];
 
         const spot: u21 = @intCast(
-            if (std.mem.indexOf(u8, tree.heap.text.items, spanz)) |i|
+            if (std.mem.indexOf(u8, tree.blob.items, spanz)) |i|
                 i
             else blk: {
-                const next = tree.heap.text.items.len;
-                try tree.heap.text.appendSlice(tree.bank, spanz);
+                const next = tree.blob.items.len;
+                try tree.blob.appendSlice(tree.bank, spanz);
                 break :blk next;
             },
         );
@@ -1868,11 +2058,11 @@ test "text dedup" {
     const n2 = try tree.text("Hello, world!");
 
     try expectEqual(n1.repr(), n2.repr());
-    try expectEqual(1 + "Hello, world!".len, tree.heap.text.items.len);
+    try expectEqual(1 + "Hello, world!".len, tree.blob.items.len);
 
     const n3 = try tree.text("Hello");
     try expect(n2.repr() != n3.repr());
-    try expectEqual(1 + "Hello, world!".len + 6, tree.heap.text.items.len);
+    try expectEqual(1 + "Hello, world!".len + 6, tree.blob.items.len);
 }
 
 test "emit plus node" {
@@ -1918,7 +2108,7 @@ test "fuse text <> nl" {
         },
         else => unreachable,
     }
-    try expectEqual(0, t.heap.cons.items.len);
+    try expectEqual(0, t.heap.cons.list.items.len);
     try expectEmitString(&t, "Hello, world!\n", fused);
 }
 
@@ -1937,7 +2127,7 @@ test "fuse nl <> text" {
         },
         else => unreachable,
     }
-    try expectEqual(0, t.heap.cons.items.len);
+    try expectEqual(0, t.heap.cons.list.items.len);
     try expectEmitString(&t, "\nHello, world!", fused);
 }
 

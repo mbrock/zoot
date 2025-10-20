@@ -187,11 +187,11 @@ fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) !Node {
     switch (node.look()) {
         .cons, .fork, .cans => |oper| {
             const args = if (node.tag == .cons)
-                t1.heap.cons.items[oper.item]
+                t1.heap.cons.list.items[oper.item]
             else if (node.tag == .cans)
-                t1.heap.cans.items[oper.item]
+                t1.heap.cans.list.items[oper.item]
             else
-                t1.heap.fork.items[oper.item];
+                t1.heap.fork.list.items[oper.item];
 
             const left_edge = try stmt(t2, try t2.cat(&.{
                 try t2.format("n{x}:sw -> n{x} ", .{ id, args.head.repr() }),
@@ -223,7 +223,7 @@ fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) !Node {
 fn formatTextNode(doc_tree: *Tree, data_tree: *Tree, node: Node) !Node {
     return switch (node.look()) {
         .span => |span_node| blk: {
-            const tail = data_tree.heap.text.items[span_node.text..];
+            const tail = data_tree.blob.items[span_node.text..];
             const slice = std.mem.sliceTo(tail, 0);
 
             break :blk try doc_tree.cat(&.{
