@@ -204,7 +204,7 @@ pub const Loop = struct {
                                 // This continuation is resumed when the cons head is done.
                                 .head = .{
                                     // Afterwards, proceed with the cons tail.
-                                    .tail = cons.tail,
+                                    .node = cons.tail,
                                     // Use the same indent base.
                                     .base = eval.base,
                                 },
@@ -256,7 +256,7 @@ pub const Loop = struct {
                         if (!icks and icky) return error.Icky;
 
                         // We must evaluate the tail also before continuing.
-                        exec.node = cont.cons.head.tail;
+                        exec.node = cont.cons.head.node;
 
                         // After the cons tail, we will combine and continue.
                         exec.then = try this.punt(.{
@@ -408,7 +408,7 @@ pub const Kont = packed struct {
     /// This lets `Kont` stay a packed struct of nice round size.
     cons: packed union {
         head: packed struct {
-            tail: Node,
+            node: Node,
             base: u16,
             flag: u80 = std.math.maxInt(u80),
         },
