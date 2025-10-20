@@ -458,9 +458,7 @@ pub fn main() !void {
     const t0 = time.lap();
 
     try writer.print("┏━ CEK debug ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{});
-    const Cost = pp.F2;
-    const cost_model = Cost.init(100);
-    const cost_factory = cost_model.factory();
+    const cost_factory = pp.F2.init(100);
 
     var frames = pp.List(pp.Kont).init(allocator);
     defer frames.deinit();
@@ -542,11 +540,11 @@ pub fn main() !void {
     const t2 = time.lap();
 
     const measure = best.measure;
-    const rank = Cost.Rank.fromU64(measure.rank);
+    const rank = measure.rank;
 
     try writer.print(
         "  rank: overflow={d} height={d} tainted={}\n",
-        .{ rank.o, rank.h, cost_factory.tainted(measure.rank) },
+        .{ rank.o, rank.h, cost_factory.tainted(rank) },
     );
     try writer.print(
         "  layouts: completions={d} frontier={d} tainted_kept={} queue_peak={d}\n",

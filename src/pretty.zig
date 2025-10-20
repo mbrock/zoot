@@ -40,7 +40,7 @@ pub const Loop = struct {
                     .rune => |rune| {
                         var last = eval.crux.head;
                         var rows: u16 = 0;
-                        var rank: u64 = 0;
+                        var rank: Rank = .{};
 
                         if (rune.reps != 0) {
                             if (rune.code == '\n') {
@@ -76,7 +76,7 @@ pub const Loop = struct {
                     .span => |span| {
                         var head = eval.crux.head;
                         var rows: u16 = 0;
-                        var rank: u64 = 0;
+                        var rank: Rank = .{};
 
                         if (span.char != 0 and span.side == .lchr) {
                             if (span.char == '\n') {
@@ -125,7 +125,7 @@ pub const Loop = struct {
                     .quad => |quad| {
                         var head = eval.crux.head;
                         var rows: u16 = 0;
-                        var rank: u64 = 0;
+                        var rank: Rank = .{};
                         const chars = [_]u7{ quad.ch0, quad.ch1, quad.ch2, quad.ch3 };
                         for (chars) |c| {
                             if (c == 0) break;
@@ -156,7 +156,7 @@ pub const Loop = struct {
                     .trip => |trip| {
                         var head = eval.crux.head;
                         var rows: u16 = 0;
-                        var rank: u64 = 0;
+                        var rank: Rank = .{};
 
                         const glyph = trip.slice();
                         const glyph_len = trip.unitLen();
@@ -422,18 +422,18 @@ pub const Loop = struct {
 
         var tainted_best: ?Idea = null;
 
-        while (work.pop()) |next| {
+        loop1: while (work.pop()) |next| {
             var exec = next;
             while (true) {
-                if (good.items.len > 0) {
-                    switch (exec) {
-                        .eval => |e| {
-                            if (e.crux.icky)
-                                break;
-                        },
-                        else => {},
-                    }
-                }
+                // if (good.items.len > 0) {
+                //     switch (exec) {
+                //         .eval => |e| {
+                //             if (e.crux.icky)
+                //                 break;
+                //         },
+                //         else => {},
+                //     }
+                // }
 
                 switch (exec) {
                     .fork => |branches| {
@@ -444,6 +444,7 @@ pub const Loop = struct {
                     },
                     .done => |done| {
                         try Loop.updateFrontier(cost, bank, &good, &tainted_best, done.idea);
+                        if (good.items.len > 0) break :loop1;
                         completions += 1;
                         break;
                     },
@@ -453,6 +454,70 @@ pub const Loop = struct {
                 exec = try step(tree, cost, &konts, exec, &memo, &stats);
             }
         }
+        vm0: while (work.pop()) |next| {
+            vm1: switch (next) {
+                .fork => |branches| {
+                    try work.append(bank, .{ .eval = branches.right });
+                    if (work.items.len > peak) peak = work.items.len;
+                    continue :vm1 .{ .eval = branches.left };
+                },
+                .done => |done| {
+                    try Loop.updateFrontier(cost, bank, &good, &tainted_best, done.idea);
+                    completions += 1;
+                    continue :vm0;
+                },
+                .eval => |eval| {
+                    if (eval.crux.icky) {
+                        continue :vm0;
+                    } else {
+                        continue :vm1 try step(
+                            tree,
+                            cost,
+                            &konts,
+                            .{ .eval = eval },
+                            &memo,
+                            &stats,
+                        );
+                    }
+                },
+                else => |exec| {
+                    continue :vm1 try step(
+                        tree,
+                        cost,
+                        &konts,
+                        exec,
+                        &memo,
+                        &stats,
+                    );
+                },
+            }
+        }
+        // while (work.pop()) |next| {
+        //     var exec = next;
+        //     while (true) {
+        //         switch (exec) {
+        //             .fork => |branches| {
+        //                 try work.append(bank, .{ .eval = branches.right });
+        //                 if (work.items.len > peak) peak = work.items.len;
+        //                 exec = .{ .eval = branches.left };
+        //                 continue;
+        //             },
+        //             .done => |done| {
+        //                 try Loop.updateFrontier(cost, bank, &good, &tainted_best, done.idea);
+        //                 completions += 1;
+        //                 break;
+        //             },
+        //             .eval => |eval| {
+        //                 if (eval.crux.icky) break else {
+        //                     exec = try step(tree, cost, &konts, exec, &memo, &stats);
+        //                 }
+        //             },
+        //             else => {
+        //                 exec = try step(tree, cost, &konts, exec, &memo, &stats);
+        //             },
+        //         }
+        //     }
+        // }
 
         const memo_entries = memo.count();
 
@@ -508,34 +573,71 @@ pub const Crux = struct {
     }
 };
 
-/// Cost factory vtable for runtime polymorphism over different cost metrics.
-/// All ranks are now standardized to u64.
-pub const CostFactory = struct {
-    ptr: *const anyopaque,
-    plusFn: *const fn (ptr: *const anyopaque, lhs: u64, rhs: u64) u64,
-    lineFn: *const fn (ptr: *const anyopaque) u64,
-    textFn: *const fn (ptr: *const anyopaque, c: u16, l: u16) u64,
-    winsFn: *const fn (ptr: *const anyopaque, a: u64, b: u64) bool,
-    taintedFn: *const fn (ptr: *const anyopaque, rank: u64) bool,
+/// Cost metric selection - either F1 (linear overflow) or F2 (squared overflow).
+pub const CostFactory = union(enum) {
+    f1: u16, // page width
+    f2: u16, // page width
 
-    pub fn plus(self: CostFactory, lhs: u64, rhs: u64) u64 {
-        return self.plusFn(self.ptr, lhs, rhs);
+    pub fn plus(_: CostFactory, lhs: Rank, rhs: Rank) Rank {
+        return .{
+            .h = lhs.h +| rhs.h,
+            .o = lhs.o +| rhs.o,
+        };
     }
 
-    pub fn line(self: CostFactory) u64 {
-        return self.lineFn(self.ptr);
+    pub fn line(_: CostFactory) Rank {
+        return .{ .h = 1 };
     }
 
-    pub fn text(self: CostFactory, c: u16, l: u16) u64 {
-        return self.textFn(self.ptr, c, l);
+    pub fn text(self: CostFactory, c: u16, l: u16) Rank {
+        return switch (self) {
+            .f1 => |w| .{
+                .o = (c +| l) -| @max(w, c),
+            },
+            .f2 => |w| blk: {
+                const a = @max(w, c) -| w;
+                const b = (c + l) -| @max(w, c);
+                break :blk .{
+                    .o = b *| (2 * a + b),
+                };
+            },
+        };
     }
 
-    pub fn wins(self: CostFactory, a: u64, b: u64) bool {
-        return self.winsFn(self.ptr, a, b);
+    pub fn wins(_: CostFactory, a: Rank, b: Rank) bool {
+        return a.toU64() < b.toU64();
     }
 
-    pub fn tainted(self: CostFactory, rank: u64) bool {
-        return self.taintedFn(self.ptr, rank);
+    pub fn tainted(_: CostFactory, rank: Rank) bool {
+        return rank.o != 0;
+    }
+};
+
+pub const Rank = struct {
+    /// the sum of overflows (F1: linear, F2: squared)
+    o: u32 = 0,
+    /// the number of newlines
+    h: u32 = 0,
+
+    pub fn toU64(self: Rank) u64 {
+        return @as(u64, self.o) << 32 | self.h;
+    }
+
+    pub fn fromU64(val: u64) Rank {
+        return .{
+            .o = @intCast((val >> 32) & 0xFFFFFFFF),
+            .h = @intCast(val & 0xFFFFFFFF),
+        };
+    }
+
+    pub fn format(
+        self: @This(),
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        try writer.print("{d: >5.1}  {d: >3}", .{
+            std.math.sqrt(@as(f32, @floatFromInt(self.o))),
+            self.h,
+        });
     }
 };
 
@@ -543,7 +645,7 @@ pub const Idea = struct {
     last: u16 = 0,
     rows: u16 = 0,
     node: Node = Node.halt,
-    rank: u64 = 0,
+    rank: Rank = .{},
 };
 
 pub const MachineStats = struct {
@@ -623,94 +725,8 @@ pub const Exec = union(enum) {
 /// > and then minimizes the height (the total number of newline characters,
 /// > or equivalently, the number of lines minus one).
 pub const F1 = struct {
-    w: u16,
-
-    pub const Rank = struct {
-        /// the sum of overflows
-        o: u16 = 0,
-        /// the number of newlines
-        h: u16 = 0,
-
-        pub fn key(rank: Rank) u32 {
-            return (@as(u32, rank.o) << 16) | rank.h;
-        }
-
-        pub fn toU64(self: Rank) u64 {
-            return @as(u64, self.o) << 16 | self.h;
-        }
-
-        pub fn fromU64(val: u64) Rank {
-            return .{
-                .o = @intCast((val >> 16) & 0xFFFF),
-                .h = @intCast(val & 0xFFFF),
-            };
-        }
-
-        pub fn format(
-            self: @This(),
-            writer: *std.Io.Writer,
-        ) std.Io.Writer.Error!void {
-            try writer.print("{d: >5.1}  {d: >3}", .{
-                std.math.sqrt(@as(f32, @floatFromInt(self.o))),
-                self.h,
-            });
-        }
-    };
-
-    pub fn init(w: u16) F1 {
-        return .{ .w = w };
-    }
-
-    pub fn line(_: @This()) Rank {
-        return .{ .h = 1 };
-    }
-
-    pub fn text(this: @This(), c: u16, l: u16) Rank {
-        return .{ .o = (c +| l) -| @max(this.w, c) };
-    }
-
-    pub fn plus(_: @This(), lhs: Rank, rhs: Rank) Rank {
-        return .{ .h = lhs.h +| rhs.h, .o = lhs.o +| rhs.o };
-    }
-
-    pub fn wins(_: @This(), a: Rank, b: Rank) bool {
-        return a.key() < b.key();
-    }
-
-    fn plusFn(self: *const F1, lhs: u64, rhs: u64) u64 {
-        const lhs_rank = Rank.fromU64(lhs);
-        const rhs_rank = Rank.fromU64(rhs);
-        return self.plus(lhs_rank, rhs_rank).toU64();
-    }
-
-    fn lineFn(self: *const F1) u64 {
-        return self.line().toU64();
-    }
-
-    fn textFn(self: *const F1, c: u16, l: u16) u64 {
-        return self.text(c, l).toU64();
-    }
-
-    fn winsFn(self: *const F1, a: u64, b: u64) bool {
-        const a_rank = Rank.fromU64(a);
-        const b_rank = Rank.fromU64(b);
-        return self.wins(a_rank, b_rank);
-    }
-
-    fn taintedFn(_: *const F1, rank: u64) bool {
-        const r = Rank.fromU64(rank);
-        return r.o != 0;
-    }
-
-    pub fn factory(self: *const F1) CostFactory {
-        return .{
-            .ptr = self,
-            .plusFn = @ptrCast(&plusFn),
-            .lineFn = @ptrCast(&lineFn),
-            .textFn = @ptrCast(&textFn),
-            .winsFn = @ptrCast(&winsFn),
-            .taintedFn = @ptrCast(&taintedFn),
-        };
+    pub fn init(w: u16) CostFactory {
+        return .{ .f1 = w };
     }
 };
 
@@ -724,97 +740,8 @@ pub const F1 = struct {
 /// > This is (essentially) the default cost factory that our implementation,
 /// > *PrettyExpressive*, employs.
 pub const F2 = struct {
-    w: u64,
-
-    pub const Rank = struct {
-        /// the sum of squared overflows
-        o: u32 = 0,
-        /// the number of newlines
-        h: u32 = 0,
-
-        pub fn toU64(self: Rank) u64 {
-            return @as(u64, self.o) << 32 | self.h;
-        }
-
-        pub fn fromU64(val: u64) Rank {
-            return .{
-                .o = @intCast((val >> 32) & 0xFFFFFFFF),
-                .h = @intCast(val & 0xFFFFFFFF),
-            };
-        }
-
-        pub fn format(
-            self: @This(),
-            writer: *std.Io.Writer,
-        ) std.Io.Writer.Error!void {
-            try writer.print("{d: >5.1}  {d: >3}", .{
-                std.math.sqrt(@as(f32, @floatFromInt(self.o))),
-                self.h,
-            });
-        }
-    };
-
-    pub fn init(w: u16) F2 {
-        return .{ .w = w };
-    }
-
-    pub fn line(_: @This()) Rank {
-        return .{ .h = 1 };
-    }
-
-    pub fn text(this: @This(), c: u16, l: u16) Rank {
-        const w: u16 = @intCast(this.w);
-
-        const a = @max(w, c) -| w;
-        const b = (c + l) -| @max(w, c);
-
-        return .{
-            .o = b *| (2 * a + b),
-        };
-    }
-
-    pub fn plus(_: @This(), lhs: Rank, rhs: Rank) Rank {
-        return .{ .h = lhs.h +| rhs.h, .o = lhs.o +| rhs.o };
-    }
-
-    pub fn wins(_: @This(), a: Rank, b: Rank) bool {
-        return a.toU64() < b.toU64();
-    }
-
-    fn plusFn(self: *const F2, lhs: u64, rhs: u64) u64 {
-        const lhs_rank = Rank.fromU64(lhs);
-        const rhs_rank = Rank.fromU64(rhs);
-        return self.plus(lhs_rank, rhs_rank).toU64();
-    }
-
-    fn lineFn(self: *const F2) u64 {
-        return self.line().toU64();
-    }
-
-    fn textFn(self: *const F2, c: u16, l: u16) u64 {
-        return self.text(c, l).toU64();
-    }
-
-    fn winsFn(self: *const F2, a: u64, b: u64) bool {
-        const a_rank = Rank.fromU64(a);
-        const b_rank = Rank.fromU64(b);
-        return self.wins(a_rank, b_rank);
-    }
-
-    fn taintedFn(_: *const F2, rank: u64) bool {
-        const r = Rank.fromU64(rank);
-        return r.o != 0;
-    }
-
-    pub fn factory(self: *const F2) CostFactory {
-        return .{
-            .ptr = self,
-            .plusFn = @ptrCast(&plusFn),
-            .lineFn = @ptrCast(&lineFn),
-            .textFn = @ptrCast(&textFn),
-            .winsFn = @ptrCast(&winsFn),
-            .taintedFn = @ptrCast(&taintedFn),
-        };
+    pub fn init(w: u16) CostFactory {
+        return .{ .f2 = w };
     }
 };
 
@@ -1128,7 +1055,7 @@ pub const Tree = struct {
         tree: *Tree,
         cf: CostFactory,
         node: Node,
-    ) !u64 {
+    ) !Rank {
         const outcome = try tree.best(tree.bank, cf, node, null);
         return outcome.measure.rank;
     }
@@ -1693,7 +1620,7 @@ test "maze evaluation chooses best layout" {
     const doc = try tree.fork(inline_doc, multiline);
 
     const cost = F1.init(10);
-    const result = try tree.best(std.testing.allocator, cost.factory(), doc, null);
+    const result = try tree.best(std.testing.allocator, cost, doc, null);
 
     const buf = try std.testing.allocator.alloc(u8, 64);
     defer std.testing.allocator.free(buf);
@@ -1738,7 +1665,7 @@ test "nest braces cost" {
 
     const cost = F1.init(32);
     const rank = try t.rank(
-        cost.factory(),
+        cost,
         try t.plus(
             try t.plus(
                 try t.text("foo {"),
@@ -1751,9 +1678,8 @@ test "nest braces cost" {
         ),
     );
 
-    const s1 = F1.Rank.fromU64(rank);
-    try expectEqual(2, s1.h);
-    try expectEqual(0, s1.o);
+    try expectEqual(2, rank.h);
+    try expectEqual(0, rank.o);
 }
 
 test "F2 cost matches example" {
@@ -1764,11 +1690,10 @@ test "F2 cost matches example" {
 
     const d1 = try t.text("   = func( pretty, print )");
     const cost = F2.init(6);
-    const rank1 = try t.rank(cost.factory(), d1);
-    const c1 = F2.Rank.fromU64(rank1);
+    const rank1 = try t.rank(cost, d1);
 
-    try expectEqual(0, c1.h);
-    try expectEqual(20 * 20, c1.o);
+    try expectEqual(0, rank1.h);
+    try expectEqual(20 * 20, rank1.o);
 
     const d2 = try t.plus(
         try t.nest(
@@ -1791,11 +1716,10 @@ test "F2 cost matches example" {
         \\)
     , d2);
 
-    const rank2 = try t.rank(cost.factory(), d2);
-    const c2 = F2.Rank.fromU64(rank2);
+    const rank2 = try t.rank(cost, d2);
 
-    try expectEqual(3, c2.h);
-    try expectEqual(4 * 4 + 3 * 3 + 1, c2.o);
+    try expectEqual(3, rank2.h);
+    try expectEqual(4 * 4 + 3 * 3 + 1, rank2.o);
 }
 
 test "flatten('a' <> nl <> 'b')" {
