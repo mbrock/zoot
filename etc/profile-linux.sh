@@ -31,18 +31,18 @@ zig build graphviz -Doptimize=ReleaseFast
 
 echo "[2/3] recording perf trace -> ${perf_data}"
 perf record \
-  --call-graph dwarf \
+  -g --call-graph dwarf \
   --freq max \
-  --output "${perf_data}" \
+  --output "${perf_data}" -- \
   ./zig-out/bin/zoot-graphviz
 
-echo "[3/3] generating perf report -> ${perf_report}"
-perf report \
-  --input "${perf_data}" \
-  --stdio \
-  --sort dso,symbol \
-  > "${perf_report}"
+# echo "[3/3] generating perf report -> ${perf_report}"
+# perf report \
+#   --input "${perf_data}" \
+#   --stdio \
+#   --sort dso,symbol \
+#   > "${perf_report}"
 
-echo "done:"
-echo "  raw profile: ${perf_data}"
-echo "  summary:     ${perf_report}"
+# echo "done:"
+# echo "  raw profile: ${perf_data}"
+# echo "  summary:     ${perf_report}"

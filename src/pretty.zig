@@ -5,125 +5,279 @@ const log = std.log;
 pub const Bank = std.mem.Allocator;
 
 pub const Loop = struct {
-    pub fn step(
-        tree: *Tree,
-        cost: CostFactory,
-        exec: Exec,
-        work: *List(Kont),
-        memo: ?*Memo,
-        stats: ?*MachineStats,
-    ) !Exec {
-        switch (exec) {
-            .eval => |eval| {
-                if (eval.node.easy() == false) {
-                    const key = MemoKey{
-                        .node = eval.node.repr(),
-                        .head = eval.crux.head,
-                        .base = eval.crux.base,
-                    };
+    tree: *Tree,
+    cost: Cost,
+    memo: *Memo,
+    stat: *Stat,
 
-                    if (memo) |m| {
-                        if (m.get(key)) |idea| {
-                            if (stats) |s| s.memo_hits += 1;
-                            return .{
-                                .give = .{
-                                    .idea = idea,
-                                    .then = eval.then,
-                                },
-                            };
+    pool: *std.heap.MemoryPool(Kont),
+    pile: *std.ArrayList(Exec),
+
+    pub fn pick(
+        tree: *Tree,
+        bank: Bank,
+        cost: Cost,
+        node: Node,
+    ) !Best {
+        var pool = std.heap.MemoryPool(Kont).init(bank);
+        defer pool.deinit();
+
+        try pool.preheat(4096 * 64);
+
+        var memo = Memo.init(bank);
+        defer memo.deinit();
+
+        try memo.ensureTotalCapacity(4096);
+
+        var pile = try std.ArrayList(Exec).initCapacity(bank, 256);
+        defer pile.deinit(bank);
+
+        try pile.append(bank, .{
+            .node = node,
+            .tick = .{ .eval = .{} },
+        });
+
+        var peak: usize = pile.items.len;
+        var stat = Stat{};
+
+        var best = std.ArrayList(Idea).empty;
+        defer best.deinit(bank);
+        try best.ensureTotalCapacity(bank, 16);
+
+        var icky: ?Idea = null;
+
+        var this = @This(){
+            .tree = tree,
+            .cost = cost,
+            .memo = &memo,
+            .stat = &stat,
+            .pool = &pool,
+            .pile = &pile,
+        };
+
+        work: while (pile.pop()) |next| {
+            var exec = next;
+            while (true) {
+                if (pile.items.len > peak) peak = pile.items.len;
+
+                switch (exec.tick) {
+                    .give => |gist| {
+                        if (exec.then == null) {
+                            const idea: Idea = .{ .gist = gist, .node = exec.node };
+                            try meld(cost, bank, &best, idea);
+                            stat.completions += 1;
+
+                            if (best.items.len > 0) break :work;
+
+                            if (icky) |existing| {
+                                if (dominates(
+                                    cost,
+                                    idea.gist,
+                                    existing.gist,
+                                ) or cost.wins(
+                                    idea.gist.rank,
+                                    existing.gist.rank,
+                                )) {
+                                    icky = idea;
+                                }
+                            } else {
+                                icky = idea;
+                            }
+
+                            continue :work;
                         }
-                    }
-                    if (stats) |s| s.memo_misses += 1;
+                    },
+                    .eval => {},
                 }
 
-                switch (eval.node.look()) {
+                try this.step(&exec, true);
+            }
+        }
+
+        work: while (pile.pop()) |next| {
+            var exec = next;
+            while (true) {
+                if (pile.items.len > peak) peak = pile.items.len;
+                switch (exec.tick) {
+                    .give => |gist| {
+                        if (exec.then == null) {
+                            try meld(cost, bank, &best, .{ .gist = gist, .node = exec.node });
+                            stat.completions += 1;
+                            continue :work;
+                        }
+                    },
+                    else => {},
+                }
+
+                if (this.step(&exec, false)) {} else |e| {
+                    switch (e) {
+                        error.Icky => continue :work,
+                        else => return e,
+                    }
+                }
+            }
+        }
+
+        const memo_entries = memo.count();
+
+        if (best.items.len != 0) {
+            var optimal = best.items[0];
+            for (1..best.items.len) |i| {
+                const candidate = best.items[i];
+                if (cost.wins(candidate.gist.rank, optimal.gist.rank)) optimal = candidate;
+            }
+            return Best{
+                .measure = optimal,
+                .completions = stat.completions,
+                .memo_hits = stat.memo_hits,
+                .memo_misses = stat.memo_misses,
+                .memo_entries = memo_entries,
+                .frontier_non_tainted = best.items.len,
+                .tainted_kept = false,
+                .queue_peak = peak,
+            };
+        }
+
+        if (icky) |tainted| {
+            return Best{
+                .measure = tainted,
+                .completions = stat.completions,
+                .memo_hits = stat.memo_hits,
+                .memo_misses = stat.memo_misses,
+                .memo_entries = memo_entries,
+                .frontier_non_tainted = 0,
+                .tainted_kept = true,
+                .queue_peak = peak,
+            };
+        }
+
+        std.debug.panic("zero layouts discovered", .{});
+    }
+
+    pub fn punt(this: *const @This(), kont: Kont) !*Kont {
+        const that = try this.pool.create();
+        that.* = kont;
+        return that;
+    }
+
+    /// Advance the CEK machine by a single step.
+    ///
+    /// If `icks` is true, we are still interested in icky ideas,
+    /// since we have not yet found any good ideas.
+    pub fn step(this: @This(), exec: *Exec, icks: bool) !void {
+        switch (exec.tick) {
+            .eval => |eval| {
+                // We are about to evaluate a node.
+
+                if (!icks and eval.icky) {
+                    // The context is already icky; abandon this branch.
+                    return error.Icky;
+                }
+
+                var crux = eval;
+
+                if (!exec.node.easy()) {
+                    // Computing this node may be costlier than looking it up.
+
+                    if (this.memo.get(crux.item(exec.node))) |idea| {
+                        // We found a precomputed idea for the node.
+                        this.stat.memo_hits += 1;
+
+                        if (icks or !this.cost.icky(idea.gist.rank)) {
+                            // Next, give the gist to the continuation.
+                            exec.tick = .{ .give = idea.gist };
+                            // These are not the same; the resolved node is forkless.
+                            exec.node = idea.node;
+
+                            return;
+                        } else {
+                            return error.Icky;
+                        }
+                    } else {
+                        // Alas, we must compute.
+                        this.stat.memo_misses += 1;
+                    }
+                }
+
+                switch (exec.node.look()) {
                     .rune => |rune| {
-                        var last = eval.crux.head;
+                        var last = crux.last;
                         var rows: u16 = 0;
                         var rank: Rank = .{};
 
                         if (rune.reps != 0) {
                             if (rune.code == '\n') {
                                 rows = rune.reps;
-                                last = eval.crux.base;
+                                last = crux.base;
                                 for (0..rune.reps) |_| {
-                                    rank = cost.plus(rank, cost.line());
+                                    rank = this.cost.plus(rank, this.cost.line());
                                 }
                             } else {
                                 const width_per = std.unicode.utf8CodepointSequenceLength(rune.code) catch 1;
                                 const total: u32 = @intCast(@as(u32, width_per) * rune.reps);
-                                rank = cost.plus(rank, cost.text(eval.crux.head, @intCast(total)));
-                                const widened = @as(u32, eval.crux.head) + total;
+                                rank = this.cost.plus(rank, this.cost.text(crux.last, @intCast(total)));
+                                const widened = @as(u32, crux.last) + total;
                                 const limit = @as(u32, std.math.maxInt(u16));
                                 last = @intCast(@min(widened, limit));
                             }
                         }
 
-                        const idea = Idea{
-                            .node = eval.node,
-                            .last = last,
-                            .rows = rows,
-                            .rank = rank,
-                        };
-
-                        return .{
+                        exec.tick = .{
                             .give = .{
-                                .idea = idea,
-                                .then = eval.then,
+                                .last = last,
+                                .rows = rows,
+                                .rank = rank,
                             },
                         };
+
+                        return;
                     },
                     .span => |span| {
-                        var head = eval.crux.head;
+                        var head = crux.last;
                         var rows: u16 = 0;
                         var rank: Rank = .{};
 
                         if (span.char != 0 and span.side == .lchr) {
                             if (span.char == '\n') {
                                 rows +|= 1;
-                                head = eval.crux.base;
-                                rank = cost.plus(rank, cost.line());
+                                head = crux.base;
+                                rank = this.cost.plus(rank, this.cost.line());
                             } else {
-                                rank = cost.plus(rank, cost.text(head, 1));
+                                rank = this.cost.plus(rank, this.cost.text(head, 1));
                                 head +|= 1;
                             }
                         }
 
-                        const tail = tree.heap.text.items[span.text..];
+                        const tail = this.tree.heap.text.items[span.text..];
                         const text = std.mem.sliceTo(tail, 0);
                         const text_len: u16 = @intCast(text.len);
                         if (text_len != 0) {
-                            rank = cost.plus(rank, cost.text(head, text_len));
+                            rank = this.cost.plus(rank, this.cost.text(head, text_len));
                             head +|= text_len;
                         }
 
                         if (span.char != 0 and span.side == .rchr) {
                             if (span.char == '\n') {
                                 rows +|= 1;
-                                rank = cost.plus(rank, cost.line());
-                                head = eval.crux.base;
+                                rank = this.cost.plus(rank, this.cost.line());
+                                head = crux.base;
                             } else {
-                                rank = cost.plus(rank, cost.text(head, 1));
+                                rank = this.cost.plus(rank, this.cost.text(head, 1));
                                 head +|= 1;
                             }
                         }
 
-                        const idea = Idea{
-                            .node = eval.node,
-                            .last = head,
-                            .rows = rows,
-                            .rank = rank,
-                        };
-
-                        return .{
+                        exec.tick = .{
                             .give = .{
-                                .idea = idea,
-                                .then = eval.then,
+                                .last = head,
+                                .rows = rows,
+                                .rank = rank,
                             },
                         };
+                        return;
                     },
                     .quad => |quad| {
-                        var head = eval.crux.head;
+                        var head = crux.last;
                         var rows: u16 = 0;
                         var rank: Rank = .{};
                         const chars = [_]u7{ quad.ch0, quad.ch1, quad.ch2, quad.ch3 };
@@ -131,30 +285,24 @@ pub const Loop = struct {
                             if (c == 0) break;
                             if (c == '\n') {
                                 rows +|= 1;
-                                head = eval.crux.base;
-                                rank = cost.plus(rank, cost.line());
+                                head = crux.base;
+                                rank = this.cost.plus(rank, this.cost.line());
                             } else {
-                                rank = cost.plus(rank, cost.text(head, 1));
+                                rank = this.cost.plus(rank, this.cost.text(head, 1));
                                 head +|= 1;
                             }
                         }
-
-                        const idea = Idea{
-                            .node = eval.node,
-                            .last = head,
-                            .rows = rows,
-                            .rank = rank,
-                        };
-
-                        return .{
+                        exec.tick = .{
                             .give = .{
-                                .idea = idea,
-                                .then = eval.then,
+                                .last = head,
+                                .rows = rows,
+                                .rank = rank,
                             },
                         };
+                        return;
                     },
                     .trip => |trip| {
-                        var head = eval.crux.head;
+                        var head = crux.last;
                         var rows: u16 = 0;
                         var rank: Rank = .{};
 
@@ -167,367 +315,214 @@ pub const Loop = struct {
                                 for (glyph[0..glyph_len]) |byte| {
                                     if (byte == '\n') {
                                         rows +|= 1;
-                                        head = eval.crux.base;
-                                        rank = cost.plus(rank, cost.line());
+                                        head = crux.base;
+                                        rank = this.cost.plus(rank, this.cost.line());
                                     } else {
-                                        rank = cost.plus(rank, cost.text(head, 1));
+                                        rank = this.cost.plus(rank, this.cost.text(head, 1));
                                         head +|= 1;
                                     }
                                 }
                             }
                         }
 
-                        const idea = Idea{
-                            .node = eval.node,
-                            .last = head,
-                            .rows = rows,
-                            .rank = rank,
-                        };
-
-                        return .{
+                        exec.tick = .{
                             .give = .{
-                                .idea = idea,
-                                .then = eval.then,
+                                .last = head,
+                                .rows = rows,
+                                .rank = rank,
                             },
                         };
+                        return;
                     },
                     .cons => |oper| {
-                        const pair = tree.heap.cons.items[oper.item];
+                        const cons = this.tree.heap.cons.items[oper.item];
 
-                        var child_ctx = eval.crux;
-                        if (oper.frob.warp == 1)
-                            child_ctx.warp();
-                        if (oper.frob.nest != 0)
-                            child_ctx.nest(oper.frob.nest);
+                        // Apply local indent state to the crux.
+                        if (oper.frob.warp == 1) crux.warp();
+                        if (oper.frob.nest != 0) crux.nest(oper.frob.nest);
 
-                        return .{
-                            .eval = .{
-                                .node = pair.head,
-                                .crux = child_ctx,
-                                .then = try work.push(tree.bank, Kont{
-                                    .after_left = .{
-                                        .node = eval.node,
-                                        .rhs = pair.tail,
-                                        .right_base = child_ctx.base,
-                                        .head = eval.crux.head,
-                                        .base = eval.crux.base,
-                                        .next = eval.then,
-                                    },
-                                }),
+                        const then = exec.then;
+                        const item = crux.item(exec.node);
+
+                        // We will start evaluating the cons head.
+                        exec.node = cons.head;
+
+                        // Splice the cons task with the current continuation.
+                        exec.then = try this.punt(.{
+                            .cons = .{
+                                // This continuation is resumed when the cons head is done.
+                                .head = .{
+                                    // Afterwards, proceed with the cons tail.
+                                    .tail = cons.tail,
+                                    // Use the same indent base.
+                                    .base = eval.base,
+                                },
                             },
-                        };
+                            // After the cons tail, return to the current continuation.
+                            .then = then,
+                            // Remember what item we are evaluating.
+                            .item = item,
+                        });
+
+                        exec.tick = .{ .eval = crux };
+
+                        return;
                     },
-                    .fork => |oper| {
-                        const pair = tree.heap.fork.items[oper.item];
+                    .fork => |fork| {
+                        const pair = this.tree.heap.fork.items[fork.item];
 
-                        var left_ctx = eval.crux;
-                        if (oper.frob.warp == 1)
-                            left_ctx.warp();
-                        if (oper.frob.nest != 0)
-                            left_ctx.nest(oper.frob.nest);
+                        // Apply local indent state to the crux.
+                        if (fork.frob.warp == 1) crux.warp();
+                        if (fork.frob.nest != 0) crux.nest(fork.frob.nest);
 
-                        const right_ctx = left_ctx;
+                        // We will proceed with the left-hand fork side.
+                        exec.node = pair.head;
+                        exec.tick = .{ .eval = crux };
 
-                        return .{
-                            .fork = .{
-                                .left = .{
-                                    .node = pair.head,
-                                    .crux = left_ctx,
-                                    .then = eval.then,
-                                },
-                                .right = .{
-                                    .node = pair.tail,
-                                    .crux = right_ctx,
-                                    .then = eval.then,
-                                },
-                            },
-                        };
+                        // Copy this execution state but with the right-hand fork side.
+                        var task = exec.*;
+                        task.node = pair.tail;
+
+                        // Enqueue that task for later evaluation.
+                        try this.pile.append(this.tree.bank, task);
+
+                        return;
                     },
                 }
             },
-            .give => |give| {
-                switch (give.then.*) {
-                    .done => {
-                        return Exec{ .done = .{ .idea = give.idea } };
-                    },
-                    .after_left => |frame| {
-                        const right_ctx = Crux{
-                            .head = give.idea.last,
-                            .base = frame.right_base,
-                            .rows = give.idea.rows,
-                        };
+            .give => {
+                // We have evaluated a node to a gist and a forkless node.
+                // If there is a current continuation, inspect it to proceed.
 
-                        return .{
-                            .eval = .{
-                                .node = frame.rhs,
-                                .crux = right_ctx,
-                                .then = try work.push(tree.bank, Kont{
-                                    .after_right = .{
-                                        .node = frame.node,
-                                        .head = frame.head,
-                                        .base = frame.base,
-                                        .left = give.idea,
-                                        .next = frame.next,
-                                    },
-                                }),
+                if (exec.then) |cont| {
+                    if (cont.cons.look() == .head) {
+                        // We have evaluated the head of a cons.
+
+                        const node = exec.node;
+                        const gist = exec.tick.give;
+                        const icky = this.cost.icky(gist.rank);
+
+                        if (!icks and icky) return error.Icky;
+
+                        // We must evaluate the tail also before continuing.
+                        exec.node = cont.cons.head.tail;
+
+                        // After the cons tail, we will combine and continue.
+                        exec.then = try this.punt(.{
+                            // Remember which cons item we are evaluating.
+                            .item = cont.item,
+                            // Remember the followup continuation.
+                            .then = cont.then,
+                            // Remember the evaluation result of the head.
+                            .cons = .{
+                                .tail = .{
+                                    .gist = gist,
+                                    .node = node,
+                                },
                             },
-                        };
-                    },
-                    .after_right => |frame| {
-                        const left = frame.left;
-                        const next = frame.next;
-
-                        const rank = cost.plus(left.rank, give.idea.rank);
-
-                        const oper = switch (frame.node.look()) {
-                            .cons => |oper| oper,
-                            else => unreachable,
-                        };
-
-                        const cons_index: u21 = @intCast(tree.heap.cons.items.len);
-                        try tree.heap.cons.append(tree.bank, .{
-                            .head = left.node,
-                            .tail = give.idea.node,
                         });
 
-                        const layout = Node.fromOper(.cons, oper.frob, cons_index);
-
-                        const idea = Idea{
-                            .node = layout,
-                            .last = give.idea.last,
-                            .rows = left.rows +| give.idea.rows,
-                            .rank = rank,
-                        };
-
-                        if (memo) |m| {
-                            const key = MemoKey{
-                                .node = frame.node.repr(),
-                                .head = frame.head,
-                                .base = frame.base,
-                            };
-                            try m.put(key, idea);
-                        }
-
-                        return .{
-                            .give = .{
-                                .idea = idea,
-                                .then = next,
+                        // Set the tail evaluation context.
+                        exec.tick = .{
+                            .eval = .{
+                                // The indent base is the same as in the head's context.
+                                .base = cont.cons.head.base,
+                                // The last column is threaded onwards.
+                                .last = gist.last,
+                                // The line count is threaded onwards.
+                                .rows = gist.rows,
+                                // The ickiness is threaded onwards.
+                                .icky = icky,
                             },
                         };
-                    },
+
+                        return;
+                    } else {
+                        // We have evaluated both the head and the tail of a cons.
+
+                        const past = cont.cons.tail;
+                        const curr = exec.tick.give;
+
+                        // Combine the head & tail gists into a gist for the whole cons.
+                        var gist = curr;
+                        gist.rows +|= past.gist.rows;
+                        gist.rank = this.cost.plus(curr.rank, past.gist.rank);
+
+                        // Both sides of the cons may have been forking nodes.
+                        // Make a forkless cons node from the resolved head and tail nodes.
+                        const oper = Node.view(Oper, cont.item.node);
+                        const node = try this.tree.hashcons(oper.frob, past.node, exec.node);
+
+                        // We also save the combined evaluation result of this item
+                        // to avoid recomputing it later.
+                        try this.memo.put(cont.item, .{ .node = node, .gist = gist });
+
+                        // If this cons made the context icky, bail out.
+                        if (!icks and this.cost.icky(gist.rank)) return error.Icky;
+
+                        exec.* = .{
+                            // Next step is the giving of a result.
+                            .tick = .{ .give = gist },
+                            // The forkless node is the node we will give the result for.
+                            .node = node,
+                            // The result will be given to the continuation of the cons.
+                            .then = cont.then,
+                        };
+
+                        return;
+                    }
                 }
             },
 
             // TODO: the dense node representation allows shortcuts.
             //
             // When A and B are tiny texts, A + B is often also a tiny text.
-
-            else => return exec,
         }
     }
 
-    fn costBetter(
-        cf: CostFactory,
-        lhs: Idea,
-        rhs: Idea,
-    ) bool {
-        return cf.wins(lhs.rank, rhs.rank);
-    }
-
     fn dominates(
-        cf: CostFactory,
-        lhs: Idea,
-        rhs: Idea,
+        cf: Cost,
+        lhs: Gist,
+        rhs: Gist,
     ) bool {
-        if (!cf.tainted(lhs.rank) and cf.tainted(rhs.rank)) return true;
-        if (cf.tainted(lhs.rank) and !cf.tainted(rhs.rank)) return false;
+        if (!cf.icky(lhs.rank) and cf.icky(rhs.rank)) return true;
+        if (cf.icky(lhs.rank) and !cf.icky(rhs.rank)) return false;
         const lhs_wins = cf.wins(lhs.rank, rhs.rank);
         const rhs_wins = cf.wins(rhs.rank, lhs.rank);
         return lhs_wins and !rhs_wins;
     }
 
-    fn updateFrontier(
-        cf: CostFactory,
+    fn meld(
+        cost: Cost,
         bank: Bank,
-        frontier: *std.ArrayList(Idea),
+        best: *std.ArrayList(Idea),
         idea: Idea,
     ) !void {
-        if (!cf.tainted(idea.rank)) {
-            var i: usize = 0;
-            while (i < frontier.items.len) {
-                const existing = frontier.items[i];
-                if (dominates(cf, existing, idea)) {
-                    return;
-                }
-                if (dominates(cf, idea, existing)) {
-                    _ = frontier.swapRemove(i);
-                    continue;
-                }
-                i += 1;
+        var i: usize = 0;
+        while (i < best.items.len) {
+            const existing = best.items[i];
+            if (dominates(cost, existing.gist, idea.gist)) {
+                return;
             }
-
-            try frontier.append(bank, idea);
-        }
-    }
-
-    pub fn best(
-        tree: *Tree,
-        bank: Bank,
-        cost: CostFactory,
-        node: Node,
-        info: ?*std.Io.Writer,
-    ) !BestOutcome {
-        _ = info;
-
-        var konts = List(Kont).init(bank);
-        defer konts.deinit();
-
-        try konts.pool.preheat(4096 * 64);
-
-        var memo = Memo.init(bank);
-        defer memo.deinit();
-
-        try memo.ensureTotalCapacity(4096);
-
-        var work = try std.ArrayList(Exec).initCapacity(bank, 256);
-        defer work.deinit(bank);
-
-        try work.append(bank, Exec{
-            .eval = .{
-                .node = node,
-                .crux = .{},
-                .then = try konts.push(bank, Kont{ .done = {} }),
-            },
-        });
-
-        var peak: usize = work.items.len;
-        var completions: usize = 0;
-        var stats = MachineStats{};
-
-        var good = try std.ArrayList(Idea).initCapacity(bank, 4);
-        defer good.deinit(bank);
-
-        var icky: ?Idea = null;
-
-        work: while (work.pop()) |next| {
-            step: switch (next) {
-                .fork => |fork| {
-                    try work.append(bank, .{ .eval = fork.right });
-                    if (work.items.len > peak) peak = work.items.len;
-                    continue :step .{ .eval = fork.left };
-                },
-                .done => |done| {
-                    try updateFrontier(cost, bank, &good, done.idea);
-                    completions += 1;
-
-                    if (good.items.len > 0) break :work;
-
-                    if (icky) |existing| {
-                        if (dominates(cost, done.idea, existing) or costBetter(cost, done.idea, existing)) {
-                            icky = done.idea;
-                        }
-                    } else {
-                        icky = done.idea;
-                    }
-
-                    continue :work;
-                },
-                else => |exec| {
-                    continue :step try step(
-                        tree,
-                        cost,
-                        exec,
-                        &konts,
-                        &memo,
-                        &stats,
-                    );
-                },
+            if (dominates(cost, idea.gist, existing.gist)) {
+                _ = best.swapRemove(i);
+                continue;
             }
+            i += 1;
         }
 
-        work: while (work.pop()) |next| {
-            step: switch (next) {
-                .fork => |branches| {
-                    try work.append(bank, .{ .eval = branches.right });
-                    if (work.items.len > peak) peak = work.items.len;
-                    continue :step .{ .eval = branches.left };
-                },
-                .done => |done| {
-                    try updateFrontier(cost, bank, &good, done.idea);
-                    completions += 1;
-                    continue :work;
-                },
-                .eval => |eval| {
-                    if (eval.crux.icky) {
-                        continue :work;
-                    } else {
-                        continue :step try step(
-                            tree,
-                            cost,
-                            .{ .eval = eval },
-                            &konts,
-                            &memo,
-                            &stats,
-                        );
-                    }
-                },
-                else => |exec| {
-                    continue :step try step(
-                        tree,
-                        cost,
-                        exec,
-                        &konts,
-                        &memo,
-                        &stats,
-                    );
-                },
-            }
-        }
-
-        const memo_entries = memo.count();
-
-        if (good.items.len != 0) {
-            var optimal = good.items[0];
-            for (good.items[1..]) |candidate| {
-                if (Loop.costBetter(cost, candidate, optimal)) optimal = candidate;
-            }
-            return BestOutcome{
-                .measure = optimal,
-                .completions = completions,
-                .memo_hits = stats.memo_hits,
-                .memo_misses = stats.memo_misses,
-                .memo_entries = memo_entries,
-                .frontier_non_tainted = good.items.len,
-                .tainted_kept = false,
-                .queue_peak = peak,
-            };
-        }
-
-        if (icky) |tainted| {
-            return BestOutcome{
-                .measure = tainted,
-                .completions = completions,
-                .memo_hits = stats.memo_hits,
-                .memo_misses = stats.memo_misses,
-                .memo_entries = memo_entries,
-                .frontier_non_tainted = 0,
-                .tainted_kept = true,
-                .queue_peak = peak,
-            };
-        }
-
-        return error.MazeNoLayouts;
+        try best.append(bank, idea);
     }
 };
 
-pub const Crux = struct {
-    head: u16 = 0,
+pub const Crux = packed struct {
+    last: u16 = 0,
     base: u16 = 0,
-    rows: u16 = 0,
     icky: bool = false,
+    rows: u16 = 0,
 
     pub fn warp(self: *@This()) void {
-        self.base = self.head;
+        self.base = self.last;
     }
 
     pub fn nest(self: *@This(), indent: u6) void {
@@ -536,49 +531,113 @@ pub const Crux = struct {
         const limit = @as(u32, std.math.maxInt(u16));
         self.base = @intCast(@min(widened, limit));
     }
+
+    pub fn item(self: @This(), node: Node) Item {
+        return .{
+            .base = self.base,
+            .head = self.last,
+            .node = node,
+        };
+    }
+};
+
+pub const Idea = packed struct {
+    node: Node = Node.halt,
+    gist: Gist = .{},
+};
+
+pub const Gist = packed struct {
+    last: u16 = 0,
+    rows: u16 = 0,
+    rank: Rank = .{},
+};
+
+pub const Exec = struct {
+    node: Node,
+    tick: union(enum) {
+        eval: Crux,
+        give: Gist,
+    },
+    then: ?*Kont = null,
+};
+
+pub const Item = packed struct {
+    node: Node,
+    head: u16,
+    base: u16,
+};
+
+pub const Memo = std.AutoHashMap(Item, Idea);
+
+pub const Kont = packed struct {
+    /// To avoid tagging this union, we use the `head.flag` field
+    /// to signal the continuation type.
+    ///
+    /// This lets `Kont` stay a packed struct of nice round size.
+    cons: packed union {
+        head: packed struct {
+            tail: Node,
+            base: u16,
+            flag: u80 = std.math.maxInt(u80),
+        },
+        tail: Idea,
+
+        pub fn look(this: @This()) enum { head, tail } {
+            return if (this.head.flag == std.math.maxInt(u80))
+                .head
+            else
+                .tail;
+        }
+    },
+    item: Item,
+    then: ?*Kont,
+
+    comptime {
+        std.debug.assert(@sizeOf(Kont) == 32);
+    }
 };
 
 /// Cost metric selection - either F1 (linear overflow) or F2 (squared overflow).
-pub const CostFactory = union(enum) {
+pub const Cost = union(enum) {
     f1: u16, // page width
     f2: u16, // page width
 
-    pub fn plus(_: CostFactory, lhs: Rank, rhs: Rank) Rank {
+    pub fn plus(_: Cost, lhs: Rank, rhs: Rank) Rank {
         return .{
             .h = lhs.h +| rhs.h,
             .o = lhs.o +| rhs.o,
         };
     }
 
-    pub fn line(_: CostFactory) Rank {
+    pub fn line(_: Cost) Rank {
         return .{ .h = 1 };
     }
 
-    pub fn text(self: CostFactory, c: u16, l: u16) Rank {
+    pub fn text(self: Cost, c: u16, l: u16) Rank {
         return switch (self) {
             .f1 => |w| .{
                 .o = (c +| l) -| @max(w, c),
             },
             .f2 => |w| blk: {
                 const a = @max(w, c) -| w;
-                const b = (c + l) -| @max(w, c);
+                const b = (c +| l) -| @max(w, c);
                 break :blk .{
-                    .o = b *| (2 * a + b),
+                    .o = b *| (2 *| a +| b),
                 };
             },
         };
     }
 
-    pub fn wins(_: CostFactory, a: Rank, b: Rank) bool {
+    pub fn wins(_: Cost, a: Rank, b: Rank) bool {
         return a.toU64() < b.toU64();
     }
 
-    pub fn tainted(_: CostFactory, rank: Rank) bool {
+    pub fn icky(_: Cost, rank: Rank) bool {
         return rank.o != 0;
     }
 };
 
-pub const Rank = struct {
+pub const Rank = packed struct {
     /// the sum of overflows (F1: linear, F2: squared)
     o: u32 = 0,
     /// the number of newlines
@@ -606,19 +665,13 @@ pub const Rank = struct {
     }
 };
 
-pub const Idea = struct {
-    last: u16 = 0,
-    rows: u16 = 0,
-    node: Node = Node.halt,
-    rank: Rank = .{},
-};
-
-pub const MachineStats = struct {
+pub const Stat = struct {
+    completions: usize = 0,
     memo_hits: usize = 0,
     memo_misses: usize = 0,
 };
 
-pub const BestOutcome = struct {
+pub const Best = struct {
     measure: Idea,
     completions: usize = 0,
     memo_hits: usize = 0,
@@ -629,60 +682,6 @@ pub const BestOutcome = struct {
     queue_peak: usize = 0,
 };
 
-pub const MemoKey = packed struct {
-    node: u32,
-    head: u16,
-    base: u16,
-};
-
-pub const Memo = std.AutoHashMap(MemoKey, Idea);
-
-pub const Kont = union(enum) {
-    done,
-    after_left: AfterLeft,
-    after_right: AfterRight,
-
-    const Self = @This();
-
-    pub const AfterLeft = struct {
-        node: Node,
-        rhs: Node,
-        right_base: u16,
-        head: u16,
-        base: u16,
-        next: *Self,
-    };
-
-    pub const AfterRight = struct {
-        node: Node,
-        head: u16,
-        base: u16,
-        left: Idea,
-        next: *Self,
-    };
-};
-
-pub const Eval = struct {
-    node: Node,
-    crux: Crux,
-    then: *Kont,
-};
-
-pub const Exec = union(enum) {
-    eval: Eval,
-    fork: struct {
-        left: Eval,
-        right: Eval,
-    },
-    give: struct {
-        idea: Idea,
-        then: *Kont,
-    },
-    done: struct {
-        idea: Idea,
-    },
-};
-
 /// Example 3.4. in *A Pretty Expressive Printer*.
 ///
 /// > Consider an optimality objective that minimizes the sum of overflows
@@ -690,7 +689,7 @@ pub const Exec = union(enum) {
 /// > and then minimizes the height (the total number of newline characters,
 /// > or equivalently, the number of lines minus one).
 pub const F1 = struct {
-    pub fn init(w: u16) CostFactory {
+    pub fn init(w: u16) Cost {
         return .{ .f1 = w };
     }
 };
@@ -705,7 +704,7 @@ pub const F1 = struct {
 /// > This is (essentially) the default cost factory that our implementation,
 /// > *PrettyExpressive*, employs.
 pub const F2 = struct {
-    pub fn init(w: u16) CostFactory {
+    pub fn init(w: u16) Cost {
         return .{ .f2 = w };
     }
 };
@@ -786,14 +785,12 @@ pub const Frob = packed struct {
     warp: u1 = 0,
     /// apply nest(n, _) to result
     nest: u6 = 0,
-    /// unused
-    pad: u1 = 0,
 };
 
 pub const Oper = packed struct {
     kind: Tag = .cons,
     frob: Frob = .{},
-    item: u21 = 0,
+    item: u22 = 0,
 };
 
 /// 32-bit handle to either terminal or operation; implicitly indexes
@@ -824,7 +821,7 @@ pub const Node = packed struct {
 
     pub const halt = Node.fromRune(0, 0);
 
-    fn view(comptime T: type, this: Node) T {
+    pub fn view(comptime T: type, this: Node) T {
         return @bitCast(this);
     }
 
@@ -921,7 +918,7 @@ pub const Node = packed struct {
         return @bitCast(rune);
     }
 
-    pub fn fromOper(kind: Tag, frob: Frob, what: u21) Node {
+    pub fn fromOper(kind: Tag, frob: Frob, what: u22) Node {
         const oper: Oper = .{
             .kind = kind,
             .frob = frob,
@@ -943,31 +940,6 @@ pub const Pair = packed struct {
         return .{ .head = a, .tail = .halt };
     }
 };
-
-pub fn List(Elem: type) type {
-    return struct {
-        pool: std.heap.MemoryPool(Elem),
-
-        pub fn init(bank: Bank) @This() {
-            return .{ .pool = std.heap.MemoryPool(Elem).init(bank) };
-        }
-
-        pub fn deinit(this: *@This()) void {
-            this.pool.deinit();
-        }
-
-        pub fn push(this: *@This(), bank: Bank, elem: Elem) !*Elem {
-            _ = bank;
-            const ptr = try this.pool.create();
-            ptr.* = elem;
-            return ptr;
-        }
-
-        pub fn size(this: *const @This()) usize {
-            return this.pool.arena.queryCapacity();
-        }
-    };
-}
 
 pub const Heap = struct {
     text: std.ArrayList(u8) = .empty,
@@ -991,37 +963,52 @@ pub const Heap = struct {
 pub const Tree = struct {
     bank: Bank,
     heap: Heap,
-    flatten_cache: std.AutoHashMap(u32, Node),
+    flatmemo: std.AutoHashMap(Node, Node),
+    consmemo: std.AutoHashMap(Pair, u22),
 
     pub fn init(bank: Bank) Tree {
         return .{
             .bank = bank,
             .heap = .{},
-            .flatten_cache = std.AutoHashMap(u32, Node).init(bank),
+            .flatmemo = std.AutoHashMap(Node, Node).init(bank),
+            .consmemo = std.AutoHashMap(Pair, u22).init(bank),
         };
     }
 
     pub fn deinit(tree: *Tree) void {
         tree.heap.deinit(tree.bank);
-        tree.flatten_cache.deinit();
+        tree.flatmemo.deinit();
+        tree.consmemo.deinit();
     }
 
-    pub fn best(
-        tree: *Tree,
-        bank: Bank,
-        cost: CostFactory,
-        node: Node,
-        info: ?*std.Io.Writer,
-    ) !BestOutcome {
-        return try Loop.best(tree, bank, cost, node, info);
+    pub fn hashcons(tree: *Tree, frob: Frob, head: Node, tail: Node) !Node {
+        const pair = Pair{ .head = head, .tail = tail };
+
+        if (tree.consmemo.get(pair)) |idx| {
+            return Node.fromOper(.cons, frob, idx);
+        }
+
+        const idx = tree.heap.cons.items.len;
+        if (idx > std.math.maxInt(u22))
+            return error.OutOfConses;
+
+        const node = Node.fromOper(.cons, frob, @intCast(idx));
+
+        try tree.heap.cons.append(tree.bank, pair);
+        try tree.consmemo.put(pair, @intCast(idx));
+        return node;
+    }
+
+    pub fn pick(tree: *Tree, bank: Bank, cost: Cost, node: Node) !Best {
+        return try Loop.pick(tree, bank, cost, node);
     }
 
     pub fn rank(
         tree: *Tree,
-        cf: CostFactory,
+        cf: Cost,
         node: Node,
     ) !Rank {
-        const outcome = try tree.best(tree.bank, cf, node, null);
+        const outcome = try tree.pick(tree.bank, cf, node, null);
         return outcome.measure.rank;
     }
 
@@ -1040,13 +1027,13 @@ pub const Tree = struct {
                         if (ctx.base != 0)
                             try sink.splatByteAll(' ', ctx.base);
                     }
-                    ctx.head = ctx.base;
+                    ctx.last = ctx.base;
                     ctx.rows +|= rune.reps;
                 } else {
                     var buffer: [4]u8 = undefined;
                     const len = std.unicode.utf8Encode(rune.code, &buffer) catch unreachable;
                     for (0..rune.reps) |_| try sink.writeAll(buffer[0..len]);
-                    ctx.head +|= @intCast(len * rune.reps);
+                    ctx.last +|= @intCast(len * rune.reps);
                 }
             },
             .span => |span| {
@@ -1057,7 +1044,7 @@ pub const Tree = struct {
                 const slice = std.mem.sliceTo(tail, 0);
                 if (slice.len != 0) {
                     try sink.writeAll(slice);
-                    ctx.head +|= @intCast(slice.len);
+                    ctx.last +|= @intCast(slice.len);
                 }
 
                 if (span.char != 0 and span.side == .rchr)
@@ -1087,7 +1074,7 @@ pub const Tree = struct {
 
                 var child_ctx = ctx.*;
                 if (oper.frob.warp == 1)
-                    child_ctx.base = child_ctx.head;
+                    child_ctx.base = child_ctx.last;
                 if (oper.frob.nest != 0)
                     child_ctx.nest(oper.frob.nest);
 
@@ -1096,7 +1083,7 @@ pub const Tree = struct {
                 var right_ctx = child_ctx;
                 try tree.emitNode(sink, pair.tail, &right_ctx);
 
-                ctx.head = right_ctx.head;
+                ctx.last = right_ctx.last;
                 ctx.rows = right_ctx.rows;
             },
             .fork => return error.EmitEncounteredFork,
@@ -1108,21 +1095,16 @@ pub const Tree = struct {
             try sink.writeByte('\n');
             if (ctx.base != 0)
                 try sink.splatByteAll(' ', ctx.base);
-            ctx.head = ctx.base;
+            ctx.last = ctx.base;
             ctx.rows +|= 1;
         } else {
             try sink.writeByte(char);
-            ctx.head +|= 1;
+            ctx.last +|= 1;
         }
     }
 
     pub fn flat(tree: *Tree, doc: Node) !Node {
-        return tree.flattenRec(doc);
-    }
-
-    fn flattenRec(tree: *Tree, doc: Node) !Node {
-        const key = doc.repr();
-        if (tree.flatten_cache.get(key)) |entry| return entry;
+        if (tree.flatmemo.get(doc)) |entry| return entry;
 
         const result = switch (doc.look()) {
             .span => |span| blk: {
@@ -1137,35 +1119,32 @@ pub const Tree = struct {
             },
             .cons => |oper| blk: {
                 const pair = tree.heap.cons.items[oper.item];
-                const head = try tree.flattenRec(pair.head);
-                const tail = try tree.flattenRec(pair.tail);
+                const head = try tree.flat(pair.head);
+                const tail = try tree.flat(pair.tail);
                 const changed =
                     head.repr() != pair.head.repr() or
                     tail.repr() != pair.tail.repr();
                 if (!changed) break :blk doc;
 
-                const next: u21 = @intCast(tree.heap.cons.items.len);
-                try tree.heap.cons.append(tree.bank, .{ .head = head, .tail = tail });
-
-                break :blk Node.fromOper(.cons, oper.frob, next);
+                break :blk try tree.hashcons(oper.frob, head, tail);
             },
             .fork => |oper| blk: {
                 const pair = tree.heap.fork.items[oper.item];
-                const head = try tree.flattenRec(pair.head);
-                const tail = try tree.flattenRec(pair.tail);
+                const head = try tree.flat(pair.head);
+                const tail = try tree.flat(pair.tail);
                 const changed =
                     head.repr() != pair.head.repr() or
                     tail.repr() != pair.tail.repr();
                 if (!changed) break :blk doc;
 
-                const next: u21 = @intCast(tree.heap.fork.items.len);
+                const next: u22 = @intCast(tree.heap.fork.items.len);
                 try tree.heap.fork.append(tree.bank, .{ .head = head, .tail = tail });
 
                 break :blk Node.fromOper(.fork, oper.frob, next);
             },
         };
 
-        try tree.flatten_cache.put(key, result);
+        try tree.flatmemo.put(doc, result);
         return result;
     }
 
@@ -1257,13 +1236,11 @@ pub const Tree = struct {
         //
         // When A and B are tiny texts, A + B is often also a tiny text.
 
-        const next: u21 = @intCast(tree.heap.cons.items.len);
-        try tree.heap.cons.append(tree.bank, .{ .head = lhs, .tail = rhs });
-        return Node.fromOper(.cons, .{}, next);
+        return try tree.hashcons(.{}, lhs, rhs);
     }
 
     pub fn fork(tree: *Tree, lhs: Node, rhs: Node) !Node {
-        const next: u21 = @intCast(tree.heap.fork.items.len);
+        const next: u22 = @intCast(tree.heap.fork.items.len);
         try tree.heap.fork.append(tree.bank, .{ .head = lhs, .tail = rhs });
         return Node.fromOper(.fork, .{}, next);
     }
@@ -1585,7 +1562,7 @@ test "maze evaluation chooses best layout" {
     const doc = try tree.fork(inline_doc, multiline);
 
     const cost = F1.init(10);
-    const result = try tree.best(std.testing.allocator, cost, doc, null);
+    const result = try tree.pick(std.testing.allocator, cost, doc, null);
 
     const buf = try std.testing.allocator.alloc(u8, 64);
     defer std.testing.allocator.free(buf);
