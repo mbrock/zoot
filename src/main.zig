@@ -146,6 +146,303 @@ pub fn main() !void {
                 },
             },
         },
+        Step{
+            .run = .{
+                .tool = "zig",
+                .args = &.{
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                },
+            },
+        },
+        Step{ .wait = 30 },
+        Step{
+            .parallel = &.{
+                Step{ .run = .{ .tool = "zig", .args = &.{"test"} } },
+                Step{
+                    .run = .{
+                        .tool = "deploy",
+                        .args = &.{ "us-west", "blue" },
+                    },
+                },
+            },
+        },
+        Step{
+            .run = .{
+                .tool = "zig",
+                .args = &.{
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                },
+            },
+        },
+        Step{ .wait = 30 },
+        Step{
+            .parallel = &.{
+                Step{ .run = .{ .tool = "zig", .args = &.{"test"} } },
+                Step{
+                    .run = .{
+                        .tool = "deploy",
+                        .args = &.{ "us-west", "blue" },
+                    },
+                },
+            },
+        },
+        Step{
+            .run = .{
+                .tool = "zig",
+                .args = &.{
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                },
+            },
+        },
+        Step{ .wait = 30 },
+        Step{
+            .parallel = &.{
+                Step{ .run = .{ .tool = "zig", .args = &.{"test"} } },
+                Step{
+                    .run = .{
+                        .tool = "deploy",
+                        .args = &.{ "us-west", "blue" },
+                    },
+                },
+            },
+        },
+        Step{
+            .run = .{
+                .tool = "zig",
+                .args = &.{
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                },
+            },
+        },
+        Step{ .wait = 30 },
+        Step{
+            .parallel = &.{
+                Step{ .run = .{ .tool = "zig", .args = &.{"test"} } },
+                Step{
+                    .run = .{
+                        .tool = "deploy",
+                        .args = &.{ "us-west", "blue" },
+                    },
+                },
+            },
+        },
+        Step{
+            .run = .{
+                .tool = "zig",
+                .args = &.{
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                },
+            },
+        },
+        Step{ .wait = 30 },
+        Step{
+            .parallel = &.{
+                Step{ .run = .{ .tool = "zig", .args = &.{"test"} } },
+                Step{
+                    .run = .{
+                        .tool = "deploy",
+                        .args = &.{ "us-west", "blue" },
+                    },
+                },
+            },
+        },
+        Step{
+            .run = .{
+                .tool = "zig",
+                .args = &.{
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                },
+            },
+        },
+        Step{ .wait = 30 },
+        Step{
+            .parallel = &.{
+                Step{ .run = .{ .tool = "zig", .args = &.{"test"} } },
+                Step{
+                    .run = .{
+                        .tool = "deploy",
+                        .args = &.{ "us-west", "blue" },
+                    },
+                },
+            },
+        },
+        Step{
+            .run = .{
+                .tool = "zig",
+                .args = &.{
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                },
+            },
+        },
+        Step{ .wait = 30 },
+        Step{
+            .parallel = &.{
+                Step{ .run = .{ .tool = "zig", .args = &.{"test"} } },
+                Step{
+                    .run = .{
+                        .tool = "deploy",
+                        .args = &.{ "us-west", "blue" },
+                    },
+                },
+            },
+        },
+        Step{
+            .run = .{
+                .tool = "zig",
+                .args = &.{
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                },
+            },
+        },
+        Step{ .wait = 30 },
+        Step{
+            .parallel = &.{
+                Step{ .run = .{ .tool = "zig", .args = &.{"test"} } },
+                Step{
+                    .run = .{
+                        .tool = "deploy",
+                        .args = &.{ "us-west", "blue" },
+                    },
+                },
+            },
+        },
+        Step{
+            .run = .{
+                .tool = "zig",
+                .args = &.{
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                },
+            },
+        },
+        Step{ .wait = 30 },
+        Step{
+            .parallel = &.{
+                Step{ .run = .{ .tool = "zig", .args = &.{"test"} } },
+                Step{
+                    .run = .{
+                        .tool = "deploy",
+                        .args = &.{ "us-west", "blue" },
+                    },
+                },
+            },
+        },
+        Step{
+            .run = .{
+                .tool = "zig",
+                .args = &.{
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                },
+            },
+        },
+        Step{ .wait = 30 },
+        Step{
+            .parallel = &.{
+                Step{ .run = .{ .tool = "zig", .args = &.{"test"} } },
+                Step{
+                    .run = .{
+                        .tool = "deploy",
+                        .args = &.{ "us-west", "blue" },
+                    },
+                },
+            },
+        },
+        Step{
+            .run = .{
+                .tool = "zig",
+                .args = &.{
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                },
+            },
+        },
+        Step{ .wait = 30 },
+        Step{
+            .parallel = &.{
+                Step{ .run = .{ .tool = "zig", .args = &.{"test"} } },
+                Step{
+                    .run = .{
+                        .tool = "deploy",
+                        .args = &.{ "us-west", "blue" },
+                    },
+                },
+            },
+        },
     };
 
     const pipeline = Pipeline{
@@ -162,7 +459,7 @@ pub fn main() !void {
 
     try writer.print("┏━ CEK debug ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{});
     const Cost = pp.F2;
-    const cost_model = Cost.init(80);
+    const cost_model = Cost.init(100);
     const cost_factory = cost_model.factory();
 
     var frames = pp.List(pp.Kont).init(allocator);
@@ -175,14 +472,6 @@ pub fn main() !void {
             .crux = .{},
             .then = k_done,
         },
-    };
-
-    var loop = pp.Loop{
-        .tree = &t,
-        .bank = allocator,
-        .cost = cost_factory,
-        .node = doc,
-        .info = null,
     };
 
     const debug_limit: usize = 12;
@@ -209,7 +498,7 @@ pub fn main() !void {
                     .{
                         state.idea.last,
                         state.idea.rows,
-                        state.idea.icky,
+                        cost_factory.tainted(state.idea.rank),
                     },
                 );
             },
@@ -229,7 +518,7 @@ pub fn main() !void {
                     .{
                         state.idea.last,
                         state.idea.rows,
-                        state.idea.icky,
+                        cost_factory.tainted(state.idea.rank),
                     },
                 );
                 stop = true;
@@ -238,7 +527,7 @@ pub fn main() !void {
 
         if (stop) break;
 
-        loop.machineStep(&frames, &machine, null, null) catch |err| {
+        machine = pp.Loop.step(&t, cost_factory, &frames, machine, null, null) catch |err| {
             try writer.print("┃   step error: {s}\n", .{@errorName(err)});
             break;
         };
@@ -257,7 +546,7 @@ pub fn main() !void {
 
     try writer.print(
         "  rank: overflow={d} height={d} tainted={}\n",
-        .{ rank.o, rank.h, measure.icky },
+        .{ rank.o, rank.h, cost_factory.tainted(measure.rank) },
     );
     try writer.print(
         "  layouts: completions={d} frontier={d} tainted_kept={} queue_peak={d}\n",
