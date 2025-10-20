@@ -11,6 +11,8 @@ pub const Tidy = struct {
     loop: *Loop,
     doop: Loop,
     wave: std.EnumArray(Tag, u21) = .initFill(0),
+    kont_head_wave: u29 = 0,
+    kont_tail_wave: u29 = 0,
 
     pub fn tidy(boop: *Loop) !Loop {
         var this = Tidy{
@@ -19,16 +21,28 @@ pub const Tidy = struct {
                 .tree = Tree.init(boop.tree.bank),
                 .cost = boop.cost,
                 .memo = Memo.init(boop.tree.bank),
-                .pool = Pool(Kont).init(boop.tree.bank),
                 .flip = if (boop.flip == 0) 1 else 0,
             },
         };
 
+        // Copy all roots: pile, best, and icky
         for (this.loop.pile.items) |*exec| {
             exec.node = try this.copy(exec.node);
+            exec.then = try this.copy_kont(exec.then);
+        }
+
+        for (this.loop.best.items) |*idea| {
+            idea.node = try this.copy(idea.node);
+        }
+
+        if (this.loop.icky) |*icky| {
+            icky.node = try this.copy(icky.node);
         }
 
         try this.scan();
+
+        // Rebuild memo, filtering out unreachable entries
+        try this.rebuild_memo();
 
         return this.doop;
     }
@@ -36,7 +50,7 @@ pub const Tidy = struct {
     fn copy(this: *Tidy, node: Node) !Node {
         switch (node.tag) {
             inline .cans, .cons, .fork => |tag| {
-                var oper = Node.view(Oper, node);
+                const oper = Node.view(Oper, node);
                 if (oper.flip == this.doop.flip)
                     return node;
 
@@ -48,7 +62,11 @@ pub const Tidy = struct {
 
                 const i = nextfeed.items.len;
                 try nextfeed.append(this.loop.tree.bank, .{ pair.head, pair.tail });
-                const next = Node.fromOper(tag, oper.frob, i);
+                
+                var next_oper = oper.*;
+                next_oper.flip = this.doop.flip;
+                next_oper.item = @intCast(i);
+                const next: Node = @bitCast(next_oper);
 
                 pair.head = Node.bolt;
                 pair.tail = next;
@@ -63,6 +81,8 @@ pub const Tidy = struct {
             inline for (tags) |tag| {
                 try this.pull(tag);
             }
+            try this.pull_kont_heads();
+            try this.pull_kont_tails();
         }
     }
 
@@ -94,6 +114,12 @@ pub const Tidy = struct {
                 return false;
         }
 
+        if (this.kont_head_wave < this.doop.tree.heap.kont_head.items.len)
+            return false;
+
+        if (this.kont_tail_wave < this.doop.tree.heap.kont_tail.items.len)
+            return false;
+
         return true;
     }
 
@@ -117,13 +143,131 @@ pub const Tidy = struct {
         const tail = try this.copy(feed.items[item].tail);
         feed.items[item].tail = tail;
     }
+
+    fn copy_kont(this: *Tidy, handle: Handle) !Handle {
+        if (handle.kind == .none) return Handle.none;
+
+        return switch (handle.kind) {
+            .head => blk: {
+                var kont = &this.loop.tree.heap.kont_head.items[handle.item];
+                if (kont.then.flip == this.doop.flip) {
+                    // Already forwarded, return the new handle stored in .then
+                    break :blk kont.then;
+                }
+
+                // Copy to new space
+                const new_idx: u29 = @intCast(this.doop.tree.heap.kont_head.items.len);
+                const new_kont = kont.*;
+                try this.doop.tree.heap.kont_head.append(this.loop.tree.bank, new_kont);
+
+                // Leave forwarding pointer
+                const new_handle = Handle.make(.head, this.doop.flip, new_idx);
+                kont.then = new_handle;
+
+                break :blk new_handle;
+            },
+            .tail => blk: {
+                var kont = &this.loop.tree.heap.kont_tail.items[handle.item];
+                if (kont.then.flip == this.doop.flip) {
+                    // Already forwarded, return the new handle stored in .then
+                    break :blk kont.then;
+                }
+
+                // Copy to new space
+                const new_idx: u29 = @intCast(this.doop.tree.heap.kont_tail.items.len);
+                const new_kont = kont.*;
+                try this.doop.tree.heap.kont_tail.append(this.loop.tree.bank, new_kont);
+
+                // Leave forwarding pointer
+                const new_handle = Handle.make(.tail, this.doop.flip, new_idx);
+                kont.then = new_handle;
+
+                break :blk new_handle;
+            },
+            .none => unreachable,
+        };
+    }
+
+    fn pull_kont_heads(this: *Tidy) !void {
+        var i = this.kont_head_wave;
+        while (i < this.doop.tree.heap.kont_head.items.len) : (i += 1) {
+            try this.drag_kont_head(i);
+        }
+        this.kont_head_wave = i;
+    }
+
+    fn pull_kont_tails(this: *Tidy) !void {
+        var i = this.kont_tail_wave;
+        while (i < this.doop.tree.heap.kont_tail.items.len) : (i += 1) {
+            try this.drag_kont_tail(i);
+        }
+        this.kont_tail_wave = i;
+    }
+
+    fn drag_kont_head(this: *Tidy, item: u29) !void {
+        var kont = &this.doop.tree.heap.kont_head.items[item];
+        
+        // Copy nodes inside the kont
+        kont.node = try this.copy(kont.node);
+        kont.item.node = try this.copy(kont.item.node);
+        
+        // Copy the continuation chain
+        kont.then = try this.copy_kont(kont.then);
+    }
+
+    fn drag_kont_tail(this: *Tidy, item: u29) !void {
+        var kont = &this.doop.tree.heap.kont_tail.items[item];
+        
+        // Copy nodes inside the kont
+        kont.idea.node = try this.copy(kont.idea.node);
+        kont.item.node = try this.copy(kont.item.node);
+        
+        // Copy the continuation chain
+        kont.then = try this.copy_kont(kont.then);
+    }
+
+    fn was_forwarded(this: *Tidy, node: Node) ?Node {
+        return switch (node.tag) {
+            inline .cans, .cons, .fork => |tag| {
+                const oper = Node.view(Oper, node);
+                if (oper.flip != this.doop.flip) return null;
+                
+                const pastfeed = this.past(tag);
+                const pair = &pastfeed.items[oper.item];
+                
+                // Check if this was forwarded (bolt marker)
+                if (pair.head == Node.bolt) return pair.tail;
+                return null;
+            },
+            else => node, // Terminal nodes don't need forwarding
+        };
+    }
+
+    fn rebuild_memo(this: *Tidy) !void {
+        var iter = this.loop.memo.iterator();
+        while (iter.next()) |entry| {
+            const old_key = entry.key_ptr.*;
+            const old_value = entry.value_ptr.*;
+
+            // Check if key's node was forwarded (is reachable)
+            const new_key_node = this.was_forwarded(old_key.node) orelse continue;
+
+            // Translate key and value to new space
+            var new_key = old_key;
+            new_key.node = new_key_node;
+
+            var new_value = old_value;
+            new_value.node = this.was_forwarded(old_value.node) orelse continue;
+
+            try this.doop.memo.put(new_key, new_value);
+        }
+    }
 };
 
 pub const Loop = struct {
     tree: *Tree,
     cost: Cost,
     memo: Memo,
-    pool: Pool(Kont),
     stat: Stat = .{},
     pile: std.ArrayList(Exec) = .empty,
     best: std.ArrayList(Idea) = .empty,
@@ -134,7 +278,6 @@ pub const Loop = struct {
         this.best.deinit(this.tree.bank);
         this.pile.deinit(this.tree.bank);
         this.memo.deinit();
-        this.pool.deinit();
     }
 
     pub fn pick(
@@ -147,7 +290,6 @@ pub const Loop = struct {
             .tree = tree,
             .cost = cost,
             .memo = .init(bank),
-            .pool = .init(bank),
         };
         defer this.deinit();
 
@@ -192,7 +334,7 @@ pub const Loop = struct {
 
                 switch (exec.tick) {
                     .give => |gist| {
-                        if (exec.then == null) {
+                        if (exec.then.kind == .none) {
                             const idea: Idea = .{ .gist = gist, .node = exec.node };
                             try this.meld(idea);
 
@@ -221,7 +363,7 @@ pub const Loop = struct {
 
                 switch (exec.tick) {
                     .give => |gist| {
-                        if (exec.then == null) {
+                        if (exec.then.kind == .none) {
                             try this.meld(.{ .gist = gist, .node = exec.node });
                             break;
                         }
@@ -239,10 +381,16 @@ pub const Loop = struct {
         }
     }
 
-    pub fn punt(this: *@This(), kont: Kont) !*Kont {
-        const that = try this.pool.create();
-        that.* = kont;
-        return that;
+    pub fn punt_head(this: *@This(), kont: KontHead) !Handle {
+        const idx: u29 = @intCast(this.tree.heap.kont_head.items.len);
+        try this.tree.heap.kont_head.append(this.tree.bank, kont);
+        return Handle.make(.head, this.flip, idx);
+    }
+
+    pub fn punt_tail(this: *@This(), kont: KontTail) !Handle {
+        const idx: u29 = @intCast(this.tree.heap.kont_tail.items.len);
+        try this.tree.heap.kont_tail.append(this.tree.bank, kont);
+        return Handle.make(.tail, this.flip, idx);
     }
 
     /// Advance the CEK machine by a single step.
@@ -315,16 +463,11 @@ pub const Loop = struct {
                         exec.node = cons.head;
 
                         // Splice the cons task with the current continuation.
-                        exec.then = try this.punt(.{
-                            .cons = .{
-                                // This continuation is resumed when the cons head is done.
-                                .head = .{
-                                    // Afterwards, proceed with the cons tail.
-                                    .node = cons.tail,
-                                    // Use the same indent base.
-                                    .base = eval.base,
-                                },
-                            },
+                        exec.then = try this.punt_head(.{
+                            // Afterwards, proceed with the cons tail.
+                            .node = cons.tail,
+                            // Use the same indent base.
+                            .base = eval.base,
                             // After the cons tail, return to the current continuation.
                             .then = then,
                             // Remember what item we are evaluating.
@@ -362,82 +505,86 @@ pub const Loop = struct {
                 // We have evaluated a node to a gist and a forkless node.
                 // If there is a current continuation, inspect it to proceed.
 
-                if (exec.then) |cont| {
-                    if (cont.cons.look() == .head) {
-                        // We have evaluated the head of a cons.
+                if (exec.then.kind != .none) {
+                    switch (exec.then.kind) {
+                        .head => {
+                            // We have evaluated the head of a cons.
+                            const cont = &this.tree.heap.kont_head.items[exec.then.item];
 
-                        const node = exec.node;
-                        const gist = exec.tick.give;
-                        const icky = this.cost.icky(gist.rank);
+                            const node = exec.node;
+                            const gist = exec.tick.give;
+                            const icky = this.cost.icky(gist.rank);
 
-                        if (!icks and icky) return error.Icky;
+                            if (!icks and icky) return error.Icky;
 
-                        // We must evaluate the tail also before continuing.
-                        exec.node = cont.cons.head.node;
+                            // We must evaluate the tail also before continuing.
+                            exec.node = cont.node;
 
-                        // After the cons tail, we will combine and continue.
-                        exec.then = try this.punt(.{
-                            // Remember which cons item we are evaluating.
-                            .item = cont.item,
-                            // Remember the followup continuation.
-                            .then = cont.then,
-                            // Remember the evaluation result of the head.
-                            .cons = .{
-                                .tail = .{
+                            // After the cons tail, we will combine and continue.
+                            exec.then = try this.punt_tail(.{
+                                // Remember which cons item we are evaluating.
+                                .item = cont.item,
+                                // Remember the followup continuation.
+                                .then = cont.then,
+                                // Remember the evaluation result of the head.
+                                .idea = .{
                                     .gist = gist,
                                     .node = node,
                                 },
-                            },
-                        });
+                            });
 
-                        // Set the tail evaluation context.
-                        exec.tick = .{
-                            .eval = .{
-                                // The indent base is the same as in the head's context.
-                                .base = cont.cons.head.base,
-                                // The last column is threaded onwards.
-                                .last = gist.last,
-                                // The line count is threaded onwards.
-                                .rows = gist.rows,
-                                // The ickiness is threaded onwards.
-                                .icky = icky,
-                            },
-                        };
+                            // Set the tail evaluation context.
+                            exec.tick = .{
+                                .eval = .{
+                                    // The indent base is the same as in the head's context.
+                                    .base = cont.base,
+                                    // The last column is threaded onwards.
+                                    .last = gist.last,
+                                    // The line count is threaded onwards.
+                                    .rows = gist.rows,
+                                    // The ickiness is threaded onwards.
+                                    .icky = icky,
+                                },
+                            };
 
-                        return;
-                    } else {
-                        // We have evaluated both the head and the tail of a cons.
+                            return;
+                        },
+                        .tail => {
+                            // We have evaluated both the head and the tail of a cons.
+                            const cont = &this.tree.heap.kont_tail.items[exec.then.item];
 
-                        const past = cont.cons.tail;
-                        const curr = exec.tick.give;
+                            const past = cont.idea;
+                            const curr = exec.tick.give;
 
-                        // Combine the head & tail gists into a gist for the whole cons.
-                        var gist = curr;
-                        gist.rows +|= past.gist.rows;
-                        gist.rank = this.cost.plus(curr.rank, past.gist.rank);
+                            // Combine the head & tail gists into a gist for the whole cons.
+                            var gist = curr;
+                            gist.rows +|= past.gist.rows;
+                            gist.rank = this.cost.plus(curr.rank, past.gist.rank);
 
-                        // Both sides of the cons may have been forking nodes.
-                        // Make a forkless cons node from the resolved head and tail nodes.
-                        const oper = Node.view(Oper, cont.item.node);
-                        const node = try this.tree.cans(oper.frob, past.node, exec.node);
+                            // Both sides of the cons may have been forking nodes.
+                            // Make a forkless cons node from the resolved head and tail nodes.
+                            const oper = Node.view(Oper, cont.item.node);
+                            const node = try this.tree.cans(oper.frob, past.node, exec.node);
 
-                        // We also save the combined evaluation result of this item
-                        // to avoid recomputing it later.
-                        try this.memo.put(cont.item, .{ .node = node, .gist = gist });
+                            // We also save the combined evaluation result of this item
+                            // to avoid recomputing it later.
+                            try this.memo.put(cont.item, .{ .node = node, .gist = gist });
 
-                        // If this cons made the context icky, bail out.
-                        if (!icks and this.cost.icky(gist.rank)) return error.Icky;
+                            // If this cons made the context icky, bail out.
+                            if (!icks and this.cost.icky(gist.rank)) return error.Icky;
 
-                        exec.* = .{
-                            // Next step is the giving of a result.
-                            .tick = .{ .give = gist },
-                            // The forkless node is the node we will give the result for.
-                            .node = node,
-                            // The result will be given to the continuation of the cons.
-                            .then = cont.then,
-                        };
+                            exec.* = .{
+                                // Next step is the giving of a result.
+                                .tick = .{ .give = gist },
+                                // The forkless node is the node we will give the result for.
+                                .node = node,
+                                // The result will be given to the continuation of the cons.
+                                .then = cont.then,
+                            };
 
-                        return;
+                            return;
+                        },
+                        .none => unreachable,
                     }
                 }
             },
@@ -509,7 +656,7 @@ pub const Exec = struct {
         eval: Crux,
         give: Gist,
     },
-    then: ?*Kont = null,
+    then: Handle = Handle.none,
 };
 
 pub const Item = packed struct {
@@ -520,31 +667,42 @@ pub const Item = packed struct {
 
 pub const Memo = std.AutoHashMap(Item, Idea);
 
-pub const Kont = packed struct {
-    /// To avoid tagging this union, we use the `head.flag` field
-    /// to signal the continuation type.
-    ///
-    /// This lets `Kont` stay a packed struct of nice round size.
-    cons: packed union {
-        head: packed struct {
-            node: Node,
-            base: u16,
-            flag: u80 = std.math.maxInt(u80),
-        },
-        tail: Idea,
+pub const KontKind = enum(u2) {
+    none = 0,
+    head = 1,
+    tail = 2,
+};
 
-        pub fn look(this: @This()) enum { head, tail } {
-            return if (this.head.flag == std.math.maxInt(u80))
-                .head
-            else
-                .tail;
-        }
-    },
+pub const Handle = packed struct {
+    kind: KontKind = .none,
+    flip: u1 = 0,
+    item: u29 = 0,
+
+    pub const none: Handle = .{ .kind = .none, .flip = 1, .item = std.math.maxInt(u29) };
+
+    pub fn make(kind: KontKind, flip: u1, idx: u29) Handle {
+        return .{ .kind = kind, .flip = flip, .item = idx };
+    }
+};
+
+pub const KontHead = packed struct {
+    node: Node,
+    base: u16,
     item: Item,
-    then: ?*Kont,
+    then: Handle,
 
     comptime {
-        std.debug.assert(@sizeOf(Kont) == 32);
+        std.debug.assert(@sizeOf(KontHead) == 32);
+    }
+};
+
+pub const KontTail = packed struct {
+    idea: Idea,
+    item: Item,
+    then: Handle,
+
+    comptime {
+        std.debug.assert(@sizeOf(KontTail) == 32);
     }
 };
 
@@ -999,7 +1157,7 @@ pub const Node = packed struct {
         return @bitCast(rune);
     }
 
-    pub fn fromOper(kind: Tag, frob: Frob, what: u22) Node {
+    pub fn fromOper(kind: Tag, frob: Frob, what: u21) Node {
         const oper: Oper = .{
             .kind = kind,
             .frob = frob,
@@ -1027,12 +1185,16 @@ pub const Heap = struct {
     cons: std.ArrayList(Pair) = .empty,
     fork: std.ArrayList(Pair) = .empty,
     cans: std.ArrayList(Pair) = .empty,
+    kont_head: std.ArrayList(KontHead) = .empty,
+    kont_tail: std.ArrayList(KontTail) = .empty,
 
     pub fn deinit(this: *@This(), alloc: Bank) void {
         this.text.deinit(alloc);
         this.cons.deinit(alloc);
         this.fork.deinit(alloc);
         this.cans.deinit(alloc);
+        this.kont_head.deinit(alloc);
+        this.kont_tail.deinit(alloc);
     }
 };
 
@@ -1230,7 +1392,7 @@ pub const Tree = struct {
                     tail.repr() != pair.tail.repr();
                 if (!changed) break :blk doc;
 
-                const next: u22 = @intCast(tree.heap.fork.items.len);
+                const next: u21 = @intCast(tree.heap.fork.items.len);
                 try tree.heap.fork.append(tree.bank, .{ .head = head, .tail = tail });
 
                 break :blk Node.fromOper(.fork, oper.frob, next);
@@ -1299,13 +1461,13 @@ pub const Tree = struct {
     }
 
     pub fn cons(tree: *Tree, frob: Frob, lhs: Node, rhs: Node) !Node {
-        const next: u22 = @intCast(tree.heap.cons.items.len);
+        const next: u21 = @intCast(tree.heap.cons.items.len);
         try tree.heap.cons.append(tree.bank, .{ .head = lhs, .tail = rhs });
         return Node.fromOper(.cons, frob, next);
     }
 
     pub fn cans(tree: *Tree, frob: Frob, lhs: Node, rhs: Node) !Node {
-        const next: u22 = @intCast(tree.heap.cans.items.len);
+        const next: u21 = @intCast(tree.heap.cans.items.len);
         try tree.heap.cans.append(tree.bank, .{ .head = lhs, .tail = rhs });
         return Node.fromOper(.cans, frob, next);
     }
@@ -1347,7 +1509,7 @@ pub const Tree = struct {
     }
 
     pub fn fork(tree: *Tree, lhs: Node, rhs: Node) !Node {
-        const next: u22 = @intCast(tree.heap.fork.items.len);
+        const next: u21 = @intCast(tree.heap.fork.items.len);
         try tree.heap.fork.append(tree.bank, .{ .head = lhs, .tail = rhs });
         return Node.fromOper(.fork, .{}, next);
     }
