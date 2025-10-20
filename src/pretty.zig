@@ -14,9 +14,9 @@ pub const Pair = struct {
         return .{ .head = a, .tail = .halt };
     }
 
-    pub fn drag(node: *Node, room: *Room) !void {
-        try room.move(&node.head);
-        try room.move(&node.tail);
+    pub fn drag(node: *Pair, room: *Room, bank: Bank) !void {
+        node.head = try node.head.warp(room, bank);
+        node.tail = try node.tail.warp(room, bank);
     }
 };
 
@@ -84,9 +84,14 @@ pub fn Rack(Elem: type) type {
             return rack.list.items[rack.scan..];
         }
 
-        pub fn pull(this: *@This(), room: *Room) !void {
-            for (this.rift()) |*elem| {
-                try elem.drag(room);
+        pub fn pull(this: *@This(), room: *Room, bank: Bank) !void {
+            while (this.scan < this.list.items.len) {
+                const i = this.scan;
+                // Copy out to avoid iterator invalidation during drag
+                var elem = this.list.items[i];
+                try elem.drag(room, bank);
+                // Write back after drag completes
+                this.list.items[i] = elem;
                 this.scan += 1;
             }
         }
@@ -120,25 +125,25 @@ pub const Heap = struct {
             this.ktwo.calm();
     }
 
-    pub fn pull(this: *@This(), room: *Room) !void {
-        try this.cons.pull(room);
-        try this.fork.pull(room);
-        try this.cans.pull(room);
-        try this.kone.pull(room);
-        try this.ktwo.pull(room);
+    pub fn pull(this: *@This(), room: *Room, bank: Bank) !void {
+        try this.cons.pull(room, bank);
+        try this.fork.pull(room, bank);
+        try this.cans.pull(room, bank);
+        try this.kone.pull(room, bank);
+        try this.ktwo.pull(room, bank);
     }
 };
 
 pub const Room = struct {
-    heap: [2]Heap,
+    heap: [2]*Heap,
     flap: u1 = 0,
 
     pub fn move(room: *Room, bank: Bank, that: anytype) !void {
         that.* = that.warp(room, bank);
     }
 
-    pub fn pull(room: *Room) !void {
-        try room.heap[room.flap].pull(room);
+    pub fn pull(room: *Room, bank: Bank) !void {
+        try room.heap[room.flap].pull(room, bank);
     }
 };
 
@@ -162,30 +167,44 @@ pub const Node = packed struct {
     ) !Node {
         if (word.calm(room.flap)) return word;
 
-        const heap = &room.heap[room.flap];
-        const leap = &room.heap[room.flap ^ 1];
+        const dest_heap = room.heap[room.flap];
+        const from_heap = room.heap[room.flap ^ 1];
 
-        const rack: *Rack(Pair) = word.rack(heap);
-        const wack: *Rack(Pair) = word.rack(leap);
+        const from: *Rack(Pair) = word.rack(from_heap);
+        const dest: *Rack(Pair) = word.rack(dest_heap);
 
-        if (rack.look(word.unit())) |turn|
+        const item = word.unit();
+        if (from.look(item)) |turn|
             return @bitCast(turn);
 
-        const data: Pair = rack.list.items[word.unit()];
-        const next = try wack.push(bank, data);
+        const data: Pair = from.list.items[item];
+        const next = try dest.push(bank, data);
 
         const bird: Node = word.onto(@intCast(next));
 
-        rack.burn(word.unit, @bitCast(bird));
+        from.burn(item, @bitCast(bird));
 
         return bird;
     }
 
-    pub fn onto(this: Node, unit: u21) Node {
+    pub fn onto(this: Node, item: u21) Node {
         var oper = view(Oper, this);
-        oper.item = unit;
+        oper.item = item;
         oper.flip ^= 1;
-        return oper;
+        return @bitCast(oper);
+    }
+
+    pub fn rack(this: Node, heap: *Heap) *Rack(Pair) {
+        return switch (this.tag) {
+            .cons => &heap.cons,
+            .fork => &heap.fork,
+            .cans => &heap.cans,
+            else => unreachable,
+        };
+    }
+
+    pub fn unit(this: Node) u21 {
+        return view(Oper, this).item;
     }
 
     pub const Form = Tag;
@@ -327,10 +346,9 @@ pub const Node = packed struct {
 
 /// Cheney-style compacting GC pass.
 pub const Tidy = struct {
-    const tags: [3]Tag = .{ .cans, .cons, .fork };
-
     loop: *Loop,
     doop: Loop,
+    room: Room,
 
     pub fn tidy(boop: *Loop) !Loop {
         std.debug.assert(boop.tree.flip == boop.flip);
@@ -353,239 +371,41 @@ pub const Tidy = struct {
                 .memo = Memo.init(boop.tree.bank),
                 .flip = new_flip,
             },
+            .room = .{
+                .heap = if (new_flip == 0)
+                    .{ &new_tree.heap, &boop.tree.heap }
+                else
+                    .{ &boop.tree.heap, &new_tree.heap },
+                .flap = new_flip,
+            },
         };
 
-        // Copy all roots: pile, best, and icky
-        // Note: we modify loop's collections in-place, then transfer to doop
+        // Copy all roots
         for (this.loop.pile.items) |*exec| {
-            exec.node = try this.copy(exec.node);
-            exec.then = try this.copy_kont(exec.then);
+            exec.node = try exec.node.warp(&this.room, boop.tree.bank);
+            exec.then = try exec.then.warp(&this.room, boop.tree.bank);
         }
 
         for (this.loop.best.items) |*idea| {
-            idea.node = try this.copy(idea.node);
+            idea.node = try idea.node.warp(&this.room, boop.tree.bank);
         }
 
         if (this.loop.icky) |*icky| {
-            icky.node = try this.copy(icky.node);
+            icky.node = try icky.node.warp(&this.room, boop.tree.bank);
         }
 
-        try this.scan();
+        // Scan until fixed point
+        while (!this.doop.tree.heap.calm()) {
+            try this.doop.tree.heap.pull(&this.room, boop.tree.bank);
+        }
 
-        // Rebuild memo, filtering out unreachable entries
         try this.rebuild_memo();
 
-        // Transfer updated collections to doop
         this.doop.pile = this.loop.pile;
         this.doop.best = this.loop.best;
         this.doop.icky = this.loop.icky;
 
         return this.doop;
-    }
-
-    fn copy(this: *Tidy, node: Node) !Node {
-        switch (node.tag) {
-            inline .cans, .cons, .fork => |tag| {
-                const oper = Node.view(Oper, node);
-                if (oper.flip == this.doop.flip)
-                    return node;
-
-                var pastfeed = this.past(tag);
-                var nextfeed = this.list(tag);
-
-                if (pastfeed.look(oper.item)) |turn| {
-                    return @bitCast(turn);
-                }
-
-                const i = try nextfeed.push(
-                    this.loop.tree.bank,
-                    pastfeed.list.items[oper.item],
-                );
-
-                var next_oper = oper;
-                next_oper.flip = this.doop.flip;
-                if (std.math.cast(u21, i)) |j|
-                    next_oper.item = j
-                else
-                    std.debug.panic("big {d} for {t}", .{ i, tag });
-                const next: Node = @bitCast(next_oper);
-
-                pastfeed.burn(oper.item, @bitCast(next));
-
-                return next;
-            },
-            // Terminal nodes don't need copying
-            .span, .quad, .trip, .rune => return node,
-        }
-    }
-
-    fn scan(this: *Tidy) !void {
-        while (!this.calm()) {
-            inline for (tags) |tag| {
-                try this.pull(tag);
-            }
-            try this.pull_kont_heads();
-            try this.pull_kont_tails();
-        }
-    }
-
-    fn size(this: *Tidy, comptime tag: Tag) u21 {
-        return @intCast(this.list(tag).list.items.len);
-    }
-
-    fn list(this: *Tidy, comptime tag: Tag) *Rack(Pair) {
-        return switch (tag) {
-            .cans => &this.doop.tree.heap.cans,
-            .cons => &this.doop.tree.heap.cons,
-            .fork => &this.doop.tree.heap.fork,
-            else => unreachable,
-        };
-    }
-
-    fn past(this: *Tidy, comptime tag: Tag) *Rack(Pair) {
-        return switch (tag) {
-            .cans => &this.loop.tree.heap.cans,
-            .cons => &this.loop.tree.heap.cons,
-            .fork => &this.loop.tree.heap.fork,
-            else => unreachable,
-        };
-    }
-
-    fn calm(this: *Tidy) bool {
-        inline for (tags) |tag| {
-            if (this.list(tag).scan < this.size(tag))
-                return false;
-        }
-
-        if (this.doop.tree.heap.kone.scan < this.doop.tree.heap.kone.list.items.len)
-            return false;
-
-        if (this.doop.tree.heap.ktwo.scan < this.doop.tree.heap.ktwo.list.items.len)
-            return false;
-
-        return true;
-    }
-
-    fn pull(this: *Tidy, comptime tag: Tag) !void {
-        const feed = this.list(tag);
-        var i: u21 = @intCast(feed.scan);
-        while (i < feed.list.items.len) : (i += 1) {
-            try this.drag(feed, i);
-        }
-        feed.scan = i;
-    }
-
-    fn drag(
-        this: *Tidy,
-        feed: *Rack(Pair),
-        item: u21,
-    ) !void {
-        const elem = feed.list.items[item];
-        const head = try this.copy(elem.head);
-        feed.list.items[item].head = head;
-
-        const tail = try this.copy(elem.tail);
-        feed.list.items[item].tail = tail;
-    }
-
-    fn copy_kont(this: *Tidy, handle: Kont) !Kont {
-        if (handle.kind == .none) return Kont.none;
-
-        // If handle already has new flip bit, it's already in new space
-        if (handle.flip == this.doop.flip) return handle;
-
-        return switch (handle.kind) {
-            .head => blk: {
-                var rack = &this.loop.tree.heap.kone;
-                const kont = this.loop.tree.heap.kone.list.items[handle.item];
-
-                if (rack.look(handle.item)) |turn| {
-                    break :blk @bitCast(turn);
-                }
-
-                const new_idx: u29 = @intCast(
-                    try this.doop.tree.heap.kone.push(this.loop.tree.bank, kont),
-                );
-
-                const new_handle = Kont.make(.head, this.doop.flip, new_idx);
-                rack.burn(handle.item, @bitCast(new_handle));
-
-                break :blk new_handle;
-            },
-            .tail => blk: {
-                var rack = &this.loop.tree.heap.ktwo;
-                const kont = this.loop.tree.heap.ktwo.list.items[handle.item];
-
-                if (rack.look(handle.item)) |turn| {
-                    break :blk @bitCast(turn);
-                }
-
-                const new_idx: u29 = @intCast(
-                    try this.doop.tree.heap.ktwo.push(this.loop.tree.bank, kont),
-                );
-
-                const new_handle = Kont.make(.tail, this.doop.flip, new_idx);
-                rack.burn(handle.item, @bitCast(new_handle));
-
-                break :blk new_handle;
-            },
-            .none => unreachable,
-        };
-    }
-
-    fn pull_kont_heads(this: *Tidy) !void {
-        var i = this.doop.tree.heap.kone.scan;
-        while (i < this.doop.tree.heap.kone.list.items.len) : (i += 1) {
-            try this.drag_kont_head(@intCast(i));
-        }
-        this.doop.tree.heap.kone.scan = i;
-    }
-
-    fn pull_kont_tails(this: *Tidy) !void {
-        var i = this.doop.tree.heap.ktwo.scan;
-        while (i < this.doop.tree.heap.ktwo.list.items.len) : (i += 1) {
-            try this.drag_kont_tail(@intCast(i));
-        }
-        this.doop.tree.heap.ktwo.scan = i;
-    }
-
-    fn drag_kont_head(this: *Tidy, item: u29) !void {
-        const elem = this.doop.tree.heap.kone.list.items[item];
-        const node = try this.copy(elem.node);
-        const item_node = try this.copy(elem.item.node);
-        const then = try this.copy_kont(elem.then);
-
-        this.doop.tree.heap.kone.list.items[item].node = node;
-        this.doop.tree.heap.kone.list.items[item].item.node = item_node;
-        this.doop.tree.heap.kone.list.items[item].then = then;
-    }
-
-    fn drag_kont_tail(this: *Tidy, item: u29) !void {
-        const elem = this.doop.tree.heap.ktwo.list.items[item];
-        const ideanode = try this.copy(elem.node);
-        const itemnode = try this.copy(elem.item.node);
-        const then = try this.copy_kont(elem.then);
-
-        var kont = &this.doop.tree.heap.ktwo.list.items[item];
-
-        kont.node = ideanode;
-        kont.item.node = itemnode;
-        kont.then = then;
-    }
-
-    fn was_forwarded(this: *Tidy, node: Node) ?Node {
-        return switch (node.tag) {
-            inline .cans, .cons, .fork => |tag| {
-                const oper = Node.view(Oper, node);
-                const pastfeed = this.past(tag);
-                if (oper.item >= pastfeed.list.items.len) return null;
-                if (pastfeed.look(oper.item)) |turn|
-                    return @bitCast(turn)
-                else
-                    return null;
-            },
-            else => node, // Terminal nodes don't need forwarding
-        };
     }
 
     fn rebuild_memo(this: *Tidy) !void {
@@ -594,17 +414,19 @@ pub const Tidy = struct {
             const old_key = entry.key_ptr.*;
             const old_value = entry.value_ptr.*;
 
-            // Check if key's node was forwarded (is reachable)
-            const new_key_node = this.was_forwarded(old_key.node) orelse continue;
+            // Skip if already at target flip (shouldn't happen but be safe)
+            if (!old_key.node.calm(this.doop.flip)) {
+                const new_key_node = old_key.node.warp(&this.room, this.loop.tree.bank) catch continue;
+                const new_value_node = old_value.node.warp(&this.room, this.loop.tree.bank) catch continue;
 
-            // Translate key and value to new space
-            var new_key = old_key;
-            new_key.node = new_key_node;
+                var new_key = old_key;
+                new_key.node = new_key_node;
 
-            var new_value = old_value;
-            new_value.node = this.was_forwarded(old_value.node) orelse continue;
+                var new_value = old_value;
+                new_value.node = new_value_node;
 
-            try this.doop.memo.put(new_key, new_value);
+                try this.doop.memo.put(new_key, new_value);
+            }
         }
     }
 };
@@ -1112,40 +934,40 @@ pub const Kont = packed struct {
     ) !Kont {
         if (word.calm(room.flap)) return word;
 
-        const heap = &room.heap[room.flap];
-        const leap = &room.heap[room.flap ^ 1];
+        const dest_heap = room.heap[room.flap];
+        const from_heap = room.heap[room.flap ^ 1];
 
         switch (word.kind) {
             .head => {
-                const rack: *Rack(Kone) = &heap.kone;
-                const wack: *Rack(Kone) = &leap.kone;
+                const from: *Rack(Kone) = &from_heap.kone;
+                const dest: *Rack(Kone) = &dest_heap.kone;
 
-                if (rack.look(word.item)) |turn|
+                if (from.look(word.item)) |turn|
                     return @bitCast(turn);
 
-                const data: Kone = rack.list.items[word.item];
-                const next = try wack.push(bank, data);
+                const data: Kone = from.list.items[word.item];
+                const next = try dest.push(bank, data);
 
                 const bird: Kont = word.onto(@intCast(next));
 
-                rack.burn(word.item, @bitCast(bird));
+                from.burn(word.item, @bitCast(bird));
 
                 return bird;
             },
 
             .tail => {
-                const rack: *Rack(Ktwo) = &heap.ktwo;
-                const wack: *Rack(Ktwo) = &leap.ktwo;
+                const from: *Rack(Ktwo) = &from_heap.ktwo;
+                const dest: *Rack(Ktwo) = &dest_heap.ktwo;
 
-                if (rack.look(word.item)) |turn|
+                if (from.look(word.item)) |turn|
                     return @bitCast(turn);
 
-                const data: Ktwo = rack.list.items[word.item];
-                const next = try wack.push(bank, data);
+                const data: Ktwo = from.list.items[word.item];
+                const next = try dest.push(bank, data);
 
                 const bird: Kont = word.onto(@intCast(next));
 
-                rack.burn(word.item, @bitCast(bird));
+                from.burn(word.item, @bitCast(bird));
 
                 return bird;
             },
@@ -1167,6 +989,12 @@ pub const Kone = struct {
     base: u16,
     item: Item,
     then: Kont,
+
+    pub fn drag(kone: *Kone, room: *Room, bank: Bank) !void {
+        kone.node = try kone.node.warp(room, bank);
+        kone.item.node = try kone.item.node.warp(room, bank);
+        kone.then = try kone.then.warp(room, bank);
+    }
 };
 
 pub const Ktwo = struct {
@@ -1174,6 +1002,12 @@ pub const Ktwo = struct {
     gist: Gist,
     item: Item,
     then: Kont,
+
+    pub fn drag(ktwo: *Ktwo, room: *Room, bank: Bank) !void {
+        ktwo.node = try ktwo.node.warp(room, bank);
+        ktwo.item.node = try ktwo.item.node.warp(room, bank);
+        ktwo.then = try ktwo.then.warp(room, bank);
+    }
 };
 
 /// Cost metric selection - either F1 (linear overflow) or F2 (squared overflow).
