@@ -455,89 +455,11 @@ pub fn main() !void {
 
     var time = try std.time.Timer.start();
     const doc = try dump.dump(&t, pipeline);
-    const t0 = time.lap();
-
-    try writer.print("┏━ CEK debug ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", .{});
     const cost_factory = pp.F2.init(100);
 
-    var frames = pp.List(pp.Kont).init(allocator);
-    defer frames.deinit();
-
-    const k_done = try frames.push(allocator, .{ .done = {} });
-    var machine = pp.Exec{
-        .eval = .{
-            .node = doc,
-            .crux = .{},
-            .then = k_done,
-        },
-    };
-
-    const debug_limit: usize = 12;
-    var step_index: usize = 0;
-    while (step_index < debug_limit) : (step_index += 1) {
-        try writer.print("┃ step {d: >2} → {s}\n", .{ step_index, @tagName(machine) });
-
-        var stop = false;
-        switch (machine) {
-            .eval => |state| {
-                try writer.print(
-                    "┃   eval node={s} head={d} base={d} rows={d}\n",
-                    .{
-                        @tagName(state.node.tag),
-                        state.crux.head,
-                        state.crux.base,
-                        state.crux.rows,
-                    },
-                );
-            },
-            .give => |state| {
-                try writer.print(
-                    "┃   ret last={d} rows={d} taint={}\n",
-                    .{
-                        state.idea.last,
-                        state.idea.rows,
-                        cost_factory.tainted(state.idea.rank),
-                    },
-                );
-            },
-            .fork => |state| {
-                try writer.print(
-                    "┃   fork L={s} R={s}\n",
-                    .{
-                        @tagName(state.left.node.tag),
-                        @tagName(state.right.node.tag),
-                    },
-                );
-                stop = true;
-            },
-            .done => |state| {
-                try writer.print(
-                    "┃   done last={d} rows={d} taint={}\n",
-                    .{
-                        state.idea.last,
-                        state.idea.rows,
-                        cost_factory.tainted(state.idea.rank),
-                    },
-                );
-                stop = true;
-            },
-        }
-
-        if (stop) break;
-
-        machine = pp.Loop.step(&t, cost_factory, &frames, machine, null, null) catch |err| {
-            try writer.print("┃   step error: {s}\n", .{@errorName(err)});
-            break;
-        };
-    }
-    try writer.print("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n", .{});
-
+    const t0 = time.lap();
     const best = try t.best(allocator, cost_factory, doc, writer);
     const t1 = time.lap();
-
-    // var hest = try pp.Maze.hest(&t, allocator, pp.F2.init(40), doc, writer);
-    // defer hest.deinit(allocator);
-    const t2 = time.lap();
 
     const measure = best.measure;
     const rank = measure.rank;
@@ -558,8 +480,8 @@ pub fn main() !void {
     try t.emit(writer, measure.node);
     const t3 = time.read();
     try writer.print(
-        "  (dump {D}; best {D}; hest {D}; emit {D})\n\n",
-        .{ t0, t1, t2, t3 },
+        "  (dump {D}; best {D}; emit {D})\n\n",
+        .{ t0, t1, t3 },
     );
     try writer.flush();
 

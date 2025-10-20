@@ -8,8 +8,8 @@ pub const Loop = struct {
     pub fn step(
         tree: *Tree,
         cost: CostFactory,
-        work: *List(Kont),
         exec: Exec,
+        work: *List(Kont),
         memo: ?*Memo,
         stats: ?*MachineStats,
     ) !Exec {
@@ -350,12 +350,9 @@ pub const Loop = struct {
         cf: CostFactory,
         bank: Bank,
         frontier: *std.ArrayList(Idea),
-        ickybest: *?Idea,
         idea: Idea,
     ) !void {
         if (!cf.tainted(idea.rank)) {
-            ickybest.* = null;
-
             var i: usize = 0;
             while (i < frontier.items.len) {
                 const existing = frontier.items[i];
@@ -370,18 +367,6 @@ pub const Loop = struct {
             }
 
             try frontier.append(bank, idea);
-            return;
-        }
-
-        if (frontier.items.len != 0) return;
-
-        if (ickybest.*) |existing| {
-            if (dominates(cf, existing, idea)) return;
-            if (dominates(cf, idea, existing) or costBetter(cf, idea, existing)) {
-                ickybest.* = idea;
-            }
-        } else {
-            ickybest.* = idea;
         }
     }
 
@@ -396,6 +381,8 @@ pub const Loop = struct {
 
         var konts = List(Kont).init(bank);
         defer konts.deinit();
+
+        try konts.pool.preheat(4096 * 64);
 
         var memo = Memo.init(bank);
         defer memo.deinit();
@@ -420,104 +407,82 @@ pub const Loop = struct {
         var good = try std.ArrayList(Idea).initCapacity(bank, 4);
         defer good.deinit(bank);
 
-        var tainted_best: ?Idea = null;
+        var icky: ?Idea = null;
 
-        loop1: while (work.pop()) |next| {
-            var exec = next;
-            while (true) {
-                // if (good.items.len > 0) {
-                //     switch (exec) {
-                //         .eval => |e| {
-                //             if (e.crux.icky)
-                //                 break;
-                //         },
-                //         else => {},
-                //     }
-                // }
-
-                switch (exec) {
-                    .fork => |branches| {
-                        try work.append(bank, .{ .eval = branches.right });
-                        if (work.items.len > peak) peak = work.items.len;
-                        exec = .{ .eval = branches.left };
-                        continue;
-                    },
-                    .done => |done| {
-                        try Loop.updateFrontier(cost, bank, &good, &tainted_best, done.idea);
-                        if (good.items.len > 0) break :loop1;
-                        completions += 1;
-                        break;
-                    },
-                    else => {},
-                }
-
-                exec = try step(tree, cost, &konts, exec, &memo, &stats);
-            }
-        }
-        vm0: while (work.pop()) |next| {
-            vm1: switch (next) {
-                .fork => |branches| {
-                    try work.append(bank, .{ .eval = branches.right });
+        work: while (work.pop()) |next| {
+            step: switch (next) {
+                .fork => |fork| {
+                    try work.append(bank, .{ .eval = fork.right });
                     if (work.items.len > peak) peak = work.items.len;
-                    continue :vm1 .{ .eval = branches.left };
+                    continue :step .{ .eval = fork.left };
                 },
                 .done => |done| {
-                    try Loop.updateFrontier(cost, bank, &good, &tainted_best, done.idea);
+                    try updateFrontier(cost, bank, &good, done.idea);
                     completions += 1;
-                    continue :vm0;
-                },
-                .eval => |eval| {
-                    if (eval.crux.icky) {
-                        continue :vm0;
+
+                    if (good.items.len > 0) break :work;
+
+                    if (icky) |existing| {
+                        if (dominates(cost, done.idea, existing) or costBetter(cost, done.idea, existing)) {
+                            icky = done.idea;
+                        }
                     } else {
-                        continue :vm1 try step(
-                            tree,
-                            cost,
-                            &konts,
-                            .{ .eval = eval },
-                            &memo,
-                            &stats,
-                        );
+                        icky = done.idea;
                     }
+
+                    continue :work;
                 },
                 else => |exec| {
-                    continue :vm1 try step(
+                    continue :step try step(
                         tree,
                         cost,
-                        &konts,
                         exec,
+                        &konts,
                         &memo,
                         &stats,
                     );
                 },
             }
         }
-        // while (work.pop()) |next| {
-        //     var exec = next;
-        //     while (true) {
-        //         switch (exec) {
-        //             .fork => |branches| {
-        //                 try work.append(bank, .{ .eval = branches.right });
-        //                 if (work.items.len > peak) peak = work.items.len;
-        //                 exec = .{ .eval = branches.left };
-        //                 continue;
-        //             },
-        //             .done => |done| {
-        //                 try Loop.updateFrontier(cost, bank, &good, &tainted_best, done.idea);
-        //                 completions += 1;
-        //                 break;
-        //             },
-        //             .eval => |eval| {
-        //                 if (eval.crux.icky) break else {
-        //                     exec = try step(tree, cost, &konts, exec, &memo, &stats);
-        //                 }
-        //             },
-        //             else => {
-        //                 exec = try step(tree, cost, &konts, exec, &memo, &stats);
-        //             },
-        //         }
-        //     }
-        // }
+
+        work: while (work.pop()) |next| {
+            step: switch (next) {
+                .fork => |branches| {
+                    try work.append(bank, .{ .eval = branches.right });
+                    if (work.items.len > peak) peak = work.items.len;
+                    continue :step .{ .eval = branches.left };
+                },
+                .done => |done| {
+                    try updateFrontier(cost, bank, &good, done.idea);
+                    completions += 1;
+                    continue :work;
+                },
+                .eval => |eval| {
+                    if (eval.crux.icky) {
+                        continue :work;
+                    } else {
+                        continue :step try step(
+                            tree,
+                            cost,
+                            .{ .eval = eval },
+                            &konts,
+                            &memo,
+                            &stats,
+                        );
+                    }
+                },
+                else => |exec| {
+                    continue :step try step(
+                        tree,
+                        cost,
+                        exec,
+                        &konts,
+                        &memo,
+                        &stats,
+                    );
+                },
+            }
+        }
 
         const memo_entries = memo.count();
 
@@ -538,7 +503,7 @@ pub const Loop = struct {
             };
         }
 
-        if (tainted_best) |tainted| {
+        if (icky) |tainted| {
             return BestOutcome{
                 .measure = tainted,
                 .completions = completions,
