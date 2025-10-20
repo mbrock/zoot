@@ -108,6 +108,10 @@ pub fn main() !void {
         "  (dump {D}; best {D}; emit {D})\n\n",
         .{ t0, t1, t3 },
     );
+    try writer.print("cons: {d} cans: {d}\n", .{
+        t.heap.cons.items.len,
+        t.heap.cans.items.len,
+    });
     try writer.flush();
 
     // {

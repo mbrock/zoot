@@ -135,8 +135,13 @@ fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) !Node {
 
     const label = switch (node.look()) {
         .span, .quad, .trip, .rune => try formatTextNode(t2, t1, node),
-        .cons, .fork => |oper| try t2.cat(&.{
-            try t2.text(if (node.tag == .cons) "+" else "?"),
+        .cons, .fork, .cans => |oper| try t2.cat(&.{
+            try t2.text(switch (node.tag) {
+                .cons => "+",
+                .cans => "#",
+                .fork => "|",
+                else => unreachable,
+            }),
             try t2.when(oper.frob.warp == 1, try t2.text("ʷ")),
             try t2.when(oper.frob.nest != 0, try t2.format("ⁿ{d}", .{oper.frob.nest})),
         }),
@@ -147,12 +152,14 @@ fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) !Node {
         .quad, .trip, .rune => "lightblue",
         .cons => "gray20",
         .fork => "lightyellow",
+        .cans => "yellow",
     };
 
     const shape = switch (node.tag) {
         .span => "ellipse",
         .quad, .trip, .rune => "box",
         .cons => "point",
+        .cans => "point",
         .fork => "box",
     };
 
@@ -178,9 +185,11 @@ fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) !Node {
 
     // Add edges if this is an oper
     switch (node.look()) {
-        .cons, .fork => |oper| {
+        .cons, .fork, .cans => |oper| {
             const args = if (node.tag == .cons)
                 t1.heap.cons.items[oper.item]
+            else if (node.tag == .cans)
+                t1.heap.cans.items[oper.item]
             else
                 t1.heap.fork.items[oper.item];
 
@@ -250,7 +259,7 @@ fn formatTextNode(doc_tree: *Tree, data_tree: *Tree, node: Node) !Node {
                 });
             }
         },
-        .cons, .fork => unreachable,
+        .cons, .fork, .cans => unreachable,
     };
 }
 

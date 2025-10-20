@@ -4,6 +4,121 @@ const log = std.log;
 pub const Bank = std.mem.Allocator;
 const Pool = std.heap.MemoryPool;
 
+/// Cheney-style compacting GC pass.
+pub const Tidy = struct {
+    const tags: [3]Tag = .{ .cans, .cons, .fork };
+
+    loop: *Loop,
+    doop: Loop,
+    wave: std.EnumArray(Tag, u21) = .initFill(0),
+
+    pub fn tidy(boop: *Loop) !Loop {
+        var this = Tidy{
+            .loop = boop,
+            .doop = Loop{
+                .tree = Tree.init(boop.tree.bank),
+                .cost = boop.cost,
+                .memo = Memo.init(boop.tree.bank),
+                .pool = Pool(Kont).init(boop.tree.bank),
+                .flip = if (boop.flip == 0) 1 else 0,
+            },
+        };
+
+        for (this.loop.pile.items) |*exec| {
+            exec.node = try this.copy(exec.node);
+        }
+
+        try this.scan();
+
+        return this.doop;
+    }
+
+    fn copy(this: *Tidy, node: Node) !Node {
+        switch (node.tag) {
+            inline .cans, .cons, .fork => |tag| {
+                var oper = Node.view(Oper, node);
+                if (oper.flip == this.doop.flip)
+                    return node;
+
+                var pastfeed = this.past(tag);
+                var nextfeed = this.list(tag);
+
+                var pair = &pastfeed.items[oper.item];
+                if (pair.head == Node.bolt) return pair.tail;
+
+                const i = nextfeed.items.len;
+                try nextfeed.append(this.loop.tree.bank, .{ pair.head, pair.tail });
+                const next = Node.fromOper(tag, oper.frob, i);
+
+                pair.head = Node.bolt;
+                pair.tail = next;
+
+                return next;
+            },
+        }
+    }
+
+    fn scan(this: *Tidy) !void {
+        while (!this.calm()) {
+            inline for (tags) |tag| {
+                try this.pull(tag);
+            }
+        }
+    }
+
+    fn size(this: *Tidy, comptime tag: Tag) u21 {
+        return this.list(tag).items.len;
+    }
+
+    fn list(this: *Tidy, comptime tag: Tag) *std.ArrayList(Pair) {
+        return switch (tag) {
+            .cans => &this.doop.tree.heap.cans,
+            .cons => &this.doop.tree.heap.cons,
+            .fork => &this.doop.tree.heap.fork,
+            else => unreachable,
+        };
+    }
+
+    fn past(this: *Tidy, comptime tag: Tag) *std.ArrayList(Pair) {
+        return switch (tag) {
+            .cans => &this.loop.tree.heap.cans,
+            .cons => &this.loop.tree.heap.cons,
+            .fork => &this.loop.tree.heap.fork,
+            else => unreachable,
+        };
+    }
+
+    fn calm(this: *Tidy) bool {
+        inline for (tags) |tag| {
+            if (this.wave.get(tag) < this.size(tag))
+                return false;
+        }
+
+        return true;
+    }
+
+    fn pull(this: *Tidy, comptime tag: Tag) !void {
+        const feed = this.list(tag);
+        var i = this.wave.get(tag);
+        while (i < feed.items.len) : (i += 1) {
+            try this.drag(feed, i);
+        }
+        this.wave.set(tag, i);
+    }
+
+    fn drag(
+        this: *Tidy,
+        feed: *std.ArrayList(Pair),
+        item: u21,
+    ) !void {
+        const head = try this.copy(feed.items[item].head);
+        feed.items[item].head = head;
+
+        const tail = try this.copy(feed.items[item].tail);
+        feed.items[item].tail = tail;
+    }
+};
+
 pub const Loop = struct {
     tree: *Tree,
     cost: Cost,
@@ -13,6 +128,7 @@ pub const Loop = struct {
     pile: std.ArrayList(Exec) = .empty,
     best: std.ArrayList(Idea) = .empty,
     icky: ?Idea = null,
+    flip: u1 = 0,
 
     pub fn deinit(this: *@This()) void {
         this.best.deinit(this.tree.bank);
@@ -239,6 +355,7 @@ pub const Loop = struct {
 
                         return;
                     },
+                    .cans => unreachable,
                 }
             },
             .give => {
@@ -302,7 +419,7 @@ pub const Loop = struct {
                         // Both sides of the cons may have been forking nodes.
                         // Make a forkless cons node from the resolved head and tail nodes.
                         const oper = Node.view(Oper, cont.item.node);
-                        const node = try this.tree.hashcons(oper.frob, past.node, exec.node);
+                        const node = try this.tree.cans(oper.frob, past.node, exec.node);
 
                         // We also save the combined evaluation result of this item
                         // to avoid recomputing it later.
@@ -336,10 +453,12 @@ pub const Loop = struct {
     }
 
     fn meld(this: *@This(), idea: Idea) !void {
-        for (0..this.best.items.len) |i| {
+        var i: usize = 0;
+        while (i < this.best.items.len) {
             const item = this.best.items[i];
             if (wins(this.cost, item.gist, idea.gist)) return;
             if (wins(this.cost, idea.gist, item.gist)) _ = this.best.swapRemove(i);
+            i += 1;
         }
 
         try this.best.append(this.tree.bank, idea);
@@ -543,6 +662,7 @@ pub const Tag = enum(u3) {
     rune = 0b011,
     cons = 0b100,
     fork = 0b101,
+    cans = 0b110,
 };
 
 pub const Side = enum(u1) { lchr, rchr };
@@ -744,7 +864,8 @@ pub const Frob = packed struct {
 pub const Oper = packed struct {
     kind: Tag = .cons,
     frob: Frob = .{},
-    item: u22 = 0,
+    flip: u1 = 0,
+    item: u21 = 0,
 };
 
 /// 32-bit handle to either terminal or operation; implicitly indexes
@@ -762,6 +883,7 @@ pub const Node = packed struct {
         rune: Rune,
         cons: Oper,
         fork: Oper,
+        cans: Oper,
     };
 
     pub const Edit = union(Tag) {
@@ -771,9 +893,11 @@ pub const Node = packed struct {
         rune: *Rune,
         cons: *Oper,
         fork: *Oper,
+        cans: *Oper,
     };
 
     pub const halt = Node.fromRune(0, 0);
+    pub const bolt = Node.fromRune(0, 0x1A);
 
     pub fn view(comptime T: type, this: Node) T {
         return @bitCast(this);
@@ -795,6 +919,7 @@ pub const Node = packed struct {
             .rune => .{ .rune = view(Rune, this) },
             .cons => .{ .cons = view(Oper, this) },
             .fork => .{ .fork = view(Oper, this) },
+            .cans => .{ .cans = view(Oper, this) },
         };
     }
 
@@ -802,6 +927,7 @@ pub const Node = packed struct {
         return switch (this.look()) {
             .cons => |cons| heap.cons.items[cons.item],
             .fork => |fork| heap.fork.items[fork.item],
+            .cans => |cans| heap.cans.items[cans.item],
             else => unreachable,
         };
     }
@@ -814,6 +940,7 @@ pub const Node = packed struct {
             .rune => .{ .rune = mut(Rune, this) },
             .cons => .{ .cons = mut(Oper, this) },
             .fork => .{ .fork = mut(Oper, this) },
+            .cans => .{ .cans = mut(Oper, this) },
         };
     }
 
@@ -899,11 +1026,13 @@ pub const Heap = struct {
     text: std.ArrayList(u8) = .empty,
     cons: std.ArrayList(Pair) = .empty,
     fork: std.ArrayList(Pair) = .empty,
+    cans: std.ArrayList(Pair) = .empty,
 
     pub fn deinit(this: *@This(), alloc: Bank) void {
         this.text.deinit(alloc);
         this.cons.deinit(alloc);
         this.fork.deinit(alloc);
+        this.cans.deinit(alloc);
     }
 };
 
@@ -918,38 +1047,38 @@ pub const Tree = struct {
     bank: Bank,
     heap: Heap,
     flatmemo: std.AutoHashMap(Node, Node),
-    consmemo: std.AutoHashMap(Pair, u22),
+    cansmemo: std.AutoHashMap(Pair, u22),
 
     pub fn init(bank: Bank) Tree {
         return .{
             .bank = bank,
             .heap = .{},
             .flatmemo = std.AutoHashMap(Node, Node).init(bank),
-            .consmemo = std.AutoHashMap(Pair, u22).init(bank),
+            .cansmemo = std.AutoHashMap(Pair, u22).init(bank),
         };
     }
 
     pub fn deinit(tree: *Tree) void {
         tree.heap.deinit(tree.bank);
         tree.flatmemo.deinit();
-        tree.consmemo.deinit();
+        tree.cansmemo.deinit();
     }
 
-    pub fn hashcons(tree: *Tree, frob: Frob, head: Node, tail: Node) !Node {
+    pub fn hashcans(tree: *Tree, frob: Frob, head: Node, tail: Node) !Node {
         const pair = Pair{ .head = head, .tail = tail };
 
-        if (tree.consmemo.get(pair)) |idx| {
-            return Node.fromOper(.cons, frob, idx);
+        if (tree.cansmemo.get(pair)) |idx| {
+            return Node.fromOper(.cans, frob, idx);
         }
 
-        const idx = tree.heap.cons.items.len;
+        const idx = tree.heap.cans.items.len;
         if (idx > std.math.maxInt(u22))
             return error.OutOfConses;
 
-        const node = Node.fromOper(.cons, frob, @intCast(idx));
+        const node = Node.fromOper(.cans, frob, @intCast(idx));
 
-        try tree.heap.cons.append(tree.bank, pair);
-        try tree.consmemo.put(pair, @intCast(idx));
+        try tree.heap.cans.append(tree.bank, pair);
+        try tree.cansmemo.put(pair, @intCast(idx));
         return node;
     }
 
@@ -1027,11 +1156,21 @@ pub const Tree = struct {
                 const pair = tree.heap.cons.items[oper.item];
 
                 var child_ctx = ctx.*;
-                if (oper.frob.warp == 1)
-                    child_ctx.base = child_ctx.last;
-                if (oper.frob.nest != 0)
-                    child_ctx.nest(oper.frob.nest);
+                if (oper.frob.warp == 1) child_ctx.base = child_ctx.last;
+                if (oper.frob.nest != 0) child_ctx.nest(oper.frob.nest);
+                try tree.emitNode(sink, pair.head, &child_ctx);
 
+                var right_ctx = child_ctx;
+                try tree.emitNode(sink, pair.tail, &right_ctx);
+                ctx.last = right_ctx.last;
+                ctx.rows = right_ctx.rows;
+            },
+            .cans => |oper| {
+                const pair = tree.heap.cans.items[oper.item];
+
+                var child_ctx = ctx.*;
+                if (oper.frob.warp == 1) child_ctx.base = child_ctx.last;
+                if (oper.frob.nest != 0) child_ctx.nest(oper.frob.nest);
                 try tree.emitNode(sink, pair.head, &child_ctx);
 
                 var right_ctx = child_ctx;
@@ -1080,7 +1219,7 @@ pub const Tree = struct {
                     tail.repr() != pair.tail.repr();
                 if (!changed) break :blk doc;
 
-                break :blk try tree.hashcons(oper.frob, head, tail);
+                break :blk try tree.cons(oper.frob, head, tail);
             },
             .fork => |oper| blk: {
                 const pair = tree.heap.fork.items[oper.item];
@@ -1096,6 +1235,7 @@ pub const Tree = struct {
 
                 break :blk Node.fromOper(.fork, oper.frob, next);
             },
+            .cans => unreachable,
         };
 
         try tree.flatmemo.put(doc, result);
@@ -1142,6 +1282,7 @@ pub const Tree = struct {
                 }
                 return new;
             },
+            .cans => unreachable,
             .span, .quad, .trip, .rune => if (doc.isEmptyText())
                 return doc
             else {
@@ -1155,6 +1296,18 @@ pub const Tree = struct {
                 return try tree.warp(oper);
             },
         }
+    }
+
+    pub fn cons(tree: *Tree, frob: Frob, lhs: Node, rhs: Node) !Node {
+        const next: u22 = @intCast(tree.heap.cons.items.len);
+        try tree.heap.cons.append(tree.bank, .{ .head = lhs, .tail = rhs });
+        return Node.fromOper(.cons, frob, next);
+    }
+
+    pub fn cans(tree: *Tree, frob: Frob, lhs: Node, rhs: Node) !Node {
+        const next: u22 = @intCast(tree.heap.cans.items.len);
+        try tree.heap.cans.append(tree.bank, .{ .head = lhs, .tail = rhs });
+        return Node.fromOper(.cans, frob, next);
     }
 
     pub fn plus(tree: *Tree, lhs: Node, rhs: Node) !Node {
@@ -1190,7 +1343,7 @@ pub const Tree = struct {
         //
         // When A and B are tiny texts, A + B is often also a tiny text.
 
-        return try tree.hashcons(.{}, lhs, rhs);
+        return try tree.cons(.{}, lhs, rhs);
     }
 
     pub fn fork(tree: *Tree, lhs: Node, rhs: Node) !Node {
