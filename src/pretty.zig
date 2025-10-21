@@ -87,6 +87,13 @@ pub const Loop = struct {
                     boss = chap;
             }
 
+            log.debug("SELECTED BEST: node={s} overflow={d} height={d} last={d}", .{
+                @tagName(boss.node.tag),
+                boss.gist.rank.o,
+                boss.gist.rank.h,
+                boss.gist.last,
+            });
+
             return Best{ .idea = boss, .stat = this.stat };
         }
 
@@ -140,7 +147,13 @@ pub const Loop = struct {
                                 const duel = this.heap.new().duel.list.items[curr.item];
                                 const idea: Idea = .{ .gist = duel.gist, .node = duel.node };
                                 const icky = this.cost.icky(duel.gist.rank);
-                                log.debug("    COMPLETION IDEA: icky={} overflow={d} height={d} last={d}", .{ icky, duel.gist.rank.o, duel.gist.rank.h, duel.gist.last });
+                                log.debug("    COMPLETION IDEA: node={s} icky={} overflow={d} height={d} last={d}", .{
+                                    @tagName(duel.node.tag),
+                                    icky,
+                                    duel.gist.rank.o,
+                                    duel.gist.rank.h,
+                                    duel.gist.last,
+                                });
                                 try this.meld(idea);
 
                                 this.icky = this.icky orelse idea;
@@ -193,7 +206,12 @@ pub const Loop = struct {
                             var curr = deck;
                             while (curr.item != 0x3FFFFFFF) {
                                 const duel = this.heap.new().duel.list.items[curr.item];
-                                log.debug("    COMPLETION: overflow={d} height={d}", .{ duel.gist.rank.o, duel.gist.rank.h });
+                                log.debug("    COMPLETION: node={s} overflow={d} height={d} last={d}", .{
+                                    @tagName(duel.node.tag),
+                                    duel.gist.rank.o,
+                                    duel.gist.rank.h,
+                                    duel.gist.last,
+                                });
                                 try this.meld(.{ .gist = duel.gist, .node = duel.node });
                                 curr = duel.next;
                             }
@@ -216,7 +234,6 @@ pub const Loop = struct {
     }
 
     /// Frontier manipulation helpers
-
     /// Create a singleton frontier from one idea
     fn singleton(this: *@This(), node: Node, gist: Gist) !Deck {
         const idx = try this.heap.new().duel.push(this.heap.bank, .{
@@ -280,7 +297,7 @@ pub const Loop = struct {
 
         const final_size = kept + 1;
         if (final_size > 100 or filtered > 0) {
-            log.debug("      FRONTIER: size={d} (kept {d}, filtered {d}, +1 new) gist=o:{d} h:{d}", .{final_size, kept, filtered, gist.rank.o, gist.rank.h});
+            log.debug("      FRONTIER: size={d} (kept {d}, filtered {d}, +1 new) gist=o:{d} h:{d}", .{ final_size, kept, filtered, gist.rank.o, gist.rank.h });
         }
 
         return .{ .flip = this.heap.tick, .cope = 0, .item = @intCast(idx) };
@@ -395,35 +412,17 @@ pub const Loop = struct {
         switch (exec.tick) {
             .eval => |eval| {
                 // We are about to evaluate a node.
-                log.debug("      EVAL: base={d} last={d} rows={d} icky={}", .{
-                    eval.base, eval.last, eval.rows, eval.icky
-                });
+                log.debug("      EVAL: base={d} last={d} rows={d} icky={}", .{ eval.base, eval.last, eval.rows, eval.icky });
 
-                if (!icks and eval.icky) {
-                    // The context is already icky; abandon this branch.
-                    log.debug("      PRUNED: context already icky", .{});
-                    return error.Icky;
-                }
+                // NOTE: We no longer prune based on icky flag.
+                // With Cope thunks, we always evaluate and decide Cope vs Duel based on result overflow.
 
                 var crux = eval;
 
-                // Check if context already exceeds width limit
-                if (!icks) {
-                    const limit = switch (this.cost) {
-                        .f1 => |w| w,
-                        .f2 => |w| w,
-                    };
-                    if (crux.last > limit or crux.base > limit) {
-                        // Already past the width limit - return a Cope thunk
-                        log.debug("      OVERFLOW DETECTED: creating Cope thunk (last={d} base={d} limit={d})", .{ crux.last, crux.base, limit });
-                        const cope_idx = try this.heap.new().cope.push(this.heap.bank, .{
-                            .node = exec.node,
-                            .crux = crux,
-                        });
-                        exec.tick = .{ .give = .{ .flip = this.heap.tick, .cope = 1, .item = @intCast(cope_idx) } };
-                        return;
-                    }
-                }
+                // NOTE: Removed early overflow check. It was too aggressive and would
+                // stop evaluation mid-hcat, losing continuations for remaining items.
+                // Instead, we let individual nodes produce overflow gists, and create
+                // Cope thunks only when combining results fails.
 
                 if (!exec.node.easy()) {
                     // Computing this node may be costlier than looking it up.
@@ -458,28 +457,28 @@ pub const Loop = struct {
                     .rune => |rune| {
                         log.debug("      RUNE: code={d}", .{rune.code});
                         const gist = rune.toGist(crux, this.cost);
-                        log.debug("      -> gist: o={d} h={d} last={d}", .{gist.rank.o, gist.rank.h, gist.last});
+                        log.debug("      -> gist: o={d} h={d} last={d}", .{ gist.rank.o, gist.rank.h, gist.last });
                         exec.tick = .{ .give = try this.singleton(exec.node, gist) };
                         return;
                     },
                     .span => |span| {
                         log.debug("      SPAN", .{});
                         const gist = span.toGist(crux, this.cost, this.tree);
-                        log.debug("      -> gist: o={d} h={d} last={d}", .{gist.rank.o, gist.rank.h, gist.last});
+                        log.debug("      -> gist: o={d} h={d} last={d}", .{ gist.rank.o, gist.rank.h, gist.last });
                         exec.tick = .{ .give = try this.singleton(exec.node, gist) };
                         return;
                     },
                     .quad => |quad| {
                         log.debug("      QUAD", .{});
                         const gist = quad.toGist(crux, this.cost);
-                        log.debug("      -> gist: o={d} h={d} last={d}", .{gist.rank.o, gist.rank.h, gist.last});
+                        log.debug("      -> gist: o={d} h={d} last={d}", .{ gist.rank.o, gist.rank.h, gist.last });
                         exec.tick = .{ .give = try this.singleton(exec.node, gist) };
                         return;
                     },
                     .trip => |trip| {
                         log.debug("      TRIP", .{});
                         const gist = trip.toGist(crux, this.cost);
-                        log.debug("      -> gist: o={d} h={d} last={d}", .{gist.rank.o, gist.rank.h, gist.last});
+                        log.debug("      -> gist: o={d} h={d} last={d}", .{ gist.rank.o, gist.rank.h, gist.last });
                         exec.tick = .{ .give = try this.singleton(exec.node, gist) };
                         return;
                     },
@@ -616,6 +615,27 @@ pub const Loop = struct {
                         const tail_deck = exec.tick.give;
                         const oper = Node.view(Oper, cont.item.node);
 
+                        // Check if either head or tail is a Cope thunk
+                        // If so, the whole hcat is tainted - create Cope for the full hcat
+                        if (head_deck.cope == 1 or tail_deck.cope == 1) {
+                            log.debug("      HCAT: head or tail is Cope - creating Cope for full hcat", .{});
+                            const cope_idx = try this.heap.new().cope.push(this.heap.bank, .{
+                                .node = cont.item.node, // The full hcat node
+                                .crux = .{
+                                    .last = cont.item.head,
+                                    .base = cont.item.base,
+                                    .rows = 0,
+                                    .icky = true,
+                                },
+                            });
+                            const result = Deck{ .flip = this.heap.tick, .cope = 1, .item = @intCast(cope_idx) };
+                            try this.memo.put(cont.item, result);
+                            exec.tick = .{ .give = result };
+                            exec.then = cont.then;
+                            return;
+                        }
+
+                        // Both are Duel frontiers, proceed with cartesian product
                         // Count frontier sizes for debugging
                         var head_size: usize = 0;
                         var tail_size: usize = 0;
@@ -634,7 +654,7 @@ pub const Loop = struct {
                             }
                         }
                         if (head_size * tail_size > 100) {
-                            log.debug("      CARTESIAN PRODUCT: {d} × {d} = {d} combos", .{head_size, tail_size, head_size * tail_size});
+                            log.debug("      CARTESIAN PRODUCT: {d} × {d} = {d} combos", .{ head_size, tail_size, head_size * tail_size });
                         }
 
                         var result = Deck.none;
@@ -645,7 +665,7 @@ pub const Loop = struct {
                             // For each head, do "running best" scan through tail (like OCaml)
                             // Tail is sorted by last (implicitly), we keep ideas with improving cost
                             var partial = Deck.none;
-                            var current_best: ?struct{gist: Gist, node: Node} = null;
+                            var current_best: ?struct { gist: Gist, node: Node } = null;
                             var tail_curr = tail_deck;
                             while (tail_curr.item != 0x3FFFFFFF) {
                                 const tail_duel = this.heap.new().duel.list.items[tail_curr.item];
@@ -666,15 +686,15 @@ pub const Loop = struct {
                                 if (current_best) |best| {
                                     if (this.cost.wins(gist.rank, best.gist.rank)) {
                                         // This is better, update current_best
-                                        current_best = .{.gist = gist, .node = node};
+                                        current_best = .{ .gist = gist, .node = node };
                                     } else {
                                         // Worse cost, emit current_best and start new run
                                         partial = try this.cons_to_deck(partial, best.node, best.gist);
-                                        current_best = .{.gist = gist, .node = node};
+                                        current_best = .{ .gist = gist, .node = node };
                                     }
                                 } else {
                                     // First idea
-                                    current_best = .{.gist = gist, .node = node};
+                                    current_best = .{ .gist = gist, .node = node };
                                 }
 
                                 tail_curr = tail_duel.next;
@@ -696,7 +716,7 @@ pub const Loop = struct {
                                 }
                             }
                             if (partial_size > 1 or (head_size > 1 and tail_size > 1)) {
-                                log.debug("      CART HEAD PRODUCED: {d} ideas (from {d} tail)", .{partial_size, tail_size});
+                                log.debug("      CART HEAD PRODUCED: {d} ideas (from {d} tail)", .{ partial_size, tail_size });
                             }
 
                             // Merge partial results into global result
@@ -705,10 +725,23 @@ pub const Loop = struct {
                             head_curr = head_duel.next;
                         }
 
-                        // If all combinations were icky, bail out
-                        if (!icks and result.item == 0x3FFFFFFF) return error.Icky;
+                        // If all combinations were icky, create Cope thunk instead of bailing
+                        if (!icks and result.item == 0x3FFFFFFF) {
+                            log.debug("      HCAT: all combos icky - creating Cope thunk", .{});
+                            // Create a Cope thunk to defer this tainted computation
+                            const cope_idx = try this.heap.new().cope.push(this.heap.bank, .{
+                                .node = cont.item.node, // Store the hcat node
+                                .crux = .{ // Reconstruct crux from memo key
+                                    .last = cont.item.head,
+                                    .base = cont.item.base,
+                                    .rows = 0, // We don't have rows in the memo key, assume 0
+                                    .icky = true, // Mark as icky for when we force it
+                                },
+                            });
+                            result = .{ .flip = this.heap.tick, .cope = 1, .item = @intCast(cope_idx) };
+                        }
 
-                        // Memoize the result frontier
+                        // Memoize the result (either frontier or Cope)
                         try this.memo.put(cont.item, result);
 
                         exec.* = .{
@@ -817,7 +850,7 @@ pub const Idea = packed struct {
 pub const Cope = struct {
     node: Node,
     crux: Crux,
-    _pad: u32 = 0,  // Padding to give Hack two 32-bit fields (node and _pad)
+    _pad: u32 = 0, // Padding to give Hack two 32-bit fields (node and _pad)
 
     pub fn warp(cope: Cope, heap: *Heap) !Cope {
         return .{
@@ -1848,7 +1881,7 @@ pub const Pair = struct {
 /// Deck: packed handle to a frontier (linked list of Duels)
 pub const Deck = packed struct {
     flip: u1,
-    cope: u1,  // 0 = Duel frontier, 1 = Cope thunk
+    cope: u1, // 0 = Duel frontier, 1 = Cope thunk
     item: u30,
 
     pub const none: Deck = .{ .flip = 0, .cope = 0, .item = 0x3FFFFFFF };
@@ -1871,9 +1904,9 @@ pub const Deck = packed struct {
 
 /// Duel: a cell in the pareto frontier linked list
 pub const Duel = struct {
-    node: Node,  // The resolved (forkless) layout node
-    gist: Gist,  // The layout metrics (last column, rows, rank)
-    next: Deck,  // Next duel in the frontier, or Deck.none
+    node: Node, // The resolved (forkless) layout node
+    gist: Gist, // The layout metrics (last column, rows, rank)
+    next: Deck, // Next duel in the frontier, or Deck.none
 
     pub const halt: Duel = .{ .node = .halt, .gist = .{}, .next = Deck.none };
 

@@ -138,10 +138,30 @@ pub fn build(b: *std.Build) void {
     verbosestep.dependOn(&verboseexec.step);
     verboseexec.step.dependOn(b.getInstallStep());
 
+    // Test width40
+    const testwidth40pack = b.createModule(.{
+        .root_source_file = b.path("src/test_width40.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zoot", .module = rootpack },
+        },
+    });
+    const testwidth40prog = b.addExecutable(.{
+        .name = "test_width40",
+        .root_module = testwidth40pack,
+        .use_llvm = true,
+    });
+    const testwidth40step = b.step("width40", "Test width=40 layout");
+    const testwidth40exec = b.addRunArtifact(testwidth40prog);
+    testwidth40step.dependOn(&testwidth40exec.step);
+    testwidth40exec.step.dependOn(b.getInstallStep());
+
     b.installArtifact(zootprog);
     b.installArtifact(testmod);
     b.installArtifact(benchprog);
     b.installArtifact(exploreprog);
     b.installArtifact(traceprog);
     b.installArtifact(verboseprog);
+    b.installArtifact(testwidth40prog);
 }
