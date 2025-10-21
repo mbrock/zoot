@@ -14,9 +14,9 @@ pub const Pair = struct {
         return .{ .head = a, .tail = .halt };
     }
 
-    pub fn drag(node: *Pair, room: *Room, bank: Bank) !void {
-        node.head = try node.head.warp(room, bank);
-        node.tail = try node.tail.warp(room, bank);
+    pub fn drag(node: *Pair, heap: *Heap) !void {
+        try heap.move(&node.head);
+        try heap.move(&node.tail);
     }
 };
 
@@ -88,12 +88,12 @@ pub fn Rack(Elem: type) type {
             return rack.list.items[rack.scan..];
         }
 
-        pub fn pull(this: *@This(), room: *Room, bank: Bank) !void {
+        pub fn pull(this: *@This(), heap: *Heap) !void {
             while (this.scan < this.list.items.len) {
                 const i = this.scan;
                 // Copy out to avoid iterator invalidation during drag
                 var elem = this.list.items[i];
-                try elem.drag(room, bank);
+                try elem.drag(heap);
                 // Write back after drag completes
                 this.list.items[i] = elem;
                 this.scan += 1;
@@ -106,95 +106,109 @@ pub fn Rack(Elem: type) type {
     };
 }
 
-pub const Heap = struct {
-    cons: Rack(Pair) = .empty,
+pub const Half = struct {
+    hcat: Rack(Pair) = .empty,
     fork: Rack(Pair) = .empty,
-    cans: Rack(Pair) = .empty,
-    kone: Rack(Kone) = .empty,
-    ktwo: Rack(Ktwo) = .empty,
+    cons: Rack(Pair) = .empty,
+    ktx1: Rack(Ktx1) = .empty,
+    ktx2: Rack(Ktx2) = .empty,
 
-    pub fn deinit(this: *@This(), alloc: Bank) void {
-        this.cons.deinit(alloc);
-        this.fork.deinit(alloc);
-        this.cans.deinit(alloc);
-        this.kone.deinit(alloc);
-        this.ktwo.deinit(alloc);
+    pub fn deinit(this: *@This(), bank: Bank) void {
+        this.hcat.deinit(bank);
+        this.fork.deinit(bank);
+        this.cons.deinit(bank);
+        this.ktx1.deinit(bank);
+        this.ktx2.deinit(bank);
     }
 
     pub fn calm(this: @This()) bool {
-        return this.cons.calm() and
+        return this.hcat.calm() and
             this.fork.calm() and
-            this.cans.calm() and
-            this.kone.calm() and
-            this.ktwo.calm();
+            this.cons.calm() and
+            this.ktx1.calm() and
+            this.ktx2.calm();
     }
 
     pub fn size(this: @This()) usize {
-        return this.cons.size() + this.fork.size() + this.cans.size() +
-            this.kone.size() + this.ktwo.size();
+        return this.hcat.size() + this.fork.size() + this.cons.size() +
+            this.ktx1.size() + this.ktx2.size();
     }
 
-    pub fn pull(this: *@This(), room: *Room, bank: Bank) !void {
-        try this.cons.pull(room, bank);
-        try this.fork.pull(room, bank);
-        try this.cans.pull(room, bank);
-        try this.kone.pull(room, bank);
-        try this.ktwo.pull(room, bank);
+    pub fn pull(this: *@This(), heap: *Heap) !void {
+        try this.hcat.pull(heap);
+        try this.fork.pull(heap);
+        try this.cons.pull(heap);
+        try this.ktx1.pull(heap);
+        try this.ktx2.pull(heap);
     }
 };
 
-pub const Room = struct {
-    heap: [2]Heap,
-    flip: u1 = 0,
+pub const Heap = struct {
+    heap: [2]Half,
+    tick: u1 = 0,
     bank: Bank,
 
-    pub fn init(bank: Bank) Room {
-        return .{ .heap = .{ .{}, .{} }, .flip = 0, .bank = bank };
+    pub fn init(bank: Bank) Heap {
+        return .{ .heap = .{ .{}, .{} }, .tick = 0, .bank = bank };
     }
 
-    pub fn deinit(room: *Room) void {
-        room.heap[0].deinit(room.bank);
-        room.heap[1].deinit(room.bank);
+    pub fn deinit(heap: *Heap) void {
+        heap.heap[0].deinit(heap.bank);
+        heap.heap[1].deinit(heap.bank);
     }
 
-    pub fn curr(room: *Room) *Heap {
-        return &room.heap[room.flip];
+    pub fn new(heap: *Heap) *Half {
+        return &heap.heap[heap.tick];
     }
 
-    pub fn old(room: *Room) *Heap {
-        return &room.heap[room.flip ^ 1];
+    pub fn old(heap: *Heap) *Half {
+        return &heap.heap[heap.tick ^ 1];
     }
 
-    pub fn size(room: *Room) usize {
-        return room.curr().size();
+    pub fn size(heap: *Heap) usize {
+        return heap.new().size();
     }
 
     /// Begin GC: flip and clear new space
-    pub fn beginFlip(room: *Room) void {
-        room.flip ^= 1;
-        room.heap[room.flip].deinit(room.bank);
-        room.heap[room.flip] = .{};
+    pub fn flip(heap: *Heap) void {
+        heap.tick ^= 1;
+        heap.heap[heap.tick].deinit(heap.bank);
+        heap.heap[heap.tick] = .{};
     }
 
-    pub fn move(room: *Room, thing: anytype) !void {
-        thing.* = try thing.warp(room, room.bank);
+    pub fn move(heap: *Heap, thing: anytype) !void {
+        thing.* = try thing.warp(heap);
     }
 
     /// Scan all unscanned items until fixed point
-    pub fn scan(room: *Room) !void {
-        while (!room.curr().calm()) {
-            try room.curr().pull(room, room.bank);
+    pub fn scan(heap: *Heap) !void {
+        while (!heap.new().calm()) {
+            try heap.new().pull(heap);
         }
     }
 
     /// Rebuild hashmap by warping keys and values, keeping only reachable entries
-    pub fn warpMap(room: *Room, old_map: anytype, new_map: anytype) !void {
+    pub fn hash(heap: *Heap, old_map: anytype, new_map: anytype) !void {
         var iter = old_map.iterator();
         while (iter.next()) |entry| {
-            const key = entry.key_ptr.*.warp(room, room.bank) catch continue;
-            const value = entry.value_ptr.*.warp(room, room.bank) catch continue;
+            const key = entry.key_ptr.*.warp(heap) catch continue;
+            const value = entry.value_ptr.*.warp(heap) catch continue;
             try new_map.put(key, value);
         }
+    }
+
+    pub fn copy(
+        heap: *Heap,
+        comptime T: type,
+        from: *Rack(T),
+        dest: *Rack(T),
+        item: usize,
+    ) !u32 {
+        if (from.look(item)) |turn| return turn;
+        const data = from.list.items[item];
+        const next = try dest.push(heap.bank, data);
+        from.burn(item, next);
+        return next;
     }
 };
 
@@ -206,33 +220,22 @@ pub const Node = packed struct {
 
     pub fn calm(this: Node, flap: u1) bool {
         return switch (this.look()) {
-            .cons, .cans, .fork => view(Oper, this).flip == flap,
+            .hcat, .cons, .fork => view(Oper, this).flip == flap,
             else => true,
         };
     }
 
     pub fn warp(
         word: Node,
-        room: *Room,
-        bank: Bank,
+        heap: *Heap,
     ) !Node {
-        if (word.calm(room.flip)) return word;
+        if (word.calm(heap.tick)) return word;
 
-        const dest: *Rack(Pair) = word.rack(room.curr());
-        const from: *Rack(Pair) = word.rack(room.old());
+        const dest: *Rack(Pair) = word.rack(heap.new());
+        const from: *Rack(Pair) = word.rack(heap.old());
 
-        const item = word.unit();
-        if (from.look(item)) |turn|
-            return @bitCast(turn);
-
-        const data: Pair = from.list.items[item];
-        const next = try dest.push(bank, data);
-
-        const bird: Node = word.onto(@intCast(next));
-
-        from.burn(item, @bitCast(bird));
-
-        return bird;
+        const next = try heap.copy(Pair, from, dest, word.unit());
+        return word.onto(@intCast(next));
     }
 
     pub fn onto(this: Node, item: u21) Node {
@@ -242,11 +245,11 @@ pub const Node = packed struct {
         return @bitCast(oper);
     }
 
-    pub fn rack(this: Node, heap: *Heap) *Rack(Pair) {
+    pub fn rack(this: Node, heap: *Half) *Rack(Pair) {
         return switch (this.tag) {
-            .cons => &heap.cons,
+            .hcat => &heap.hcat,
             .fork => &heap.fork,
-            .cans => &heap.cans,
+            .cons => &heap.cons,
             else => unreachable,
         };
     }
@@ -262,9 +265,9 @@ pub const Node = packed struct {
         quad: Quad,
         trip: Trip,
         rune: Rune,
-        cons: Oper,
+        hcat: Oper,
         fork: Oper,
-        cans: Oper,
+        cons: Oper,
     };
 
     pub const Edit = union(Tag) {
@@ -272,9 +275,9 @@ pub const Node = packed struct {
         quad: *Quad,
         trip: *Trip,
         rune: *Rune,
-        cons: *Oper,
+        hcat: *Oper,
         fork: *Oper,
-        cans: *Oper,
+        cons: *Oper,
     };
 
     pub const halt = Node.fromRune(0, 0);
@@ -288,7 +291,7 @@ pub const Node = packed struct {
     }
 
     pub fn easy(this: Node) bool {
-        return this.tag != .cons and this.tag != .fork;
+        return this.tag != .hcat and this.tag != .fork;
     }
 
     pub fn look(this: Node) Look {
@@ -297,17 +300,17 @@ pub const Node = packed struct {
             .quad => .{ .quad = view(Quad, this) },
             .trip => .{ .trip = view(Trip, this) },
             .rune => .{ .rune = view(Rune, this) },
-            .cons => .{ .cons = view(Oper, this) },
+            .hcat => .{ .hcat = view(Oper, this) },
             .fork => .{ .fork = view(Oper, this) },
-            .cans => .{ .cans = view(Oper, this) },
+            .cons => .{ .cons = view(Oper, this) },
         };
     }
 
-    pub fn load(this: Node, heap: *const Heap) Pair {
+    pub fn load(this: Node, heap: *const Half) Pair {
         return switch (this.look()) {
-            .cons => |cons| heap.cons.items[cons.item],
+            .hcat => |hcat| heap.hcat.items[hcat.item],
             .fork => |fork| heap.fork.items[fork.item],
-            .cans => |cans| heap.cans.items[cans.item],
+            .cons => |cons| heap.cons.items[cons.item],
             else => unreachable,
         };
     }
@@ -318,9 +321,9 @@ pub const Node = packed struct {
             .quad => .{ .quad = mut(Quad, this) },
             .trip => .{ .trip = mut(Trip, this) },
             .rune => .{ .rune = mut(Rune, this) },
-            .cons => .{ .cons = mut(Oper, this) },
+            .hcat => .{ .hcat = mut(Oper, this) },
             .fork => .{ .fork = mut(Oper, this) },
-            .cans => .{ .cans = mut(Oper, this) },
+            .cons => .{ .cons = mut(Oper, this) },
         };
     }
 
@@ -394,74 +397,46 @@ pub const Node = packed struct {
 
 pub const Loop = struct {
     tree: *Tree,
-    room: *Room,
+    heap: *Heap,
     cost: Cost,
     memo: Memo,
     stat: Stat = .{},
     pile: std.ArrayList(Exec) = .empty,
     best: std.ArrayList(Idea) = .empty,
     icky: ?Idea = null,
-    gc_threshold: usize = 10000,
+    tide: usize = 10_000_000,
 
     pub fn deinit(this: *@This()) void {
-        this.best.deinit(this.room.bank);
-        this.pile.deinit(this.room.bank);
+        this.best.deinit(this.heap.bank);
+        this.pile.deinit(this.heap.bank);
         this.memo.deinit();
     }
 
-    fn should_gc(this: *@This()) bool {
-        return this.room.size() > this.gc_threshold;
-    }
-
-    /// Cheney-style compacting GC pass
     fn tidy(this: *@This()) !void {
-        this.room.beginFlip();
+        this.heap.flip();
 
         for (this.pile.items) |*exec|
-            try this.room.move(exec);
-
+            try this.heap.move(exec);
         for (this.best.items) |*idea|
-            try this.room.move(idea);
-
+            try this.heap.move(idea);
         if (this.icky) |*icky|
-            try this.room.move(icky);
+            try this.heap.move(icky);
 
-        try this.room.scan();
+        try this.heap.scan();
 
-        var new_memo = Memo.init(this.tree.bank);
-        try this.room.warpMap(&this.memo, &new_memo);
-
+        var memo = Memo.init(this.tree.bank);
+        try this.heap.hash(&this.memo, &memo);
         this.memo.deinit();
-        this.memo = new_memo;
+        this.memo = memo;
     }
 
-    fn maybe_gc(this: *@This()) !void {
-        if (!this.should_gc()) return;
-
-        const old_heap_size = this.room.size();
-        const old_memo_size = this.memo.count();
-
-        log.info("GC triggered: heap_size={} threshold={}", .{
-            old_heap_size,
-            this.gc_threshold,
-        });
-
+    fn fuss(this: *@This()) !void {
+        if (this.heap.size() < this.tide) return;
+        const size0 = this.heap.size();
         try this.tidy();
-
-        const new_heap_size = this.room.size();
-        const new_memo_size = this.memo.count();
-
-        log.info("GC completed: heap {} -> {}, memo {} -> {}", .{
-            old_heap_size,
-            new_heap_size,
-            old_memo_size,
-            new_memo_size,
-        });
-
-        const growth = new_heap_size * 2;
-        const proposed_threshold = new_heap_size + growth;
-        if (proposed_threshold > this.gc_threshold)
-            this.gc_threshold = proposed_threshold;
+        const size1 = this.heap.size();
+        log.info("gc: heap {Bi:>6.2} to {Bi:>6.2}", .{ size0, size1 });
+        this.tide = @max(this.tide, size1 + size1 * 2);
     }
 
     pub fn pick(
@@ -472,7 +447,7 @@ pub const Loop = struct {
     ) !Best {
         var this = @This(){
             .tree = tree,
-            .room = &tree.room,
+            .heap = &tree.heap,
             .cost = cost,
             .memo = .init(bank),
         };
@@ -488,7 +463,7 @@ pub const Loop = struct {
 
     pub fn loop(this: *@This()) !Best {
         try this.ickyloop();
-        try this.maybe_gc();
+        try this.fuss();
         try this.goodloop();
 
         this.stat.size = this.best.items.len;
@@ -542,32 +517,30 @@ pub const Loop = struct {
 
     fn goodloop(this: *@This()) !void {
         while (this.pile.pop()) |next| {
-            {
-                var exec = next;
-                while (true) {
-                    if (this.pile.items.len > this.stat.peak)
-                        this.stat.peak = this.pile.items.len;
+            var exec = next;
+            while (true) {
+                if (this.pile.items.len > this.stat.peak)
+                    this.stat.peak = this.pile.items.len;
 
-                    switch (exec.tick) {
-                        .give => |gist| {
-                            if (exec.then.kind == .none) {
-                                try this.meld(.{ .gist = gist, .node = exec.node });
-                                break;
-                            }
-                        },
-                        else => {},
-                    }
-
-                    if (this.step(&exec, false)) {} else |e| {
-                        switch (e) {
-                            error.Icky => break,
-                            else => return e,
+                switch (exec.tick) {
+                    .give => |gist| {
+                        if (exec.then.kind == .none) {
+                            try this.meld(.{ .gist = gist, .node = exec.node });
+                            break;
                         }
+                    },
+                    else => {},
+                }
+
+                if (this.step(&exec, false)) {} else |e| {
+                    switch (e) {
+                        error.Icky => break,
+                        else => return e,
                     }
                 }
             }
 
-            try this.maybe_gc();
+            try this.fuss();
         }
     }
 
@@ -627,8 +600,8 @@ pub const Loop = struct {
                         exec.tick = .{ .give = trip.toGist(crux, this.cost) };
                         return;
                     },
-                    .cons => |oper| {
-                        const cons = this.room.curr().cons.list.items[oper.item];
+                    .hcat => |oper| {
+                        const hcat = this.heap.new().hcat.list.items[oper.item];
 
                         // Apply local indent state to the crux.
                         if (oper.frob.warp == 1) crux.warp();
@@ -637,27 +610,27 @@ pub const Loop = struct {
                         const then = exec.then;
                         const item = crux.item(exec.node);
 
-                        // We will start evaluating the cons head.
-                        exec.node = cons.head;
+                        // We will start evaluating the hcat head.
+                        exec.node = hcat.head;
 
-                        // Splice the cons task with the current continuation.
-                        exec.then = try Kone.make(.{
-                            // Afterwards, proceed with the cons tail.
-                            .node = cons.tail,
+                        // Splice the hcat task with the current continuation.
+                        exec.then = try Ktx1.make(.{
+                            // Afterwards, proceed with the hcat tail.
+                            .node = hcat.tail,
                             // Use the same indent base.
                             .base = eval.base,
-                            // After the cons tail, return to the current continuation.
+                            // After the hcat tail, return to the current continuation.
                             .then = then,
                             // Remember what item we are evaluating.
                             .item = item,
-                        }, this.room);
+                        }, this.heap);
 
                         exec.tick = .{ .eval = crux };
 
                         return;
                     },
                     .fork => |fork| {
-                        const pair = this.room.curr().fork.list.items[fork.item];
+                        const pair = this.heap.new().fork.list.items[fork.item];
 
                         // Apply local indent state to the crux.
                         if (fork.frob.warp == 1) crux.warp();
@@ -676,16 +649,16 @@ pub const Loop = struct {
 
                         return;
                     },
-                    .cans => unreachable,
+                    .cons => unreachable,
                 }
             },
             .give => {
                 // We have evaluated a node to a gist and a forkless node.
                 // If there is a current continuation, inspect it to proceed.
 
-                switch (exec.then.load(this.room)) {
+                switch (exec.then.load(this.heap)) {
                     .head => |cont| {
-                        // We have evaluated the head of a cons.
+                        // We have evaluated the head of a hcat.
 
                         const node = exec.node;
                         const gist = exec.tick.give;
@@ -696,16 +669,16 @@ pub const Loop = struct {
                         // We must evaluate the tail also before continuing.
                         exec.node = cont.node;
 
-                        // After the cons tail, we will combine and continue.
-                        exec.then = try Ktwo.make(.{
-                            // Remember which cons item we are evaluating.
+                        // After the hcat tail, we will combine and continue.
+                        exec.then = try Ktx2.make(.{
+                            // Remember which hcat item we are evaluating.
                             .item = cont.item,
                             // Remember the followup continuation.
                             .then = cont.then,
                             // Remember the evaluation result of the head.
                             .gist = gist,
                             .node = node,
-                        }, this.room);
+                        }, this.heap);
 
                         // Set the tail evaluation context.
                         exec.tick = .{
@@ -724,33 +697,20 @@ pub const Loop = struct {
                         return;
                     },
                     .tail => |cont| {
-                        // We have evaluated both the head and the tail of a cons.
+                        // We have evaluated both the head and the tail of a hcat.
 
                         const past = cont;
                         const curr = exec.tick.give;
 
-                        // Combine the head & tail gists into a gist for the whole cons.
+                        // Combine the head & tail gists into a gist for the whole hcat.
                         var gist = curr;
                         gist.rows +|= past.gist.rows;
                         gist.rank = this.cost.plus(curr.rank, past.gist.rank);
 
-                        // Both sides of the cons may have been forking nodes.
+                        // Both sides of the hcat may have been forking nodes.
                         // Make a forkless cons node from the resolved head and tail nodes.
-                        if (std.debug.runtime_safety) {
-                            const cans_len = this.room.curr().cans.list.items.len;
-                            if (cans_len > std.math.maxInt(u21)) {
-                                log.err(
-                                    "pre-cans len overflow: len={} flip={} head_ptr={x}",
-                                    .{
-                                        cans_len,
-                                        this.room.flip,
-                                        @intFromPtr(this.room.curr().cans.list.items.ptr),
-                                    },
-                                );
-                            }
-                        }
                         const oper = Node.view(Oper, cont.item.node);
-                        const node = try this.tree.cans(oper.frob, past.node, exec.node);
+                        const node = try this.tree.cons(oper.frob, past.node, exec.node);
 
                         // We also save the combined evaluation result of this item
                         // to avoid recomputing it later.
@@ -828,9 +788,9 @@ pub const Idea = packed struct {
     node: Node = Node.halt,
     gist: Gist = .{},
 
-    pub fn warp(idea: Idea, room: *Room, bank: Bank) !Idea {
+    pub fn warp(idea: Idea, heap: *Heap) !Idea {
         return .{
-            .node = try idea.node.warp(room, bank),
+            .node = try idea.node.warp(heap),
             .gist = idea.gist,
         };
     }
@@ -850,11 +810,11 @@ pub const Exec = struct {
     },
     then: Kont = Kont.none,
 
-    pub fn warp(exec: Exec, room: *Room, bank: Bank) !Exec {
+    pub fn warp(exec: Exec, heap: *Heap) !Exec {
         return .{
-            .node = try exec.node.warp(room, bank),
+            .node = try exec.node.warp(heap),
             .tick = exec.tick,
-            .then = try exec.then.warp(room, bank),
+            .then = try exec.then.warp(heap),
         };
     }
 };
@@ -864,9 +824,9 @@ pub const Item = packed struct {
     head: u16,
     base: u16,
 
-    pub fn warp(item: Item, room: *Room, bank: Bank) !Item {
+    pub fn warp(item: Item, heap: *Heap) !Item {
         return .{
-            .node = try item.node.warp(room, bank),
+            .node = try item.node.warp(heap),
             .head = item.head,
             .base = item.base,
         };
@@ -875,20 +835,16 @@ pub const Item = packed struct {
 
 pub const Memo = std.AutoHashMap(Item, Idea);
 
-pub const KontKind = enum(u2) {
-    none = 0,
-    head = 1,
-    tail = 2,
-};
-
 pub const Kont = packed struct {
-    kind: KontKind = .none,
+    pub const Kind = enum(u2) { none, head, tail };
+
+    kind: Kind = .none,
     flip: u1 = 0,
     item: u29 = 0,
 
-    pub const none: Kont = .{ .kind = .none, .flip = 1, .item = std.math.maxInt(u29) };
+    pub const none: Kont = .{ .kind = .none, .flip = 1 };
 
-    pub fn make(kind: KontKind, flip: u1, idx: u29) Kont {
+    pub fn make(kind: Kind, flip: u1, idx: u29) Kont {
         return .{ .kind = kind, .flip = flip, .item = idx };
     }
 
@@ -896,58 +852,25 @@ pub const Kont = packed struct {
         return this.flip == flap;
     }
 
-    pub fn load(this: Kont, room: *Room) union(enum) { head: *Kone, tail: *Ktwo, none } {
+    pub fn load(this: Kont, heap: *Heap) union(enum) { head: *Ktx1, tail: *Ktx2, none } {
         return switch (this.kind) {
-            .head => .{ .head = &room.curr().kone.list.items[this.item] },
-            .tail => .{ .tail = &room.curr().ktwo.list.items[this.item] },
+            .head => .{ .head = &heap.new().ktx1.list.items[this.item] },
+            .tail => .{ .tail = &heap.new().ktx2.list.items[this.item] },
             .none => .none,
         };
     }
 
     pub fn warp(
         word: Kont,
-        room: *Room,
-        bank: Bank,
+        heap: *Heap,
     ) !Kont {
-        if (word.calm(room.flip)) return word;
-
-        switch (word.kind) {
-            .head => {
-                const from: *Rack(Kone) = &room.old().kone;
-                const dest: *Rack(Kone) = &room.curr().kone;
-
-                if (from.look(word.item)) |turn|
-                    return @bitCast(turn);
-
-                const data: Kone = from.list.items[word.item];
-                const next = try dest.push(bank, data);
-
-                const bird: Kont = word.onto(@intCast(next));
-
-                from.burn(word.item, @bitCast(bird));
-
-                return bird;
-            },
-
-            .tail => {
-                const from: *Rack(Ktwo) = &room.old().ktwo;
-                const dest: *Rack(Ktwo) = &room.curr().ktwo;
-
-                if (from.look(word.item)) |turn|
-                    return @bitCast(turn);
-
-                const data: Ktwo = from.list.items[word.item];
-                const next = try dest.push(bank, data);
-
-                const bird: Kont = word.onto(@intCast(next));
-
-                from.burn(word.item, @bitCast(bird));
-
-                return bird;
-            },
-
+        if (word.calm(heap.tick)) return word;
+        const next = switch (word.kind) {
+            .head => try heap.copy(Ktx1, &heap.old().ktx1, &heap.new().ktx1, word.item),
+            .tail => try heap.copy(Ktx2, &heap.old().ktx2, &heap.new().ktx2, word.item),
             else => return word,
-        }
+        };
+        return word.onto(@intCast(next));
     }
 
     pub fn onto(this: Kont, unit: u21) Kont {
@@ -958,39 +881,39 @@ pub const Kont = packed struct {
     }
 };
 
-pub const Kone = struct {
+pub const Ktx1 = struct {
     node: Node,
     base: u16,
     item: Item,
     then: Kont,
 
-    pub fn make(kone: Kone, room: *Room) !Kont {
-        const idx = try room.curr().kone.push(room.bank, kone);
-        return Kont.make(.head, room.flip, @intCast(idx));
+    pub fn make(k1: Ktx1, heap: *Heap) !Kont {
+        const idx = try heap.new().ktx1.push(heap.bank, k1);
+        return Kont.make(.head, heap.tick, @intCast(idx));
     }
 
-    pub fn drag(kone: *Kone, room: *Room, bank: Bank) !void {
-        kone.node = try kone.node.warp(room, bank);
-        kone.item.node = try kone.item.node.warp(room, bank);
-        kone.then = try kone.then.warp(room, bank);
+    pub fn drag(k1: *Ktx1, heap: *Heap) !void {
+        try heap.move(&k1.node);
+        try heap.move(&k1.item.node);
+        try heap.move(&k1.then);
     }
 };
 
-pub const Ktwo = struct {
+pub const Ktx2 = struct {
     node: Node,
     gist: Gist,
     item: Item,
     then: Kont,
 
-    pub fn make(ktwo: Ktwo, room: *Room) !Kont {
-        const idx = try room.curr().ktwo.push(room.bank, ktwo);
-        return Kont.make(.tail, room.flip, @intCast(idx));
+    pub fn make(k2: Ktx2, heap: *Heap) !Kont {
+        const idx = try heap.new().ktx2.push(heap.bank, k2);
+        return Kont.make(.tail, heap.tick, @intCast(idx));
     }
 
-    pub fn drag(ktwo: *Ktwo, room: *Room, bank: Bank) !void {
-        ktwo.node = try ktwo.node.warp(room, bank);
-        ktwo.item.node = try ktwo.item.node.warp(room, bank);
-        ktwo.then = try ktwo.then.warp(room, bank);
+    pub fn drag(k2: *Ktx2, heap: *Heap) !void {
+        try heap.move(&k2.node);
+        try heap.move(&k2.item.node);
+        try heap.move(&k2.then);
     }
 };
 
@@ -1106,9 +1029,9 @@ pub const Tag = enum(u3) {
     quad = 0b001,
     trip = 0b010,
     rune = 0b011,
-    cons = 0b100,
+    hcat = 0b100,
     fork = 0b101,
-    cans = 0b110,
+    cons = 0b110,
 };
 
 pub const Side = enum(u1) { lchr, rchr };
@@ -1308,7 +1231,7 @@ pub const Frob = packed struct {
 };
 
 pub const Oper = packed struct {
-    kind: Tag = .cons,
+    kind: Tag = .hcat,
     frob: Frob = .{},
     flip: u1 = 0,
     item: u21 = 0,
@@ -1323,43 +1246,43 @@ pub const Oper = packed struct {
 /// It is also used to rank layouts, and to actually print them.
 pub const Tree = struct {
     bank: Bank,
-    room: Room,
+    heap: Heap,
     blob: std.ArrayList(u8),
     flatmemo: std.AutoHashMap(Node, Node),
-    cansmemo: std.AutoHashMap(Pair, u22),
+    consmemo: std.AutoHashMap(Pair, u22),
 
     pub fn init(bank: Bank) Tree {
         return .{
             .bank = bank,
-            .room = Room.init(bank),
+            .heap = Heap.init(bank),
             .blob = .empty,
             .flatmemo = std.AutoHashMap(Node, Node).init(bank),
-            .cansmemo = std.AutoHashMap(Pair, u22).init(bank),
+            .consmemo = std.AutoHashMap(Pair, u22).init(bank),
         };
     }
 
     pub fn deinit(tree: *Tree) void {
-        tree.room.deinit();
+        tree.heap.deinit();
         tree.blob.deinit(tree.bank);
         tree.flatmemo.deinit();
-        tree.cansmemo.deinit();
+        tree.consmemo.deinit();
     }
 
-    pub fn hashcans(tree: *Tree, frob: Frob, head: Node, tail: Node) !Node {
+    pub fn hashcons(tree: *Tree, frob: Frob, head: Node, tail: Node) !Node {
         const pair = Pair{ .head = head, .tail = tail };
 
-        if (tree.cansmemo.get(pair)) |idx| {
-            return Node.fromOper(.cans, frob, tree.room.flip, @intCast(idx));
+        if (tree.consmemo.get(pair)) |idx| {
+            return Node.fromOper(.cons, frob, tree.heap.tick, @intCast(idx));
         }
 
-        const idx = tree.room.curr().cans.items.len;
+        const idx = tree.heap.new().cons.items.len;
         if (idx > std.math.maxInt(u22))
             return error.OutOfConses;
 
-        const node = Node.fromOper(.cans, frob, tree.room.flip, @intCast(idx));
+        const node = Node.fromOper(.cons, frob, tree.heap.tick, @intCast(idx));
 
-        try tree.room.curr().cans.append(tree.bank, pair);
-        try tree.cansmemo.put(pair, @intCast(idx));
+        try tree.heap.new().cons.append(tree.bank, pair);
+        try tree.consmemo.put(pair, @intCast(idx));
         return node;
     }
 
@@ -1433,8 +1356,8 @@ pub const Tree = struct {
                     }
                 }
             },
-            .cons => |oper| {
-                const pair = tree.room.curr().cons.list.items[oper.item];
+            .hcat => |oper| {
+                const pair = tree.heap.new().hcat.list.items[oper.item];
 
                 var child_ctx = ctx.*;
                 if (oper.frob.warp == 1) child_ctx.base = child_ctx.last;
@@ -1446,8 +1369,8 @@ pub const Tree = struct {
                 ctx.last = right_ctx.last;
                 ctx.rows = right_ctx.rows;
             },
-            .cans => |oper| {
-                const pair = tree.room.curr().cans.list.items[oper.item];
+            .cons => |oper| {
+                const pair = tree.heap.new().cons.list.items[oper.item];
 
                 var child_ctx = ctx.*;
                 if (oper.frob.warp == 1) child_ctx.base = child_ctx.last;
@@ -1491,8 +1414,8 @@ pub const Tree = struct {
                 if (rune.code != '\n' or rune.reps == 0) break :blk doc;
                 break :blk Node.fromRune(rune.reps, ' ');
             },
-            .cons => |oper| blk: {
-                const pair = tree.room.curr().cons.list.items[oper.item];
+            .hcat => |oper| blk: {
+                const pair = tree.heap.new().hcat.list.items[oper.item];
                 const head = try tree.flat(pair.head);
                 const tail = try tree.flat(pair.tail);
                 const changed =
@@ -1500,10 +1423,10 @@ pub const Tree = struct {
                     tail.repr() != pair.tail.repr();
                 if (!changed) break :blk doc;
 
-                break :blk try tree.cons(oper.frob, head, tail);
+                break :blk try tree.hcat(oper.frob, head, tail);
             },
             .fork => |oper| blk: {
-                const pair = tree.room.curr().fork.list.items[oper.item];
+                const pair = tree.heap.new().fork.list.items[oper.item];
                 const head = try tree.flat(pair.head);
                 const tail = try tree.flat(pair.tail);
                 const changed =
@@ -1511,13 +1434,13 @@ pub const Tree = struct {
                     tail.repr() != pair.tail.repr();
                 if (!changed) break :blk doc;
 
-                const next: u21 = @intCast(try tree.room.curr().fork.push(
+                const next: u21 = @intCast(try tree.heap.new().fork.push(
                     tree.bank,
                     .{ .head = head, .tail = tail },
                 ));
-                break :blk Node.fromOper(.fork, oper.frob, tree.room.flip, next);
+                break :blk Node.fromOper(.fork, oper.frob, tree.heap.tick, next);
             },
-            .cans => unreachable,
+            .cons => unreachable,
         };
 
         try tree.flatmemo.put(doc, result);
@@ -1538,7 +1461,7 @@ pub const Tree = struct {
 
         var new = doc;
         switch (new.edit()) {
-            .cons, .fork => |oper| {
+            .hcat, .fork => |oper| {
                 oper.frob.nest +|= indent;
                 return new;
             },
@@ -1556,15 +1479,15 @@ pub const Tree = struct {
     ///     ...DDD
     pub fn warp(tree: *Tree, doc: Node) !Node {
         switch (doc.tag) {
-            .cons, .fork => {
+            .hcat, .fork => {
                 var new = doc;
                 switch (new.edit()) {
-                    .cons, .fork => |oper| oper.frob.warp = 1,
+                    .hcat, .fork => |oper| oper.frob.warp = 1,
                     else => unreachable,
                 }
                 return new;
             },
-            .cans => unreachable,
+            .cons => unreachable,
             .span, .quad, .trip, .rune => if (doc.isEmptyText())
                 return doc
             else {
@@ -1573,36 +1496,26 @@ pub const Tree = struct {
                 // We need an `oper` to carry the `frob`.
                 // If `plus` learns to fuse tiny texts,
                 // we'll need to fix this path.
-                std.debug.assert(oper.tag == .cons);
+                std.debug.assert(oper.tag == .hcat);
 
                 return try tree.warp(oper);
             },
         }
     }
 
-    pub fn cons(tree: *Tree, frob: Frob, lhs: Node, rhs: Node) !Node {
-        const next: u21 = @intCast(try tree.room.curr().cons.push(tree.bank, .{
+    pub fn hcat(tree: *Tree, frob: Frob, lhs: Node, rhs: Node) !Node {
+        const next: u21 = @intCast(try tree.heap.new().hcat.push(tree.bank, .{
             .head = lhs,
             .tail = rhs,
         }));
-        return Node.fromOper(.cons, frob, tree.room.flip, next);
+        return Node.fromOper(.hcat, frob, tree.heap.tick, next);
     }
 
-    pub fn cans(tree: *Tree, frob: Frob, lhs: Node, rhs: Node) !Node {
-        const len = tree.room.curr().cans.list.items.len;
-        if (len > std.math.maxInt(u21)) {
-            log.err("cans heap overflow: len={} flip={} lhs={} rhs={} ptr={x}", .{
-                len,
-                tree.room.flip,
-                lhs.repr(),
-                rhs.repr(),
-                @intFromPtr(tree.room.curr().cans.list.items.ptr),
-            });
-            return error.OutOfConses;
-        }
+    pub fn cons(tree: *Tree, frob: Frob, lhs: Node, rhs: Node) !Node {
+        const len = tree.heap.new().cons.list.items.len;
         const next: u21 = @intCast(len);
-        try tree.room.curr().cans.list.append(tree.bank, .{ .head = lhs, .tail = rhs });
-        return Node.fromOper(.cans, frob, tree.room.flip, next);
+        try tree.heap.new().cons.list.append(tree.bank, .{ .head = lhs, .tail = rhs });
+        return Node.fromOper(.cons, frob, tree.heap.tick, next);
     }
 
     pub fn plus(tree: *Tree, lhs: Node, rhs: Node) !Node {
@@ -1638,15 +1551,15 @@ pub const Tree = struct {
         //
         // When A and B are tiny texts, A + B is often also a tiny text.
 
-        return try tree.cons(.{}, lhs, rhs);
+        return try tree.hcat(.{}, lhs, rhs);
     }
 
     pub fn fork(tree: *Tree, lhs: Node, rhs: Node) !Node {
-        const next: u21 = @intCast(try tree.room.curr().fork.push(tree.bank, .{
+        const next: u21 = @intCast(try tree.heap.new().fork.push(tree.bank, .{
             .head = lhs,
             .tail = rhs,
         }));
-        return Node.fromOper(.fork, .{}, tree.room.flip, next);
+        return Node.fromOper(.fork, .{}, tree.heap.tick, next);
     }
 
     /// Concatenate multiple nodes in sequence
@@ -1924,7 +1837,7 @@ test "fuse text <> nl" {
         },
         else => unreachable,
     }
-    try expectEqual(0, t.room.curr().cons.list.items.len);
+    try expectEqual(0, t.heap.new().hcat.list.items.len);
     try expectEmitString(&t, "Hello, world!\n", fused);
 }
 
@@ -1943,7 +1856,7 @@ test "fuse nl <> text" {
         },
         else => unreachable,
     }
-    try expectEqual(0, t.room.curr().cons.list.items.len);
+    try expectEqual(0, t.heap.new().hcat.list.items.len);
     try expectEmitString(&t, "\nHello, world!", fused);
 }
 

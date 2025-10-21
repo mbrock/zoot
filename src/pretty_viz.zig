@@ -34,15 +34,15 @@ fn jsonNode(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
     const id = node.repr();
 
     const kind_str = switch (node.tag) {
-        .cons => "plus",
+        .hcat => "plus",
         .fork => "fork",
         else => "text",
     };
 
     const label = switch (node.look()) {
         .span, .quad, .trip, .rune => try formatTextNode(t2, t1, node),
-        .cons, .fork => |oper| try t2.cat(&.{
-            try t2.text(if (node.tag == .cons) "+" else "?"),
+        .hcat, .fork => |oper| try t2.cat(&.{
+            try t2.text(if (node.tag == .hcat) "+" else "?"),
             try t2.when(oper.frob.warp == 1, try t2.text("ʷ")),
             try t2.when(oper.frob.nest != 0, try t2.format("ⁿ{d}", .{oper.frob.nest})),
         }),
@@ -61,11 +61,11 @@ fn jsonNode(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
     };
 
     const children_field = switch (node.look()) {
-        .cons, .fork => |oper| blk: {
-            const args = if (node.tag == .cons)
-                t1.room.curr().cons.items[oper.item]
+        .hcat, .fork => |oper| blk: {
+            const args = if (node.tag == .hcat)
+                t1.heap.new().hcat.items[oper.item]
             else
-                t1.room.curr().fork.items[oper.item];
+                t1.heap.new().fork.items[oper.item];
 
             const left = try jsonNode(t2, t1, args.head);
             const right = try jsonNode(t2, t1, args.tail);
@@ -80,7 +80,7 @@ fn jsonNode(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
     };
 
     const fields = switch (node.tag) {
-        .cons, .fork => &[_]Node{ id_field, kind_field, label_field, children_field },
+        .hcat, .fork => &[_]Node{ id_field, kind_field, label_field, children_field },
         .span, .quad, .trip, .rune => &[_]Node{ id_field, kind_field, text_kind_field, label_field },
     };
 
@@ -135,10 +135,10 @@ fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) !Node {
 
     const label = switch (node.look()) {
         .span, .quad, .trip, .rune => try formatTextNode(t2, t1, node),
-        .cons, .fork, .cans => |oper| try t2.cat(&.{
+        .hcat, .fork, .cons => |oper| try t2.cat(&.{
             try t2.text(switch (node.tag) {
-                .cons => "+",
-                .cans => "#",
+                .hcat => "+",
+                .cons => "#",
                 .fork => "|",
                 else => unreachable,
             }),
@@ -150,21 +150,21 @@ fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) !Node {
     const color = switch (node.tag) {
         .span => "lightcyan",
         .quad, .trip, .rune => "lightblue",
-        .cons => "gray20",
+        .hcat => "gray20",
         .fork => "lightyellow",
-        .cans => "yellow",
+        .cons => "yellow",
     };
 
     const shape = switch (node.tag) {
         .span => "ellipse",
         .quad, .trip, .rune => "box",
+        .hcat => "point",
         .cons => "point",
-        .cans => "point",
         .fork => "box",
     };
 
     const style_attrs = switch (node.tag) {
-        .cons => try t2.sepBy(&.{
+        .hcat => try t2.sepBy(&.{
             try t2.attr("shape", try t2.text(shape)),
             try t2.attr("width", try t2.text("0.15")),
             try t2.attr("fillcolor", try t2.text(color)),
@@ -185,13 +185,13 @@ fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) !Node {
 
     // Add edges if this is an oper
     switch (node.look()) {
-        .cons, .fork, .cans => |oper| {
-            const args = if (node.tag == .cons)
-                t1.room.curr().cons.list.items[oper.item]
-            else if (node.tag == .cans)
-                t1.room.curr().cans.list.items[oper.item]
+        .hcat, .fork, .cons => |oper| {
+            const args = if (node.tag == .hcat)
+                t1.heap.new().hcat.list.items[oper.item]
+            else if (node.tag == .cons)
+                t1.heap.new().cons.list.items[oper.item]
             else
-                t1.room.curr().fork.list.items[oper.item];
+                t1.heap.new().fork.list.items[oper.item];
 
             const left_edge = try stmt(t2, try t2.cat(&.{
                 try t2.format("n{x}:sw -> n{x} ", .{ id, args.head.repr() }),
@@ -259,7 +259,7 @@ fn formatTextNode(doc_tree: *Tree, data_tree: *Tree, node: Node) !Node {
                 });
             }
         },
-        .cons, .fork, .cans => unreachable,
+        .hcat, .fork, .cons => unreachable,
     };
 }
 
