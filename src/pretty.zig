@@ -73,9 +73,9 @@ pub const Loop = struct {
     }
 
     pub fn loop(this: *@This()) !Best {
-        try this.ickyloop();
+        // Single unified loop: explore with icks=false (reject overflow, create Cope thunks)
+        try this.explore();
         try this.fuss();
-        try this.goodloop();
 
         this.stat.size = this.best.items.len;
         this.stat.memo_entries = this.memo.count();
@@ -90,6 +90,7 @@ pub const Loop = struct {
             return Best{ .idea = boss, .stat = this.stat };
         }
 
+        // No non-icky layouts found - use icky fallback if we have one
         if (this.icky) |icky| {
             return Best{ .idea = icky, .stat = this.stat };
         }
@@ -97,7 +98,7 @@ pub const Loop = struct {
         std.debug.panic("zero layouts discovered", .{});
     }
 
-    fn ickyloop(this: *@This()) !void {
+    fn old_ickyloop(this: *@This()) !void {
         log.debug("=== ICKY LOOP START (finding any layout, even bad ones) ===", .{});
         while (this.pile.pop()) |next| {
             var exec = next;
@@ -109,11 +110,23 @@ pub const Loop = struct {
                 switch (exec.tick) {
                     .give => |deck| {
                         if (exec.then.kind == .none) {
+                            // Check if this is a Cope thunk (tainted lazy computation)
+                            if (deck.cope == 1) {
+                                log.debug("    COMPLETION: Cope thunk - forcing evaluation", .{});
+                                // Force the Cope thunk by re-evaluating with icky=true
+                                const cope = this.heap.new().cope.list.items[deck.item];
+                                exec.node = cope.node;
+                                exec.tick = .{ .eval = cope.crux };
+                                // Continue loop to evaluate it
+                                try this.step(&exec, true);
+                                continue;
+                            }
+
                             // Count frontier size
                             var size: usize = 0;
                             {
                                 var curr = deck;
-                                while (curr.item != 0x7FFFFFFF) {
+                                while (curr.item != 0x3FFFFFFF) {
                                     size += 1;
                                     const duel = this.heap.new().duel.list.items[curr.item];
                                     curr = duel.next;
@@ -123,7 +136,7 @@ pub const Loop = struct {
 
                             // Process all ideas in the frontier
                             var curr = deck;
-                            while (curr.item != 0x7FFFFFFF) {
+                            while (curr.item != 0x3FFFFFFF) {
                                 const duel = this.heap.new().duel.list.items[curr.item];
                                 const idea: Idea = .{ .gist = duel.gist, .node = duel.node };
                                 const icky = this.cost.icky(duel.gist.rank);
@@ -151,16 +164,9 @@ pub const Loop = struct {
         }
     }
 
-    fn goodloop(this: *@This()) !void {
-        log.debug("=== GOOD LOOP START (finding optimal non-icky layouts) ===", .{});
+    fn explore(this: *@This()) !void {
+        log.debug("=== EXPLORE (unified loop: reject overflow, create Cope thunks) ===", .{});
 
-        // Re-push root node to restart exploration
-        try this.pile.append(this.heap.bank, .{
-            .node = this.root,
-            .tick = .{ .eval = .{} },
-        });
-
-        log.debug("  Pile has {d} tasks", .{this.pile.items.len});
         while (this.pile.pop()) |next| {
             var exec = next;
             log.debug("  Dequeued task (pile: {d})", .{this.pile.items.len});
@@ -171,11 +177,23 @@ pub const Loop = struct {
                 switch (exec.tick) {
                     .give => |deck| {
                         if (exec.then.kind == .none) {
-                            // Process all ideas in the frontier
+                            // Completion! Check if it's a Cope thunk or Duel frontier
+                            if (deck.cope == 1) {
+                                // Got a Cope thunk - force it to get an icky fallback
+                                log.debug("    COMPLETION: Cope thunk (forcing for icky fallback)", .{});
+                                const cope = this.heap.new().cope.list.items[deck.item];
+                                exec.node = cope.node;
+                                exec.tick = .{ .eval = cope.crux };
+                                // Re-evaluate with icky=true to get a tainted result
+                                try this.step(&exec, true);
+                                continue;
+                            }
+
+                            // Process all ideas in the Duel frontier (non-overflow)
                             var curr = deck;
-                            while (curr.item != 0x7FFFFFFF) {
+                            while (curr.item != 0x3FFFFFFF) {
                                 const duel = this.heap.new().duel.list.items[curr.item];
-                                log.debug("    GOOD COMPLETION: overflow={d} height={d}", .{ duel.gist.rank.o, duel.gist.rank.h });
+                                log.debug("    COMPLETION: overflow={d} height={d}", .{ duel.gist.rank.o, duel.gist.rank.h });
                                 try this.meld(.{ .gist = duel.gist, .node = duel.node });
                                 curr = duel.next;
                             }
@@ -211,9 +229,9 @@ pub const Loop = struct {
 
     /// Check if idea is dominated by any idea in the frontier
     fn dominated(this: *@This(), deck: Deck, gist: Gist) bool {
-        if (deck.item == 0x7FFFFFFF) return false;
+        if (deck.item == 0x3FFFFFFF) return false;
         var curr = deck;
-        while (curr.item != 0x7FFFFFFF) {
+        while (curr.item != 0x3FFFFFFF) {
             const duel = this.heap.new().duel.list.items[curr.item];
             if (wins(this.cost, duel.gist, gist)) return true;
             curr = duel.next;
@@ -233,9 +251,9 @@ pub const Loop = struct {
         var result = Deck.none;
         var kept: usize = 0;
         var filtered: usize = 0;
-        if (deck.item != 0x7FFFFFFF) {
+        if (deck.item != 0x3FFFFFFF) {
             var curr = deck;
-            while (curr.item != 0x7FFFFFFF) {
+            while (curr.item != 0x3FFFFFFF) {
                 const duel = this.heap.new().duel.list.items[curr.item];
                 if (!wins(this.cost, gist, duel.gist)) {
                     // Keep this idea
@@ -274,23 +292,34 @@ pub const Loop = struct {
         // If m1 <== m2: skip m2, keep m1
         // Else if m2 <== m1: skip m1, keep m2
         // Else: keep both and continue based on last
+        //
+        // Cope handling (OCaml's Tainted):
+        // - Prefer Duel (frontier) over Cope (thunk)
+        // - If both Cope, pick either one
 
-        if (a.item == 0x7FFFFFFF) return b;
-        if (b.item == 0x7FFFFFFF) return a;
+        if (a.item == 0x3FFFFFFF) return b;
+        if (b.item == 0x3FFFFFFF) return a;
+
+        // If b is Cope, prefer a (might be Duel or Cope)
+        if (b.cope == 1) return a;
+        // If a is Cope (and b is Duel), prefer b
+        if (a.cope == 1) return b;
+
+        // Both are Duel frontiers, merge them
 
         var result = Deck.none;
         var a_curr = a;
         var b_curr = b;
 
-        while (a_curr.item != 0x7FFFFFFF or b_curr.item != 0x7FFFFFFF) {
-            if (a_curr.item == 0x7FFFFFFF) {
+        while (a_curr.item != 0x3FFFFFFF or b_curr.item != 0x3FFFFFFF) {
+            if (a_curr.item == 0x3FFFFFFF) {
                 // Only b left
                 const b_duel = this.heap.new().duel.list.items[b_curr.item];
                 result = try this.cons_to_deck_raw(result, b_duel.node, b_duel.gist);
                 b_curr = b_duel.next;
                 continue;
             }
-            if (b_curr.item == 0x7FFFFFFF) {
+            if (b_curr.item == 0x3FFFFFFF) {
                 // Only a left
                 const a_duel = this.heap.new().duel.list.items[a_curr.item];
                 result = try this.cons_to_deck_raw(result, a_duel.node, a_duel.gist);
@@ -333,11 +362,11 @@ pub const Loop = struct {
 
     /// Filter out icky ideas from a frontier
     fn filterIcky(this: *@This(), deck: Deck) !Deck {
-        if (deck.item == 0x7FFFFFFF) return Deck.none;
+        if (deck.item == 0x3FFFFFFF) return Deck.none;
 
         var result = Deck.none;
         var curr = deck;
-        while (curr.item != 0x7FFFFFFF) {
+        while (curr.item != 0x3FFFFFFF) {
             const duel = this.heap.new().duel.list.items[curr.item];
             if (!this.cost.icky(duel.gist.rank)) {
                 const idx = try this.heap.new().duel.push(this.heap.bank, .{
@@ -407,7 +436,7 @@ pub const Loop = struct {
                         // In goodloop, filter out icky ideas from the deck
                         if (!icks) {
                             const filtered = try this.filterIcky(deck);
-                            if (filtered.item == 0x7FFFFFFF) {
+                            if (filtered.item == 0x3FFFFFFF) {
                                 // All ideas were icky, abandon this branch
                                 log.debug("      PRUNED: all memo results are icky", .{});
                                 return error.Icky;
@@ -592,13 +621,13 @@ pub const Loop = struct {
                         var tail_size: usize = 0;
                         {
                             var curr = head_deck;
-                            while (curr.item != 0x7FFFFFFF) {
+                            while (curr.item != 0x3FFFFFFF) {
                                 head_size += 1;
                                 const duel = this.heap.new().duel.list.items[curr.item];
                                 curr = duel.next;
                             }
                             curr = tail_deck;
-                            while (curr.item != 0x7FFFFFFF) {
+                            while (curr.item != 0x3FFFFFFF) {
                                 tail_size += 1;
                                 const duel = this.heap.new().duel.list.items[curr.item];
                                 curr = duel.next;
@@ -610,7 +639,7 @@ pub const Loop = struct {
 
                         var result = Deck.none;
                         var head_curr = head_deck;
-                        while (head_curr.item != 0x7FFFFFFF) {
+                        while (head_curr.item != 0x3FFFFFFF) {
                             const head_duel = this.heap.new().duel.list.items[head_curr.item];
 
                             // For each head, do "running best" scan through tail (like OCaml)
@@ -618,7 +647,7 @@ pub const Loop = struct {
                             var partial = Deck.none;
                             var current_best: ?struct{gist: Gist, node: Node} = null;
                             var tail_curr = tail_deck;
-                            while (tail_curr.item != 0x7FFFFFFF) {
+                            while (tail_curr.item != 0x3FFFFFFF) {
                                 const tail_duel = this.heap.new().duel.list.items[tail_curr.item];
 
                                 // Combine the gists
@@ -660,7 +689,7 @@ pub const Loop = struct {
                             var partial_size: usize = 0;
                             {
                                 var curr = partial;
-                                while (curr.item != 0x7FFFFFFF) {
+                                while (curr.item != 0x3FFFFFFF) {
                                     partial_size += 1;
                                     const duel = this.heap.new().duel.list.items[curr.item];
                                     curr = duel.next;
@@ -677,7 +706,7 @@ pub const Loop = struct {
                         }
 
                         // If all combinations were icky, bail out
-                        if (!icks and result.item == 0x7FFFFFFF) return error.Icky;
+                        if (!icks and result.item == 0x3FFFFFFF) return error.Icky;
 
                         // Memoize the result frontier
                         try this.memo.put(cont.item, result);
@@ -704,7 +733,7 @@ pub const Loop = struct {
                         const result = try this.merge_decks(left_deck, right_deck);
 
                         // If all ideas were icky in goodloop, bail out
-                        if (!icks and result.item == 0x7FFFFFFF) return error.Icky;
+                        if (!icks and result.item == 0x3FFFFFFF) return error.Icky;
 
                         // Memoize the result frontier
                         try this.memo.put(cont.item, result);
