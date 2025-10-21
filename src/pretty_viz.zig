@@ -63,9 +63,9 @@ fn jsonNode(t2: *Tree, t1: *Tree, node: Node) error{OutOfMemory}!Node {
     const children_field = switch (node.look()) {
         .cons, .fork => |oper| blk: {
             const args = if (node.tag == .cons)
-                t1.heap.cons.items[oper.item]
+                t1.room.curr().cons.items[oper.item]
             else
-                t1.heap.fork.items[oper.item];
+                t1.room.curr().fork.items[oper.item];
 
             const left = try jsonNode(t2, t1, args.head);
             const right = try jsonNode(t2, t1, args.tail);
@@ -187,11 +187,11 @@ fn graphvizDoc(t2: *Tree, t1: *Tree, node: Node) !Node {
     switch (node.look()) {
         .cons, .fork, .cans => |oper| {
             const args = if (node.tag == .cons)
-                t1.heap.cons.list.items[oper.item]
+                t1.room.curr().cons.list.items[oper.item]
             else if (node.tag == .cans)
-                t1.heap.cans.list.items[oper.item]
+                t1.room.curr().cans.list.items[oper.item]
             else
-                t1.heap.fork.list.items[oper.item];
+                t1.room.curr().fork.list.items[oper.item];
 
             const left_edge = try stmt(t2, try t2.cat(&.{
                 try t2.format("n{x}:sw -> n{x} ", .{ id, args.head.repr() }),

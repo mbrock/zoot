@@ -109,8 +109,8 @@ pub fn main() !void {
         .{ t0, t1, t3 },
     );
     try writer.print("cons: {d} cans: {d}\n", .{
-        t.heap.cons.list.items.len,
-        t.heap.cans.list.items.len,
+        t.room.curr().cons.list.items.len,
+        t.room.curr().cans.list.items.len,
     });
     try writer.flush();
 
