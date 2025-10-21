@@ -619,12 +619,22 @@ pub const Loop = struct {
                         // If so, the whole hcat is tainted - create Cope for the full hcat
                         if (head_deck.cope == 1 or tail_deck.cope == 1) {
                             log.debug("      HCAT: head or tail is Cope - creating Cope for full hcat", .{});
+
+                            // Get rows: if head is Duel, get from first gist; if Cope, get from its crux
+                            const head_rows = if (head_deck.cope == 0) blk: {
+                                const first_duel = this.heap.new().duel.list.items[head_deck.item];
+                                break :blk first_duel.gist.rows;
+                            } else blk: {
+                                const head_cope = this.heap.new().cope.list.items[head_deck.item];
+                                break :blk head_cope.crux.rows;
+                            };
+
                             const cope_idx = try this.heap.new().cope.push(this.heap.bank, .{
                                 .node = cont.item.node, // The full hcat node
                                 .crux = .{
                                     .last = cont.item.head,
                                     .base = cont.item.base,
-                                    .rows = 0,
+                                    .rows = head_rows,  // Get actual rows from head!
                                     .icky = true,
                                 },
                             });
