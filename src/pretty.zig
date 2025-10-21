@@ -2,398 +2,6 @@ const std = @import("std");
 const log = std.log;
 
 pub const Bank = std.mem.Allocator;
-const Pool = std.heap.MemoryPool;
-
-pub const Pair = struct {
-    head: Node,
-    tail: Node,
-
-    pub const halt: Pair = just(.halt);
-
-    pub fn just(a: Node) Pair {
-        return .{ .head = a, .tail = .halt };
-    }
-
-    pub fn drag(node: *Pair, heap: *Heap) !void {
-        try heap.move(&node.head);
-        try heap.move(&node.tail);
-    }
-};
-
-const Hack = struct {
-    mark: [:0]const u8,
-    word: [:0]const u8,
-
-    pub fn make(T: type) Hack {
-        switch (@typeInfo(T)) {
-            .@"struct" => |@"struct"| {
-                var mark: ?std.builtin.Type.StructField = null;
-                var word: ?std.builtin.Type.StructField = null;
-                for (@"struct".fields) |x| {
-                    if (@sizeOf(x.type) == 4) {
-                        if (mark == null)
-                            mark = x
-                        else if (word == null)
-                            word = x;
-                    }
-                }
-                if (mark != null and word != null)
-                    return .{ .mark = mark.?.name, .word = word.?.name };
-            },
-            else => {},
-        }
-        @compileError("need two 32 bit fields");
-    }
-};
-
-pub fn Rack(Elem: type) type {
-    const hack = Hack.make(Elem);
-
-    return struct {
-        list: std.ArrayList(Elem) = .empty,
-        scan: usize = 0,
-
-        pub const empty: @This() = .{};
-
-        pub fn burn(rack: *@This(), item: usize, word: u32) void {
-            var elem = &rack.list.items[item];
-            @as(*u32, @ptrCast(&@field(elem, hack.mark))).* = 0xffffaaaa;
-            @as(*u32, @ptrCast(&@field(elem, hack.word))).* = word;
-        }
-
-        pub fn look(rack: *@This(), item: usize) ?u32 {
-            const elem = rack.list.items[item];
-            return switch (@as(u32, @bitCast(@field(elem, hack.mark)))) {
-                0xffffaaaa => @as(u32, @bitCast(@field(elem, hack.word))),
-                else => null,
-            };
-        }
-
-        pub fn push(rack: *@This(), bank: Bank, elem: Elem) !u32 {
-            const item = rack.list.items.len;
-
-            try rack.list.append(bank, elem);
-            return @intCast(item);
-        }
-
-        pub fn calm(rack: @This()) bool {
-            return rack.scan == rack.list.items.len;
-        }
-
-        pub fn size(rack: @This()) usize {
-            return rack.list.items.len;
-        }
-
-        pub fn rift(rack: *@This()) []Elem {
-            return rack.list.items[rack.scan..];
-        }
-
-        pub fn pull(this: *@This(), heap: *Heap) !void {
-            while (this.scan < this.list.items.len) {
-                const i = this.scan;
-                // Copy out to avoid iterator invalidation during drag
-                var elem = this.list.items[i];
-                try elem.drag(heap);
-                // Write back after drag completes
-                this.list.items[i] = elem;
-                this.scan += 1;
-            }
-        }
-
-        pub fn deinit(rack: *@This(), bank: Bank) void {
-            rack.list.deinit(bank);
-        }
-    };
-}
-
-pub const Half = struct {
-    hcat: Rack(Pair) = .empty,
-    fork: Rack(Pair) = .empty,
-    cons: Rack(Pair) = .empty,
-    ktx1: Rack(Ktx1) = .empty,
-    ktx2: Rack(Ktx2) = .empty,
-
-    pub fn deinit(this: *@This(), bank: Bank) void {
-        this.hcat.deinit(bank);
-        this.fork.deinit(bank);
-        this.cons.deinit(bank);
-        this.ktx1.deinit(bank);
-        this.ktx2.deinit(bank);
-    }
-
-    pub fn calm(this: @This()) bool {
-        return this.hcat.calm() and
-            this.fork.calm() and
-            this.cons.calm() and
-            this.ktx1.calm() and
-            this.ktx2.calm();
-    }
-
-    pub fn size(this: @This()) usize {
-        return this.hcat.size() + this.fork.size() + this.cons.size() +
-            this.ktx1.size() + this.ktx2.size();
-    }
-
-    pub fn pull(this: *@This(), heap: *Heap) !void {
-        try this.hcat.pull(heap);
-        try this.fork.pull(heap);
-        try this.cons.pull(heap);
-        try this.ktx1.pull(heap);
-        try this.ktx2.pull(heap);
-    }
-};
-
-pub const Heap = struct {
-    heap: [2]Half,
-    tick: u1 = 0,
-    bank: Bank,
-
-    pub fn init(bank: Bank) Heap {
-        return .{ .heap = .{ .{}, .{} }, .tick = 0, .bank = bank };
-    }
-
-    pub fn deinit(heap: *Heap) void {
-        heap.heap[0].deinit(heap.bank);
-        heap.heap[1].deinit(heap.bank);
-    }
-
-    pub fn new(heap: *Heap) *Half {
-        return &heap.heap[heap.tick];
-    }
-
-    pub fn old(heap: *Heap) *Half {
-        return &heap.heap[heap.tick ^ 1];
-    }
-
-    pub fn size(heap: *Heap) usize {
-        return heap.new().size();
-    }
-
-    /// Begin GC: flip and clear new space
-    pub fn flip(heap: *Heap) void {
-        heap.tick ^= 1;
-        heap.heap[heap.tick].deinit(heap.bank);
-        heap.heap[heap.tick] = .{};
-    }
-
-    pub fn move(heap: *Heap, thing: anytype) !void {
-        thing.* = try thing.warp(heap);
-    }
-
-    /// Scan all unscanned items until fixed point
-    pub fn scan(heap: *Heap) !void {
-        while (!heap.new().calm()) {
-            try heap.new().pull(heap);
-        }
-    }
-
-    /// Rebuild hashmap by warping keys and values, keeping only reachable entries
-    pub fn hash(heap: *Heap, old_map: anytype, new_map: anytype) !void {
-        var iter = old_map.iterator();
-        while (iter.next()) |entry| {
-            const key = entry.key_ptr.*.warp(heap) catch continue;
-            const value = entry.value_ptr.*.warp(heap) catch continue;
-            try new_map.put(key, value);
-        }
-    }
-
-    pub fn copy(
-        heap: *Heap,
-        comptime T: type,
-        from: *Rack(T),
-        dest: *Rack(T),
-        item: usize,
-    ) !u32 {
-        if (from.look(item)) |turn| return turn;
-        const data = from.list.items[item];
-        const next = try dest.push(heap.bank, data);
-        from.burn(item, next);
-        return next;
-    }
-};
-
-/// 32-bit handle to either terminal or operation; implicitly indexes
-/// into some `Tree` aggregate.
-pub const Node = packed struct {
-    tag: Tag,
-    data: u29 = 0,
-
-    pub fn calm(this: Node, flap: u1) bool {
-        return switch (this.look()) {
-            .hcat, .cons, .fork => view(Oper, this).flip == flap,
-            else => true,
-        };
-    }
-
-    pub fn warp(
-        word: Node,
-        heap: *Heap,
-    ) !Node {
-        if (word.calm(heap.tick)) return word;
-
-        const dest: *Rack(Pair) = word.rack(heap.new());
-        const from: *Rack(Pair) = word.rack(heap.old());
-
-        const next = try heap.copy(Pair, from, dest, word.unit());
-        return word.onto(@intCast(next));
-    }
-
-    pub fn onto(this: Node, item: u21) Node {
-        var oper = view(Oper, this);
-        oper.item = item;
-        oper.flip ^= 1;
-        return @bitCast(oper);
-    }
-
-    pub fn rack(this: Node, heap: *Half) *Rack(Pair) {
-        return switch (this.tag) {
-            .hcat => &heap.hcat,
-            .fork => &heap.fork,
-            .cons => &heap.cons,
-            else => unreachable,
-        };
-    }
-
-    pub fn unit(this: Node) u21 {
-        return view(Oper, this).item;
-    }
-
-    pub const Form = Tag;
-
-    pub const Look = union(Tag) {
-        span: Span,
-        quad: Quad,
-        trip: Trip,
-        rune: Rune,
-        hcat: Oper,
-        fork: Oper,
-        cons: Oper,
-    };
-
-    pub const Edit = union(Tag) {
-        span: *Span,
-        quad: *Quad,
-        trip: *Trip,
-        rune: *Rune,
-        hcat: *Oper,
-        fork: *Oper,
-        cons: *Oper,
-    };
-
-    pub const halt = Node.fromRune(0, 0);
-
-    pub fn view(comptime T: type, this: Node) T {
-        return @bitCast(this);
-    }
-
-    fn mut(comptime T: type, this: *Node) *T {
-        return @ptrCast(@alignCast(this));
-    }
-
-    pub fn easy(this: Node) bool {
-        return this.tag != .hcat and this.tag != .fork;
-    }
-
-    pub fn look(this: Node) Look {
-        return switch (this.tag) {
-            .span => .{ .span = view(Span, this) },
-            .quad => .{ .quad = view(Quad, this) },
-            .trip => .{ .trip = view(Trip, this) },
-            .rune => .{ .rune = view(Rune, this) },
-            .hcat => .{ .hcat = view(Oper, this) },
-            .fork => .{ .fork = view(Oper, this) },
-            .cons => .{ .cons = view(Oper, this) },
-        };
-    }
-
-    pub fn load(this: Node, heap: *const Half) Pair {
-        return switch (this.look()) {
-            .hcat => |hcat| heap.hcat.items[hcat.item],
-            .fork => |fork| heap.fork.items[fork.item],
-            .cons => |cons| heap.cons.items[cons.item],
-            else => unreachable,
-        };
-    }
-
-    pub fn edit(this: *Node) Edit {
-        return switch (this.tag) {
-            .span => .{ .span = mut(Span, this) },
-            .quad => .{ .quad = mut(Quad, this) },
-            .trip => .{ .trip = mut(Trip, this) },
-            .rune => .{ .rune = mut(Rune, this) },
-            .hcat => .{ .hcat = mut(Oper, this) },
-            .fork => .{ .fork = mut(Oper, this) },
-            .cons => .{ .cons = mut(Oper, this) },
-        };
-    }
-
-    pub fn isTerminal(this: Node) bool {
-        return switch (this.tag) {
-            .span, .quad, .trip, .rune => true,
-            else => false,
-        };
-    }
-
-    pub fn isEmptyText(this: Node) bool {
-        return switch (this.look()) {
-            .rune => |rune| rune.isEmpty(),
-            else => false,
-        };
-    }
-
-    pub fn repr(this: Node) u32 {
-        return @bitCast(this);
-    }
-
-    pub fn fromSpan(side: Side, char: u7, text: u21) Node {
-        const span: Span = .{
-            .side = side,
-            .char = char,
-            .text = text,
-        };
-        return @bitCast(span);
-    }
-
-    pub fn fromQuad(chars: [4]u7) Node {
-        const quad: Quad = .{
-            .ch0 = chars[0],
-            .ch1 = chars[1],
-            .ch2 = chars[2],
-            .ch3 = chars[3],
-        };
-        return @bitCast(quad);
-    }
-
-    pub fn fromTrip(reps: u3, bytes: [3]u8) Node {
-        const trip: Trip = .{
-            .reps = reps,
-            .byte0 = bytes[0],
-            .byte1 = bytes[1],
-            .byte2 = bytes[2],
-        };
-        return @bitCast(trip);
-    }
-
-    pub fn fromRune(reps: u6, code: u21) Node {
-        const rune: Rune = .{
-            .reps = reps,
-            .code = code,
-        };
-        return @bitCast(rune);
-    }
-
-    pub fn fromOper(kind: Tag, frob: Frob, flip: u1, what: u21) Node {
-        const oper: Oper = .{
-            .kind = kind,
-            .frob = frob,
-            .flip = flip,
-            .item = what,
-        };
-        return @bitCast(oper);
-    }
-
-    pub const nl: Node = Node.fromRune(1, '\n');
-};
 
 pub const Loop = struct {
     tree: *Tree,
@@ -1747,6 +1355,397 @@ pub const Tree = struct {
         _ = args;
         return error.Unimplemented;
     }
+};
+
+pub const Pair = struct {
+    head: Node,
+    tail: Node,
+
+    pub const halt: Pair = just(.halt);
+
+    pub fn just(a: Node) Pair {
+        return .{ .head = a, .tail = .halt };
+    }
+
+    pub fn drag(node: *Pair, heap: *Heap) !void {
+        try heap.move(&node.head);
+        try heap.move(&node.tail);
+    }
+};
+
+const Hack = struct {
+    mark: [:0]const u8,
+    word: [:0]const u8,
+
+    pub fn make(T: type) Hack {
+        switch (@typeInfo(T)) {
+            .@"struct" => |@"struct"| {
+                var mark: ?std.builtin.Type.StructField = null;
+                var word: ?std.builtin.Type.StructField = null;
+                for (@"struct".fields) |x| {
+                    if (@sizeOf(x.type) == 4) {
+                        if (mark == null)
+                            mark = x
+                        else if (word == null)
+                            word = x;
+                    }
+                }
+                if (mark != null and word != null)
+                    return .{ .mark = mark.?.name, .word = word.?.name };
+            },
+            else => {},
+        }
+        @compileError("need two 32 bit fields");
+    }
+};
+
+pub fn Rack(Elem: type) type {
+    const hack = Hack.make(Elem);
+
+    return struct {
+        list: std.ArrayList(Elem) = .empty,
+        scan: usize = 0,
+
+        pub const empty: @This() = .{};
+
+        pub fn burn(rack: *@This(), item: usize, word: u32) void {
+            var elem = &rack.list.items[item];
+            @as(*u32, @ptrCast(&@field(elem, hack.mark))).* = 0xffffaaaa;
+            @as(*u32, @ptrCast(&@field(elem, hack.word))).* = word;
+        }
+
+        pub fn look(rack: *@This(), item: usize) ?u32 {
+            const elem = rack.list.items[item];
+            return switch (@as(u32, @bitCast(@field(elem, hack.mark)))) {
+                0xffffaaaa => @as(u32, @bitCast(@field(elem, hack.word))),
+                else => null,
+            };
+        }
+
+        pub fn push(rack: *@This(), bank: Bank, elem: Elem) !u32 {
+            const item = rack.list.items.len;
+
+            try rack.list.append(bank, elem);
+            return @intCast(item);
+        }
+
+        pub fn calm(rack: @This()) bool {
+            return rack.scan == rack.list.items.len;
+        }
+
+        pub fn size(rack: @This()) usize {
+            return rack.list.items.len;
+        }
+
+        pub fn rift(rack: *@This()) []Elem {
+            return rack.list.items[rack.scan..];
+        }
+
+        pub fn pull(this: *@This(), heap: *Heap) !void {
+            while (this.scan < this.list.items.len) {
+                const i = this.scan;
+                // Copy out to avoid iterator invalidation during drag
+                var elem = this.list.items[i];
+                try elem.drag(heap);
+                // Write back after drag completes
+                this.list.items[i] = elem;
+                this.scan += 1;
+            }
+        }
+
+        pub fn deinit(rack: *@This(), bank: Bank) void {
+            rack.list.deinit(bank);
+        }
+    };
+}
+
+pub const Half = struct {
+    hcat: Rack(Pair) = .empty,
+    fork: Rack(Pair) = .empty,
+    cons: Rack(Pair) = .empty,
+    ktx1: Rack(Ktx1) = .empty,
+    ktx2: Rack(Ktx2) = .empty,
+
+    pub fn deinit(this: *@This(), bank: Bank) void {
+        this.hcat.deinit(bank);
+        this.fork.deinit(bank);
+        this.cons.deinit(bank);
+        this.ktx1.deinit(bank);
+        this.ktx2.deinit(bank);
+    }
+
+    pub fn calm(this: @This()) bool {
+        return this.hcat.calm() and
+            this.fork.calm() and
+            this.cons.calm() and
+            this.ktx1.calm() and
+            this.ktx2.calm();
+    }
+
+    pub fn size(this: @This()) usize {
+        return this.hcat.size() + this.fork.size() + this.cons.size() +
+            this.ktx1.size() + this.ktx2.size();
+    }
+
+    pub fn pull(this: *@This(), heap: *Heap) !void {
+        try this.hcat.pull(heap);
+        try this.fork.pull(heap);
+        try this.cons.pull(heap);
+        try this.ktx1.pull(heap);
+        try this.ktx2.pull(heap);
+    }
+};
+
+pub const Heap = struct {
+    heap: [2]Half,
+    tick: u1 = 0,
+    bank: Bank,
+
+    pub fn init(bank: Bank) Heap {
+        return .{ .heap = .{ .{}, .{} }, .tick = 0, .bank = bank };
+    }
+
+    pub fn deinit(heap: *Heap) void {
+        heap.heap[0].deinit(heap.bank);
+        heap.heap[1].deinit(heap.bank);
+    }
+
+    pub fn new(heap: *Heap) *Half {
+        return &heap.heap[heap.tick];
+    }
+
+    pub fn old(heap: *Heap) *Half {
+        return &heap.heap[heap.tick ^ 1];
+    }
+
+    pub fn size(heap: *Heap) usize {
+        return heap.new().size();
+    }
+
+    /// Begin GC: flip and clear new space
+    pub fn flip(heap: *Heap) void {
+        heap.tick ^= 1;
+        heap.heap[heap.tick].deinit(heap.bank);
+        heap.heap[heap.tick] = .{};
+    }
+
+    pub fn move(heap: *Heap, thing: anytype) !void {
+        thing.* = try thing.warp(heap);
+    }
+
+    /// Scan all unscanned items until fixed point
+    pub fn scan(heap: *Heap) !void {
+        while (!heap.new().calm()) {
+            try heap.new().pull(heap);
+        }
+    }
+
+    /// Rebuild hashmap by warping keys and values, keeping only reachable entries
+    pub fn hash(heap: *Heap, old_map: anytype, new_map: anytype) !void {
+        var iter = old_map.iterator();
+        while (iter.next()) |entry| {
+            const key = entry.key_ptr.*.warp(heap) catch continue;
+            const value = entry.value_ptr.*.warp(heap) catch continue;
+            try new_map.put(key, value);
+        }
+    }
+
+    pub fn copy(
+        heap: *Heap,
+        comptime T: type,
+        from: *Rack(T),
+        dest: *Rack(T),
+        item: usize,
+    ) !u32 {
+        if (from.look(item)) |turn| return turn;
+        const data = from.list.items[item];
+        const next = try dest.push(heap.bank, data);
+        from.burn(item, next);
+        return next;
+    }
+};
+
+/// 32-bit handle to either terminal or operation; implicitly indexes
+/// into some `Tree` aggregate.
+pub const Node = packed struct {
+    tag: Tag,
+    data: u29 = 0,
+
+    pub fn calm(this: Node, flap: u1) bool {
+        return switch (this.look()) {
+            .hcat, .cons, .fork => view(Oper, this).flip == flap,
+            else => true,
+        };
+    }
+
+    pub fn warp(
+        word: Node,
+        heap: *Heap,
+    ) !Node {
+        if (word.calm(heap.tick)) return word;
+
+        const dest: *Rack(Pair) = word.rack(heap.new());
+        const from: *Rack(Pair) = word.rack(heap.old());
+
+        const next = try heap.copy(Pair, from, dest, word.unit());
+        return word.onto(@intCast(next));
+    }
+
+    pub fn onto(this: Node, item: u21) Node {
+        var oper = view(Oper, this);
+        oper.item = item;
+        oper.flip ^= 1;
+        return @bitCast(oper);
+    }
+
+    pub fn rack(this: Node, heap: *Half) *Rack(Pair) {
+        return switch (this.tag) {
+            .hcat => &heap.hcat,
+            .fork => &heap.fork,
+            .cons => &heap.cons,
+            else => unreachable,
+        };
+    }
+
+    pub fn unit(this: Node) u21 {
+        return view(Oper, this).item;
+    }
+
+    pub const Form = Tag;
+
+    pub const Look = union(Tag) {
+        span: Span,
+        quad: Quad,
+        trip: Trip,
+        rune: Rune,
+        hcat: Oper,
+        fork: Oper,
+        cons: Oper,
+    };
+
+    pub const Edit = union(Tag) {
+        span: *Span,
+        quad: *Quad,
+        trip: *Trip,
+        rune: *Rune,
+        hcat: *Oper,
+        fork: *Oper,
+        cons: *Oper,
+    };
+
+    pub const halt = Node.fromRune(0, 0);
+
+    pub fn view(comptime T: type, this: Node) T {
+        return @bitCast(this);
+    }
+
+    fn mut(comptime T: type, this: *Node) *T {
+        return @ptrCast(@alignCast(this));
+    }
+
+    pub fn easy(this: Node) bool {
+        return this.tag != .hcat and this.tag != .fork;
+    }
+
+    pub fn look(this: Node) Look {
+        return switch (this.tag) {
+            .span => .{ .span = view(Span, this) },
+            .quad => .{ .quad = view(Quad, this) },
+            .trip => .{ .trip = view(Trip, this) },
+            .rune => .{ .rune = view(Rune, this) },
+            .hcat => .{ .hcat = view(Oper, this) },
+            .fork => .{ .fork = view(Oper, this) },
+            .cons => .{ .cons = view(Oper, this) },
+        };
+    }
+
+    pub fn load(this: Node, heap: *const Half) Pair {
+        return switch (this.look()) {
+            .hcat => |hcat| heap.hcat.items[hcat.item],
+            .fork => |fork| heap.fork.items[fork.item],
+            .cons => |cons| heap.cons.items[cons.item],
+            else => unreachable,
+        };
+    }
+
+    pub fn edit(this: *Node) Edit {
+        return switch (this.tag) {
+            .span => .{ .span = mut(Span, this) },
+            .quad => .{ .quad = mut(Quad, this) },
+            .trip => .{ .trip = mut(Trip, this) },
+            .rune => .{ .rune = mut(Rune, this) },
+            .hcat => .{ .hcat = mut(Oper, this) },
+            .fork => .{ .fork = mut(Oper, this) },
+            .cons => .{ .cons = mut(Oper, this) },
+        };
+    }
+
+    pub fn isTerminal(this: Node) bool {
+        return switch (this.tag) {
+            .span, .quad, .trip, .rune => true,
+            else => false,
+        };
+    }
+
+    pub fn isEmptyText(this: Node) bool {
+        return switch (this.look()) {
+            .rune => |rune| rune.isEmpty(),
+            else => false,
+        };
+    }
+
+    pub fn repr(this: Node) u32 {
+        return @bitCast(this);
+    }
+
+    pub fn fromSpan(side: Side, char: u7, text: u21) Node {
+        const span: Span = .{
+            .side = side,
+            .char = char,
+            .text = text,
+        };
+        return @bitCast(span);
+    }
+
+    pub fn fromQuad(chars: [4]u7) Node {
+        const quad: Quad = .{
+            .ch0 = chars[0],
+            .ch1 = chars[1],
+            .ch2 = chars[2],
+            .ch3 = chars[3],
+        };
+        return @bitCast(quad);
+    }
+
+    pub fn fromTrip(reps: u3, bytes: [3]u8) Node {
+        const trip: Trip = .{
+            .reps = reps,
+            .byte0 = bytes[0],
+            .byte1 = bytes[1],
+            .byte2 = bytes[2],
+        };
+        return @bitCast(trip);
+    }
+
+    pub fn fromRune(reps: u6, code: u21) Node {
+        const rune: Rune = .{
+            .reps = reps,
+            .code = code,
+        };
+        return @bitCast(rune);
+    }
+
+    pub fn fromOper(kind: Tag, frob: Frob, flip: u1, what: u21) Node {
+        const oper: Oper = .{
+            .kind = kind,
+            .frob = frob,
+            .flip = flip,
+            .item = what,
+        };
+        return @bitCast(oper);
+    }
+
+    pub const nl: Node = Node.fromRune(1, '\n');
 };
 
 const expect = std.testing.expect;
