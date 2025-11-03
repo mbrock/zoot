@@ -9,43 +9,53 @@ pub const Loop = struct {
     heap: *Heap,
     cost: Cost,
     memo: Memo,
-    root: Node, // Store root node for goodloop restart
+    root: Node,
+    exec: Exec,
     stat: Stat = .{},
-    pile: std.ArrayList(Exec) = .empty,
     best: std.ArrayList(Idea) = .empty,
     icky: ?Idea = null,
-    tide: usize = 10_000_000,
+    tide: usize = 100_000_000,
 
     pub fn deinit(this: *@This()) void {
         this.best.deinit(this.heap.bank);
-        this.pile.deinit(this.heap.bank);
         this.memo.deinit();
     }
 
     fn tidy(this: *@This()) !void {
+        std.debug.print(
+            "memo {Bi:>6.2} ",
+            .{this.memo.count() * @sizeOf(Item) * @sizeOf(Deck)},
+        );
+        this.heap.new().dump();
         this.heap.flip();
+        var memo = Memo.init(this.tree.bank);
+        try this.heap.hash(&this.memo, &memo);
+        this.memo.deinit();
+        this.memo = memo;
 
-        for (this.pile.items) |*exec|
-            try this.heap.move(exec);
+        try this.heap.move(&this.exec);
+        try this.heap.move(&this.root);
+
         for (this.best.items) |*idea|
             try this.heap.move(idea);
         if (this.icky) |*icky|
             try this.heap.move(icky);
 
         try this.heap.scan();
+        std.debug.print(
+            "memo {Bi:>6.2} ",
+            .{this.memo.count() * @sizeOf(Item) * @sizeOf(Deck)},
+        );
 
-        var memo = Memo.init(this.tree.bank);
-        try this.heap.hash(&this.memo, &memo);
-        this.memo.deinit();
-        this.memo = memo;
+        this.heap.new().dump();
     }
 
     fn fuss(this: *@This()) !void {
         if (this.heap.size() < this.tide) return;
-        const size0 = this.heap.size();
+        //        const size0 = this.heap.size();
         try this.tidy();
         const size1 = this.heap.size();
-        log.info("gc: heap {Bi:>6.2} to {Bi:>6.2}", .{ size0, size1 });
+        //        log.info("gc: heap {Bi:>6.2} to {Bi:>6.2}", .{ size0, size1 });
         this.tide = @max(this.tide, size1 + size1 * 2);
     }
 
@@ -61,19 +71,17 @@ pub const Loop = struct {
             .cost = cost,
             .memo = .init(bank),
             .root = node,
+            .exec = .{
+                .node = node,
+                .tick = .{ .eval = .{} },
+            },
         };
         defer this.deinit();
-
-        try this.pile.append(bank, .{
-            .node = node,
-            .tick = .{ .eval = .{} },
-        });
 
         return this.loop();
     }
 
     pub fn loop(this: *@This()) !Best {
-        // Single unified loop: explore with icks=false (reject overflow, create Cope thunks)
         try this.explore();
         try this.fuss();
 
@@ -97,138 +105,38 @@ pub const Loop = struct {
             return Best{ .idea = boss, .stat = this.stat };
         }
 
-        // No non-icky layouts found - use icky fallback if we have one
-        if (this.icky) |icky| {
+        if (this.icky) |icky|
             return Best{ .idea = icky, .stat = this.stat };
-        }
 
         std.debug.panic("zero layouts discovered", .{});
     }
 
-    fn old_ickyloop(this: *@This()) !void {
-        log.debug("=== ICKY LOOP START (finding any layout, even bad ones) ===", .{});
-        while (this.pile.pop()) |next| {
-            var exec = next;
-            log.debug("  Dequeued task from pile (pile size: {d})", .{this.pile.items.len});
-            while (true) {
-                if (this.pile.items.len > this.stat.peak)
-                    this.stat.peak = this.pile.items.len;
-
-                switch (exec.tick) {
-                    .give => |deck| {
-                        if (exec.then.kind == .none) {
-                            // Check if this is a Cope thunk (tainted lazy computation)
-                            if (deck.cope == 1) {
-                                log.debug("    COMPLETION: Cope thunk - forcing evaluation", .{});
-                                // Force the Cope thunk by re-evaluating with icky=true
-                                const cope = this.heap.new().cope.list.items[deck.item];
-                                exec.node = cope.node;
-                                exec.tick = .{ .eval = cope.crux };
-                                // Continue loop to evaluate it
-                                try this.step(&exec, true);
-                                continue;
-                            }
-
-                            // Count frontier size
-                            var size: usize = 0;
-                            {
-                                var curr = deck;
-                                while (curr.item != 0x3FFFFFFF) {
-                                    size += 1;
-                                    const duel = this.heap.new().duel.list.items[curr.item];
-                                    curr = duel.next;
-                                }
-                            }
-                            log.debug("    COMPLETION: frontier size={d}", .{size});
-
-                            // Process all ideas in the frontier
-                            var curr = deck;
-                            while (curr.item != 0x3FFFFFFF) {
-                                const duel = this.heap.new().duel.list.items[curr.item];
-                                const idea: Idea = .{ .gist = duel.gist, .node = duel.node };
-                                const icky = this.cost.icky(duel.gist.rank);
-                                log.debug("    COMPLETION IDEA: node={s} icky={} overflow={d} height={d} last={d}", .{
-                                    @tagName(duel.node.tag),
-                                    icky,
-                                    duel.gist.rank.o,
-                                    duel.gist.rank.h,
-                                    duel.gist.last,
-                                });
-                                try this.meld(idea);
-
-                                this.icky = this.icky orelse idea;
-                                curr = duel.next;
-                            }
-
-                            if (this.best.items.len > 0) {
-                                log.debug("  Found non-icky layout! Exiting icky loop.", .{});
-                                return;
-                            } else {
-                                log.debug("  Icky layout saved as fallback. Continuing search.", .{});
-                                break;
-                            }
-                        }
-                    },
-                    .eval => {},
-                }
-
-                try this.step(&exec, true);
-            }
-        }
-    }
-
     fn explore(this: *@This()) !void {
-        log.debug("=== EXPLORE (unified loop: reject overflow, create Cope thunks) ===", .{});
+        while (true) {
+            switch (this.exec.tick) {
+                .give => |deck| {
+                    if (this.exec.then.kind == .none) {
+                        if (deck.cope == 1) {
+                            const cope = this.heap.new().cope.list.items[deck.item];
+                            this.exec.node = cope.node;
+                            this.exec.tick = .{ .eval = cope.crux };
 
-        while (this.pile.pop()) |next| {
-            var exec = next;
-            log.debug("  Dequeued task (pile: {d})", .{this.pile.items.len});
-            while (true) {
-                if (this.pile.items.len > this.stat.peak)
-                    this.stat.peak = this.pile.items.len;
-
-                switch (exec.tick) {
-                    .give => |deck| {
-                        if (exec.then.kind == .none) {
-                            // Completion! Check if it's a Cope thunk or Duel frontier
-                            if (deck.cope == 1) {
-                                // Got a Cope thunk - force it to get an icky fallback
-                                log.debug("    COMPLETION: Cope thunk (forcing for icky fallback)", .{});
-                                const cope = this.heap.new().cope.list.items[deck.item];
-                                exec.node = cope.node;
-                                exec.tick = .{ .eval = cope.crux };
-                                // Re-evaluate with icky=true to get a tainted result
-                                try this.step(&exec, true);
-                                continue;
-                            }
-
-                            // Process all ideas in the Duel frontier (non-overflow)
-                            var curr = deck;
-                            while (curr.item != 0x3FFFFFFF) {
-                                const duel = this.heap.new().duel.list.items[curr.item];
-                                log.debug("    COMPLETION: node={s} overflow={d} height={d} last={d}", .{
-                                    @tagName(duel.node.tag),
-                                    duel.gist.rank.o,
-                                    duel.gist.rank.h,
-                                    duel.gist.last,
-                                });
-                                try this.meld(.{ .gist = duel.gist, .node = duel.node });
-                                curr = duel.next;
-                            }
-                            break;
+                            continue;
                         }
-                    },
-                    else => {},
-                }
 
-                if (this.step(&exec, false)) {} else |e| {
-                    switch (e) {
-                        error.Icky => break,
-                        else => return e,
+                        var curr = deck;
+                        while (curr.item != 0x3FFFFFFF) {
+                            const duel = this.heap.new().duel.list.items[curr.item];
+                            try this.meld(.{ .gist = duel.gist, .node = duel.node });
+                            curr = duel.next;
+                        }
+                        break;
                     }
-                }
+                },
+                else => {},
             }
 
+            try this.step();
             try this.fuss();
         }
     }
@@ -260,7 +168,6 @@ pub const Loop = struct {
     fn cons_to_deck(this: *@This(), deck: Deck, node: Node, gist: Gist) !Deck {
         // First check if new idea is dominated
         if (this.dominated(deck, gist)) {
-            log.debug("      DOMINATED: new idea filtered out", .{});
             return deck;
         }
 
@@ -294,11 +201,6 @@ pub const Loop = struct {
             .gist = gist,
             .next = result,
         });
-
-        const final_size = kept + 1;
-        if (final_size > 100 or filtered > 0) {
-            log.debug("      FRONTIER: size={d} (kept {d}, filtered {d}, +1 new) gist=o:{d} h:{d}", .{ final_size, kept, filtered, gist.rank.o, gist.rank.h });
-        }
 
         return .{ .flip = this.heap.tick, .cope = 0, .item = @intCast(idx) };
     }
@@ -377,109 +279,82 @@ pub const Loop = struct {
         return .{ .flip = this.heap.tick, .cope = 0, .item = @intCast(idx) };
     }
 
-    /// Filter out icky ideas from a frontier
-    fn filterIcky(this: *@This(), deck: Deck) !Deck {
-        if (deck.item == 0x3FFFFFFF) return Deck.none;
-
-        var result = Deck.none;
-        var curr = deck;
-        while (curr.item != 0x3FFFFFFF) {
-            const duel = this.heap.new().duel.list.items[curr.item];
-            if (!this.cost.icky(duel.gist.rank)) {
-                const idx = try this.heap.new().duel.push(this.heap.bank, .{
-                    .node = duel.node,
-                    .gist = duel.gist,
-                    .next = result,
-                });
-                result = .{ .flip = this.heap.tick, .cope = 0, .item = @intCast(idx) };
-            }
-            curr = duel.next;
+    /// Helper: emit a node to a string buffer for debugging
+    /// Returns a preview of what this node produces (truncated if too long)
+    fn preview(this: *@This(), node: Node) []const u8 {
+        var buf: [128]u8 = undefined;
+        var writer = std.Io.Writer.fixed(&buf);
+        this.tree.emit(&writer, node) catch return "<emit-error>";
+        const s = writer.buffered();
+        // Escape newlines and show preview
+        if (std.mem.indexOfScalar(u8, s, '\n')) |_| {
+            return "<multiline>";
         }
-        return result;
+        if (s.len > 40) {
+            return s[0..37] ++ "...";
+        }
+        return s;
+    }
+
+    /// Calculate continuation depth for indentation
+    fn contDepth(this: *@This(), exec: Exec) usize {
+        var depth: usize = 0;
+        var ktx = exec.then;
+        while (ktx.kind != .none) {
+            depth += 1;
+            const loaded = ktx.load(this.heap);
+            ktx = switch (loaded) {
+                .none => unreachable,
+                .head => |k| k.then,
+                .tail => |k| k.then,
+                .fork => |k| k.then,
+                .iter => |k| k.then,
+            };
+        }
+        return depth;
     }
 
     /// Advance the CEK machine by a single step.
-    ///
-    /// If `icks` is true, we are still interested in icky ideas,
-    /// since we have not yet found any good ideas.
-    pub fn step(this: *@This(), exec: *Exec, icks: bool) !void {
-        log.debug("    STEP: tick={s} node={s} icks={}", .{
-            @tagName(exec.tick),
-            @tagName(exec.node.tag),
-            icks,
-        });
-
-        switch (exec.tick) {
+    pub fn step(this: *@This()) !void {
+        switch (this.exec.tick) {
             .eval => |eval| {
                 // We are about to evaluate a node.
-                log.debug("      EVAL: base={d} last={d} rows={d} icky={}", .{ eval.base, eval.last, eval.rows, eval.icky });
-
-                // NOTE: We no longer prune based on icky flag.
-                // With Cope thunks, we always evaluate and decide Cope vs Duel based on result overflow.
-
                 var crux = eval;
 
-                // NOTE: Removed early overflow check. It was too aggressive and would
-                // stop evaluation mid-hcat, losing continuations for remaining items.
-                // Instead, we let individual nodes produce overflow gists, and create
-                // Cope thunks only when combining results fails.
-
-                if (!exec.node.easy()) {
+                if (!this.exec.node.easy()) {
                     // Computing this node may be costlier than looking it up.
 
-                    if (this.memo.get(crux.item(exec.node))) |deck| {
+                    if (this.memo.get(crux.item(this.exec.node))) |deck| {
                         // We found a precomputed frontier for the node.
                         this.stat.memo_hits += 1;
-                        log.debug("      MEMO HIT (hits:{d} misses:{d})", .{ this.stat.memo_hits, this.stat.memo_misses });
-
-                        // In goodloop, filter out icky ideas from the deck
-                        if (!icks) {
-                            const filtered = try this.filterIcky(deck);
-                            if (filtered.item == 0x3FFFFFFF) {
-                                // All ideas were icky, abandon this branch
-                                log.debug("      PRUNED: all memo results are icky", .{});
-                                return error.Icky;
-                            }
-                            exec.tick = .{ .give = filtered };
-                        } else {
-                            exec.tick = .{ .give = deck };
-                        }
-
+                        // Use the memoized frontier as-is (includes overflow layouts)
+                        this.exec.tick = .{ .give = deck };
                         return;
                     } else {
                         // Alas, we must compute.
                         this.stat.memo_misses += 1;
-                        log.debug("      MEMO MISS (hits:{d} misses:{d}) - computing", .{ this.stat.memo_hits, this.stat.memo_misses });
                     }
                 }
 
-                switch (exec.node.look()) {
+                switch (this.exec.node.look()) {
                     .rune => |rune| {
-                        log.debug("      RUNE: code={d}", .{rune.code});
                         const gist = rune.toGist(crux, this.cost);
-                        log.debug("      -> gist: o={d} h={d} last={d}", .{ gist.rank.o, gist.rank.h, gist.last });
-                        exec.tick = .{ .give = try this.singleton(exec.node, gist) };
+                        this.exec.tick = .{ .give = try this.singleton(this.exec.node, gist) };
                         return;
                     },
                     .span => |span| {
-                        log.debug("      SPAN", .{});
                         const gist = span.toGist(crux, this.cost, this.tree);
-                        log.debug("      -> gist: o={d} h={d} last={d}", .{ gist.rank.o, gist.rank.h, gist.last });
-                        exec.tick = .{ .give = try this.singleton(exec.node, gist) };
+                        this.exec.tick = .{ .give = try this.singleton(this.exec.node, gist) };
                         return;
                     },
                     .quad => |quad| {
-                        log.debug("      QUAD", .{});
                         const gist = quad.toGist(crux, this.cost);
-                        log.debug("      -> gist: o={d} h={d} last={d}", .{ gist.rank.o, gist.rank.h, gist.last });
-                        exec.tick = .{ .give = try this.singleton(exec.node, gist) };
+                        this.exec.tick = .{ .give = try this.singleton(this.exec.node, gist) };
                         return;
                     },
                     .trip => |trip| {
-                        log.debug("      TRIP", .{});
                         const gist = trip.toGist(crux, this.cost);
-                        log.debug("      -> gist: o={d} h={d} last={d}", .{ gist.rank.o, gist.rank.h, gist.last });
-                        exec.tick = .{ .give = try this.singleton(exec.node, gist) };
+                        this.exec.tick = .{ .give = try this.singleton(this.exec.node, gist) };
                         return;
                     },
                     .hcat => |oper| {
@@ -489,14 +364,14 @@ pub const Loop = struct {
                         if (oper.frob.warp == 1) crux.warp();
                         if (oper.frob.nest != 0) crux.nest(oper.frob.nest);
 
-                        const then = exec.then;
-                        const item = crux.item(exec.node);
+                        const then = this.exec.then;
+                        const item = crux.item(this.exec.node);
 
                         // We will start evaluating the hcat head.
-                        exec.node = hcat.head;
+                        this.exec.node = hcat.head;
 
                         // Splice the hcat task with the current continuation.
-                        exec.then = try Ktx1.make(.{
+                        this.exec.then = try Ktx1.make(.{
                             // Afterwards, proceed with the hcat tail.
                             .node = hcat.tail,
                             // Use the same indent base.
@@ -507,28 +382,26 @@ pub const Loop = struct {
                             .item = item,
                         }, this.heap);
 
-                        exec.tick = .{ .eval = crux };
+                        this.exec.tick = .{ .eval = crux };
 
                         return;
                     },
                     .fork => |fork| {
                         const pair = this.heap.new().fork.list.items[fork.item];
 
-                        log.debug("      FORK: evaluating left then right branch", .{});
-
                         // Apply local indent state to the crux.
                         if (fork.frob.warp == 1) crux.warp();
                         if (fork.frob.nest != 0) crux.nest(fork.frob.nest);
 
-                        const then = exec.then;
-                        const item = crux.item(exec.node);
+                        const then = this.exec.then;
+                        const item = crux.item(this.exec.node);
 
                         // Evaluate left branch first
-                        exec.node = pair.head;
-                        exec.tick = .{ .eval = crux };
+                        this.exec.node = pair.head;
+                        this.exec.tick = .{ .eval = crux };
 
                         // After left branch completes, we'll evaluate right branch
-                        exec.then = try Ktx1.make(.{
+                        this.exec.then = try Ktx1.make(.{
                             .node = pair.tail,
                             .base = crux.base,
                             .item = item,
@@ -544,9 +417,9 @@ pub const Loop = struct {
                 // We have evaluated a node to a gist and a forkless node.
                 // If there is a current continuation, inspect it to proceed.
 
-                switch (exec.then.load(this.heap)) {
+                switch (this.exec.then.load(this.heap)) {
                     .head => |cont| {
-                        const left_deck = exec.tick.give;
+                        const left_deck = this.exec.tick.give;
 
                         // Check if this is a fork or hcat by examining the item node
                         const is_fork = cont.item.node.tag == .fork;
@@ -554,20 +427,20 @@ pub const Loop = struct {
                         if (is_fork) {
                             // We have evaluated the left branch of a fork.
                             // Now evaluate the right branch.
-                            exec.node = cont.node;
+                            this.exec.node = cont.node;
 
                             // After the right branch, we will merge and continue.
-                            exec.then = try Ktx3.make(.{
+                            this.exec.then = try Ktx3.make(.{
                                 .item = cont.item,
                                 .then = cont.then,
                                 .left_deck = left_deck,
                             }, this.heap);
 
                             // Evaluate right branch with same context as left
-                            exec.tick = .{
+                            this.exec.tick = .{
                                 .eval = .{
                                     .base = cont.base,
-                                    .last = 0,
+                                    .last = cont.item.head,
                                     .rows = 0,
                                     .icky = false,
                                 },
@@ -577,211 +450,135 @@ pub const Loop = struct {
                         } else {
                             // We have evaluated the head of a hcat.
                             const head_deck = left_deck;
+                            const oper = Node.view(Oper, cont.item.node);
 
-                            // We must evaluate the tail also before continuing.
-                            exec.node = cont.node;
+                            // If head has no valid layouts, the whole hcat has none
+                            if (head_deck.item == 0x3FFFFFFF) {
+                                try this.memo.put(cont.item, Deck.none);
+                                this.exec.tick = .{ .give = Deck.none };
+                                this.exec.then = cont.then;
+                                return;
+                            }
 
-                            // After the hcat tail, we will combine and continue.
-                            exec.then = try Ktx2.make(.{
+                            // Set up iteration through head frontier
+                            // We'll evaluate tail for each head, one at a time
+                            this.exec.node = cont.node; // The tail node
+
+                            // Create iterator continuation
+                            this.exec.then = try Ktx4.make(.{
+                                .current_head = head_deck,
+                                .result_deck = Deck.none,
+                                .tail_node = cont.node,
                                 .item = cont.item,
+                                .base = cont.base,
+                                .frob = oper.frob,
                                 .then = cont.then,
-                                .head_deck = head_deck,
                             }, this.heap);
 
-                            // For the tail evaluation context, we need to thread through state.
-                            // We'll use the first idea in the head deck to set up context.
+                            // Evaluate tail starting at first head's ending position
                             const first_duel = this.heap.new().duel.list.items[head_deck.item];
-                            const first_gist = first_duel.gist;
-                            const icky = this.cost.icky(first_gist.rank);
 
-                            // Set the tail evaluation context.
-                            exec.tick = .{
+                            this.exec.tick = .{
                                 .eval = .{
                                     .base = cont.base,
-                                    .last = first_gist.last,
-                                    .rows = first_gist.rows,
-                                    .icky = icky,
+                                    .last = first_duel.gist.last,
+                                    .rows = first_duel.gist.rows,
+                                    .icky = this.cost.icky(first_duel.gist.rank),
                                 },
                             };
 
                             return;
                         }
                     },
-                    .tail => |cont| {
-                        // We have evaluated both the head and the tail of a hcat.
-                        // Now compute the Cartesian product of head and tail frontiers.
+                    .iter => |cont| {
+                        // Tail has been evaluated for current head
+                        // Combine this (head, tail) pair and continue iteration
+                        const tail_deck = this.exec.tick.give;
 
-                        const head_deck = cont.head_deck;
-                        const tail_deck = exec.tick.give;
-                        const oper = Node.view(Oper, cont.item.node);
-
-                        // Check if either head or tail is a Cope thunk
-                        // If so, the whole hcat is tainted - create Cope for the full hcat
-                        if (head_deck.cope == 1 or tail_deck.cope == 1) {
-                            log.debug("      HCAT: head or tail is Cope - creating Cope for full hcat", .{});
-
-                            // Get rows: if head is Duel, get from first gist; if Cope, get from its crux
-                            const head_rows = if (head_deck.cope == 0) blk: {
-                                const first_duel = this.heap.new().duel.list.items[head_deck.item];
-                                break :blk first_duel.gist.rows;
-                            } else blk: {
-                                const head_cope = this.heap.new().cope.list.items[head_deck.item];
-                                break :blk head_cope.crux.rows;
-                            };
-
-                            const cope_idx = try this.heap.new().cope.push(this.heap.bank, .{
-                                .node = cont.item.node, // The full hcat node
-                                .crux = .{
-                                    .last = cont.item.head,
-                                    .base = cont.item.base,
-                                    .rows = head_rows,  // Get actual rows from head!
-                                    .icky = true,
-                                },
-                            });
-                            const result = Deck{ .flip = this.heap.tick, .cope = 1, .item = @intCast(cope_idx) };
-                            try this.memo.put(cont.item, result);
-                            exec.tick = .{ .give = result };
-                            exec.then = cont.then;
-                            return;
-                        }
-
-                        // Both are Duel frontiers, proceed with cartesian product
-                        // Count frontier sizes for debugging
-                        var head_size: usize = 0;
-                        var tail_size: usize = 0;
-                        {
-                            var curr = head_deck;
-                            while (curr.item != 0x3FFFFFFF) {
-                                head_size += 1;
-                                const duel = this.heap.new().duel.list.items[curr.item];
-                                curr = duel.next;
-                            }
-                            curr = tail_deck;
-                            while (curr.item != 0x3FFFFFFF) {
-                                tail_size += 1;
-                                const duel = this.heap.new().duel.list.items[curr.item];
-                                curr = duel.next;
-                            }
-                        }
-                        if (head_size * tail_size > 100) {
-                            log.debug("      CARTESIAN PRODUCT: {d} × {d} = {d} combos", .{ head_size, tail_size, head_size * tail_size });
-                        }
-
-                        var result = Deck.none;
-                        var head_curr = head_deck;
-                        while (head_curr.item != 0x3FFFFFFF) {
-                            const head_duel = this.heap.new().duel.list.items[head_curr.item];
-
-                            // For each head, do "running best" scan through tail (like OCaml)
-                            // Tail is sorted by last (implicitly), we keep ideas with improving cost
+                        // If tail has no layouts, skip this head
+                        if (tail_deck.item != 0x3FFFFFFF) {
+                            // Get current head Duel
+                            const head_duel = this.heap.new().duel.list.items[cont.current_head.item];
+                            // Do "running best" scan through tail (like OCaml)
                             var partial = Deck.none;
                             var current_best: ?struct { gist: Gist, node: Node } = null;
                             var tail_curr = tail_deck;
                             while (tail_curr.item != 0x3FFFFFFF) {
                                 const tail_duel = this.heap.new().duel.list.items[tail_curr.item];
-
-                                // Combine the gists
-                                var gist = tail_duel.gist;
-                                gist.rows +|= head_duel.gist.rows;
-                                gist.rank = this.cost.plus(tail_duel.gist.rank, head_duel.gist.rank);
-
-                                // Skip if icky
-                                if (!icks and this.cost.icky(gist.rank)) {
-                                    tail_curr = tail_duel.next;
-                                    continue;
-                                }
-
-                                const node = try this.tree.cons(oper.frob, head_duel.node, tail_duel.node);
+                                const gist = combineGist(head_duel.gist, tail_duel.gist, this.cost);
+                                const node = try this.tree.cons(cont.frob, head_duel.node, tail_duel.node);
 
                                 if (current_best) |best| {
                                     if (this.cost.wins(gist.rank, best.gist.rank)) {
-                                        // This is better, update current_best
                                         current_best = .{ .gist = gist, .node = node };
                                     } else {
-                                        // Worse cost, emit current_best and start new run
                                         partial = try this.cons_to_deck(partial, best.node, best.gist);
                                         current_best = .{ .gist = gist, .node = node };
                                     }
                                 } else {
-                                    // First idea
                                     current_best = .{ .gist = gist, .node = node };
                                 }
 
                                 tail_curr = tail_duel.next;
                             }
 
-                            // Don't forget the final current_best!
+                            // Add final current_best
                             if (current_best) |best| {
                                 partial = try this.cons_to_deck(partial, best.node, best.gist);
                             }
 
-                            // Count partial size for debugging
-                            var partial_size: usize = 0;
-                            {
-                                var curr = partial;
-                                while (curr.item != 0x3FFFFFFF) {
-                                    partial_size += 1;
-                                    const duel = this.heap.new().duel.list.items[curr.item];
-                                    curr = duel.next;
-                                }
-                            }
-                            if (partial_size > 1 or (head_size > 1 and tail_size > 1)) {
-                                log.debug("      CART HEAD PRODUCED: {d} ideas (from {d} tail)", .{ partial_size, tail_size });
-                            }
-
-                            // Merge partial results into global result
-                            result = try this.merge_decks(result, partial);
-
-                            head_curr = head_duel.next;
+                            // Merge this head's results with accumulated results
+                            const foo = try this.merge_decks(cont.result_deck, partial);
+                            this.exec.then.load(this.heap).iter.result_deck = foo;
                         }
 
-                        // If all combinations were icky, create Cope thunk instead of bailing
-                        if (!icks and result.item == 0x3FFFFFFF) {
-                            log.debug("      HCAT: all combos icky - creating Cope thunk", .{});
-                            // Create a Cope thunk to defer this tainted computation
-                            const cope_idx = try this.heap.new().cope.push(this.heap.bank, .{
-                                .node = cont.item.node, // Store the hcat node
-                                .crux = .{ // Reconstruct crux from memo key
-                                    .last = cont.item.head,
-                                    .base = cont.item.base,
-                                    .rows = 0, // We don't have rows in the memo key, assume 0
-                                    .icky = true, // Mark as icky for when we force it
+                        // Move to next head
+                        const head_duel = this.heap.new().duel.list.items[cont.current_head.item];
+                        const next_head = head_duel.next;
+
+                        if (next_head.item == 0x3FFFFFFF) {
+                            // No more heads - iteration complete
+                            const result = this.exec.then.load(this.heap).iter.result_deck;
+                            try this.memo.put(cont.item, result);
+                            this.exec.tick = .{ .give = result };
+                            this.exec.then = cont.then;
+                            return;
+                        } else {
+                            // More heads - evaluate tail at next head's position
+                            this.exec.then.load(this.heap).iter.current_head = next_head;
+                            this.exec.node = cont.tail_node;
+
+                            const next_head_duel = this.heap.new().duel.list.items[next_head.item];
+
+                            this.exec.tick = .{
+                                .eval = .{
+                                    .base = cont.base,
+                                    .last = next_head_duel.gist.last,
+                                    .rows = next_head_duel.gist.rows,
+                                    .icky = this.cost.icky(next_head_duel.gist.rank),
                                 },
-                            });
-                            result = .{ .flip = this.heap.tick, .cope = 1, .item = @intCast(cope_idx) };
+                            };
+
+                            return;
                         }
-
-                        // Memoize the result (either frontier or Cope)
-                        try this.memo.put(cont.item, result);
-
-                        exec.* = .{
-                            // Next step is the giving of a result.
-                            .tick = .{ .give = result },
-                            // Node is not meaningful here since result contains multiple nodes
-                            .node = Node.halt,
-                            // The result will be given to the continuation of the cons.
-                            .then = cont.then,
-                        };
-
-                        return;
+                    },
+                    .tail => |_| {
+                        unreachable;
                     },
                     .fork => |cont| {
                         // We have evaluated both branches of a fork.
                         // Now merge the left and right frontiers.
 
                         const left_deck = cont.left_deck;
-                        const right_deck = exec.tick.give;
+                        const right_deck = this.exec.tick.give;
 
                         // Merge the two frontiers
                         const result = try this.merge_decks(left_deck, right_deck);
 
-                        // If all ideas were icky in goodloop, bail out
-                        if (!icks and result.item == 0x3FFFFFFF) return error.Icky;
-
                         // Memoize the result frontier
                         try this.memo.put(cont.item, result);
 
-                        exec.* = .{
+                        this.exec = .{
                             .tick = .{ .give = result },
                             .node = Node.halt,
                             .then = cont.then,
@@ -817,13 +614,57 @@ pub const Loop = struct {
         try this.best.append(this.tree.bank, idea);
         this.stat.completions += 1;
     }
+
+    fn debugLayout(this: *@This(), label: []const u8, gist: Gist, node: Node) void {
+        var storage: [8192]u8 = undefined;
+        var writer = std.Io.Writer.fixed(storage[0..]);
+        this.tree.emit(&writer, node) catch |err| {
+            std.debug.print("{s} emit failed: {}\n", .{ label, err });
+            return;
+        };
+        const rendered = writer.buffered();
+        var max_line: usize = 0;
+        var curr: usize = 0;
+        var longest_slice: []const u8 = rendered;
+        for (rendered, 0..) |c, i| {
+            if (c == '\n') {
+                if (curr > max_line) {
+                    max_line = curr;
+                    const start = i - curr;
+                    longest_slice = rendered[start..i];
+                }
+                curr = 0;
+            } else {
+                curr += 1;
+            }
+        }
+        if (curr > max_line) {
+            const start = rendered.len - curr;
+            longest_slice = rendered[start..];
+            max_line = curr;
+        }
+        std.debug.print(
+            "{s} gist(last={d}, rows={d}, overflow={d}) actual_max_line={d}\n",
+            .{ label, gist.last, gist.rows, gist.rank.o, max_line },
+        );
+        std.debug.print("{s} longest line: {s}\n", .{ label, longest_slice });
+        std.debug.print("{s}{s}", .{ label, rendered });
+    }
+
+    fn combineGist(head: Gist, tail: Gist, cost: Cost) Gist {
+        return .{
+            .last = tail.last,
+            .rows = head.rows + tail.rows,
+            .rank = cost.plus(head.rank, tail.rank),
+        };
+    }
 };
 
 pub const Crux = packed struct {
     last: u16 = 0,
     base: u16 = 0,
     icky: bool = false,
-    rows: u16 = 0,
+    rows: u32 = 0,
 
     pub fn warp(self: *@This()) void {
         self.base = self.last;
@@ -877,7 +718,7 @@ pub const Cope = struct {
 
 pub const Gist = packed struct {
     last: u16 = 0,
-    rows: u16 = 0,
+    rows: u32 = 0,
     rank: Rank = .{},
 };
 
@@ -918,15 +759,15 @@ pub const Item = packed struct {
 pub const Memo = std.AutoHashMap(Item, Deck);
 
 pub const Kont = packed struct {
-    pub const Kind = enum(u2) { none, head, tail, fork };
+    pub const Kind = enum(u3) { none, head, tail, fork, iter };
 
     kind: Kind = .none,
     flip: u1 = 0,
-    item: u29 = 0,
+    item: u28 = 0,
 
     pub const none: Kont = .{ .kind = .none, .flip = 1 };
 
-    pub fn make(kind: Kind, flip: u1, idx: u29) Kont {
+    pub fn make(kind: Kind, flip: u1, idx: u28) Kont {
         return .{ .kind = kind, .flip = flip, .item = idx };
     }
 
@@ -934,11 +775,12 @@ pub const Kont = packed struct {
         return this.flip == flap;
     }
 
-    pub fn load(this: Kont, heap: *Heap) union(enum) { head: *Ktx1, tail: *Ktx2, fork: *Ktx3, none } {
+    pub fn load(this: Kont, heap: *Heap) union(enum) { head: *Ktx1, tail: *Ktx2, fork: *Ktx3, iter: *Ktx4, none } {
         return switch (this.kind) {
             .head => .{ .head = &heap.new().ktx1.list.items[this.item] },
             .tail => .{ .tail = &heap.new().ktx2.list.items[this.item] },
             .fork => .{ .fork = &heap.new().ktx3.list.items[this.item] },
+            .iter => .{ .iter = &heap.new().ktx4.list.items[this.item] },
             .none => .none,
         };
     }
@@ -952,6 +794,7 @@ pub const Kont = packed struct {
             .head => try heap.copy(Ktx1, &heap.old().ktx1, &heap.new().ktx1, word.item),
             .tail => try heap.copy(Ktx2, &heap.old().ktx2, &heap.new().ktx2, word.item),
             .fork => try heap.copy(Ktx3, &heap.old().ktx3, &heap.new().ktx3, word.item),
+            .iter => try heap.copy(Ktx4, &heap.old().ktx4, &heap.new().ktx4, word.item),
             else => return word,
         };
         return word.onto(@intCast(next));
@@ -994,7 +837,7 @@ pub const Ktx2 = struct {
     }
 
     pub fn drag(k2: *Ktx2, heap: *Heap) !void {
-        k2.head_deck = try k2.head_deck.warp(heap);
+        try heap.move(&k2.head_deck);
         try heap.move(&k2.item.node);
         try heap.move(&k2.then);
     }
@@ -1011,9 +854,32 @@ pub const Ktx3 = struct {
     }
 
     pub fn drag(k3: *Ktx3, heap: *Heap) !void {
-        k3.left_deck = try k3.left_deck.warp(heap);
+        try heap.move(&k3.left_deck);
         try heap.move(&k3.item.node);
         try heap.move(&k3.then);
+    }
+};
+
+pub const Ktx4 = struct {
+    current_head: Deck, // Current position in head frontier iteration
+    result_deck: Deck, // Accumulated results
+    tail_node: Node, // Tail to evaluate for each head
+    item: Item, // For memoization
+    base: u16, // Indentation base
+    frob: Frob, // Operator frob from hcat
+    then: Kont, // Outer continuation
+
+    pub fn make(k4: Ktx4, heap: *Heap) !Kont {
+        const idx = try heap.new().ktx4.push(heap.bank, k4);
+        return Kont.make(.iter, heap.tick, @intCast(idx));
+    }
+
+    pub fn drag(k4: *Ktx4, heap: *Heap) !void {
+        try heap.move(&k4.current_head);
+        try heap.move(&k4.result_deck);
+        try heap.move(&k4.tail_node);
+        try heap.move(&k4.item.node);
+        try heap.move(&k4.then);
     }
 };
 
@@ -1125,6 +991,18 @@ pub const F2 = struct {
     }
 };
 
+test "Cost F1 overflow includes current column" {
+    const cf = F1.init(60);
+    const rank = cf.text(50, 20);
+    try std.testing.expectEqual(@as(u32, 10), rank.o);
+}
+
+test "Cost F2 overflow includes current column" {
+    const cf = F2.init(60);
+    const rank = cf.text(50, 20);
+    try std.testing.expect(rank.o > 0);
+}
+
 pub const Tag = enum(u3) {
     span = 0b000,
     quad = 0b001,
@@ -1145,7 +1023,7 @@ pub const Span = packed struct {
 
     pub fn toGist(self: Span, crux: Crux, cost: Cost, tree: *const Tree) Gist {
         var head = crux.last;
-        var rows: u16 = 0;
+        var rows: u32 = 0;
         var rank: Rank = .{};
 
         if (self.char != 0 and self.side == .lchr) {
@@ -1196,7 +1074,7 @@ pub const Quad = packed struct {
 
     pub fn toGist(self: Quad, crux: Crux, cost: Cost) Gist {
         var head = crux.last;
-        var rows: u16 = 0;
+        var rows: u32 = 0;
         var rank: Rank = .{};
         const chars = [_]u7{ self.ch0, self.ch1, self.ch2, self.ch3 };
         for (chars) |c| {
@@ -1252,7 +1130,7 @@ pub const Trip = packed struct {
 
     pub fn toGist(self: Trip, crux: Crux, cost: Cost) Gist {
         var head = crux.last;
-        var rows: u16 = 0;
+        var rows: u32 = 0;
         var rank: Rank = .{};
 
         const glyph = self.slice();
@@ -1294,7 +1172,7 @@ pub const Rune = packed struct {
 
     pub fn toGist(self: Rune, crux: Crux, cost: Cost) Gist {
         var last = crux.last;
-        var rows: u16 = 0;
+        var rows: u32 = 0;
         var rank: Rank = .{};
 
         if (self.reps != 0) {
@@ -1504,6 +1382,23 @@ pub const Tree = struct {
         }
     }
 
+    fn hasNewline(tree: *Tree, doc: Node) bool {
+        return switch (doc.look()) {
+            .span => |span| span.char == '\n',
+            .rune => |rune| rune.code == '\n' and rune.reps > 0,
+            .quad, .trip => false,
+            .hcat => |oper| blk: {
+                const pair = tree.heap.new().hcat.list.items[oper.item];
+                break :blk hasNewline(tree, pair.head) or hasNewline(tree, pair.tail);
+            },
+            .fork => |oper| blk: {
+                const pair = tree.heap.new().fork.list.items[oper.item];
+                break :blk hasNewline(tree, pair.head) or hasNewline(tree, pair.tail);
+            },
+            .cons => false,
+        };
+    }
+
     pub fn flat(tree: *Tree, doc: Node) !Node {
         if (tree.flatmemo.get(doc)) |entry| return entry;
 
@@ -1525,9 +1420,14 @@ pub const Tree = struct {
                 const changed =
                     head.repr() != pair.head.repr() or
                     tail.repr() != pair.tail.repr();
-                if (!changed) break :blk doc;
 
-                break :blk try tree.hcat(oper.frob, head, tail);
+                // Discard nest when flattening (no newlines = no indentation needed)
+                var flat_frob = oper.frob;
+                flat_frob.nest = 0;
+
+                if (!changed and flat_frob.nest == oper.frob.nest) break :blk doc;
+
+                break :blk try tree.hcat(flat_frob, head, tail);
             },
             .fork => |oper| blk: {
                 const pair = tree.heap.new().fork.list.items[oper.item];
@@ -1549,6 +1449,14 @@ pub const Tree = struct {
 
         try tree.flatmemo.put(doc, result);
         return result;
+    }
+
+    fn combineGist(head: Gist, tail: Gist, cost: Cost) Gist {
+        return .{
+            .last = tail.last,
+            .rows = head.rows + tail.rows,
+            .rank = cost.plus(head.rank, tail.rank),
+        };
     }
 
     /// The `nest` combinator shifts the base of a layout's
@@ -1901,7 +1809,7 @@ pub const Deck = packed struct {
     }
 
     pub fn warp(deck: Deck, heap: *Heap) !Deck {
-        if (deck.item == 0x3FFFFFFF) return deck;
+        if (deck.calm(heap.tick)) return deck;
         if (deck.cope == 1) {
             const next = try heap.copy(Cope, &heap.old().cope, &heap.new().cope, deck.item);
             return .{ .flip = heap.tick, .cope = 1, .item = @intCast(next) };
@@ -1922,7 +1830,7 @@ pub const Duel = struct {
 
     pub fn drag(duel: *Duel, heap: *Heap) !void {
         try heap.move(&duel.node);
-        duel.next = try duel.next.warp(heap);
+        try heap.move(&duel.next);
     }
 };
 
@@ -1963,14 +1871,14 @@ pub fn Rack(Elem: type) type {
 
         pub fn burn(rack: *@This(), item: usize, word: u32) void {
             var elem = &rack.list.items[item];
-            @as(*u32, @ptrCast(&@field(elem, hack.mark))).* = 0xffffaaaa;
+            @as(*u32, @ptrCast(&@field(elem, hack.mark))).* = 0x13371337;
             @as(*u32, @ptrCast(&@field(elem, hack.word))).* = word;
         }
 
         pub fn look(rack: *@This(), item: usize) ?u32 {
             const elem = rack.list.items[item];
             return switch (@as(u32, @bitCast(@field(elem, hack.mark)))) {
-                0xffffaaaa => @as(u32, @bitCast(@field(elem, hack.word))),
+                0x13371337 => @as(u32, @bitCast(@field(elem, hack.word))),
                 else => null,
             };
         }
@@ -1987,7 +1895,7 @@ pub fn Rack(Elem: type) type {
         }
 
         pub fn size(rack: @This()) usize {
-            return rack.list.items.len;
+            return rack.list.items.len * @sizeOf(Elem);
         }
 
         pub fn rift(rack: *@This()) []Elem {
@@ -2019,6 +1927,7 @@ pub const Half = struct {
     ktx1: Rack(Ktx1) = .empty,
     ktx2: Rack(Ktx2) = .empty,
     ktx3: Rack(Ktx3) = .empty,
+    ktx4: Rack(Ktx4) = .empty,
     duel: Rack(Duel) = .empty,
     cope: Rack(Cope) = .empty,
 
@@ -2029,6 +1938,7 @@ pub const Half = struct {
         this.ktx1.deinit(bank);
         this.ktx2.deinit(bank);
         this.ktx3.deinit(bank);
+        this.ktx4.deinit(bank);
         this.duel.deinit(bank);
         this.cope.deinit(bank);
     }
@@ -2040,14 +1950,30 @@ pub const Half = struct {
             this.ktx1.calm() and
             this.ktx2.calm() and
             this.ktx3.calm() and
+            this.ktx4.calm() and
             this.duel.calm() and
             this.cope.calm();
     }
 
     pub fn size(this: @This()) usize {
         return this.hcat.size() + this.fork.size() + this.cons.size() +
-            this.ktx1.size() + this.ktx2.size() + this.ktx3.size() +
+            this.ktx1.size() + this.ktx2.size() + this.ktx3.size() + this.ktx4.size() +
             this.duel.size() + this.cope.size();
+    }
+
+    pub fn dump(this: @This()) void {
+        std.debug.print(
+            "hcat {Bi:>6.0} fork {Bi:>6.0} cons {Bi:>6.0} ktx1 {Bi:>6.0} ktx3 {Bi:>6.0} ktx4 {Bi:>6.0} duel {Bi:>6.0}\n",
+            .{
+                this.hcat.size(),
+                this.fork.size(),
+                this.cons.size(),
+                this.ktx1.size(),
+                this.ktx3.size(),
+                this.ktx4.size(),
+                this.duel.size(),
+            },
+        );
     }
 
     pub fn pull(this: *@This(), heap: *Heap) !void {
@@ -2057,6 +1983,7 @@ pub const Half = struct {
         try this.ktx1.pull(heap);
         try this.ktx2.pull(heap);
         try this.ktx3.pull(heap);
+        try this.ktx4.pull(heap);
         try this.duel.pull(heap);
         try this.cope.pull(heap);
     }
@@ -2110,8 +2037,8 @@ pub const Heap = struct {
     pub fn hash(heap: *Heap, old_map: anytype, new_map: anytype) !void {
         var iter = old_map.iterator();
         while (iter.next()) |entry| {
-            const key = entry.key_ptr.*.warp(heap) catch continue;
-            const value = entry.value_ptr.*.warp(heap) catch continue;
+            const key = try entry.key_ptr.*.warp(heap);
+            const value = try entry.value_ptr.*.warp(heap);
             try new_map.put(key, value);
         }
     }
@@ -2154,7 +2081,9 @@ pub const Node = packed struct {
         const from: *Rack(Pair) = word.rack(heap.old());
 
         const next = try heap.copy(Pair, from, dest, word.unit());
-        return word.onto(@intCast(next));
+        const new_node = word.onto(@intCast(next));
+
+        return new_node;
     }
 
     pub fn onto(this: Node, item: u21) Node {

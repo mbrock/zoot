@@ -2,3 +2,4 @@
 zig-out
 *.dot
 *.json
+/.heapdumps/

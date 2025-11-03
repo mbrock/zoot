@@ -346,3 +346,89 @@ test "dump escapes strings" {
 
     try expectEqualStrings("\"quote \\\" and newline\\n\"", rendered);
 }
+
+test "dump renders nested unions with slices" {
+    var gpa = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var tree = Tree.init(allocator);
+    defer tree.deinit();
+
+    const Run = struct {
+        tool: []const u8,
+        args: []const []const u8,
+    };
+
+    const Step = union(enum) {
+        run: Run,
+        wait: u32,
+        parallel: []const @This(),
+    };
+
+    const Pipeline = struct {
+        name: []const u8,
+        enabled: bool,
+        retries: ?u8,
+        tags: []const []const u8,
+        steps: []const Step,
+    };
+
+    const pipeline_tags = &.{ "cli", "zig", "pretty" };
+    const pipeline_steps = &.{
+        Step{
+            .run = .{
+                .tool = "zig",
+                .args = &.{
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                    "build",
+                    "-Drelease-safe=true",
+                },
+            },
+        },
+        Step{ .wait = 30 },
+        Step{
+            .parallel = &.{
+                Step{ .run = .{ .tool = "zig", .args = &.{"test"} } },
+                Step{
+                    .run = .{
+                        .tool = "deploy",
+                        .args = &.{ "us-west", "blue" },
+                    },
+                },
+            },
+        },
+    };
+
+    const pipelines = try allocator.alloc(Pipeline, 1);
+    defer allocator.free(pipelines);
+
+    for (pipelines, 0..) |*p, i| {
+        p.* = .{
+            .name = try std.fmt.allocPrint(allocator, "pipeline-{d}", .{i}),
+            .enabled = i % 2 == 0,
+            .retries = if (i % 5 == 0) null else @intCast(i % 5),
+            .tags = pipeline_tags,
+            .steps = pipeline_steps,
+        };
+    }
+
+    const doc = try dump(&tree, pipelines);
+    const cost = pretty.F2.init(60);
+    const best = try tree.pick(allocator, cost, doc);
+
+    var buffer: [1024]u8 = undefined;
+    var writer = std.Io.Writer.fixed(buffer[0..]);
+    try tree.emit(&writer, best.idea.node);
+    const rendered = writer.buffered();
+
+    std.debug.print("rendered:\n{s}\n", .{rendered});
+
+    try expect(std.mem.containsAtLeast(u8, rendered, 1, ".parallel"));
+    try expect(std.mem.containsAtLeast(u8, rendered, 1, "\"us-west\""));
+}

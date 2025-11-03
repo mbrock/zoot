@@ -67,7 +67,7 @@ pub fn main() !void {
         },
     };
 
-    const pipelines = try allocator.alloc(Pipeline, 1);
+    const pipelines = try allocator.alloc(Pipeline, 100);
     for (pipelines, 0..) |*p, i| {
         p.* = .{
             .name = try std.fmt.allocPrint(allocator, "pipeline-{d}", .{i}),
@@ -80,7 +80,7 @@ pub fn main() !void {
 
     var time = try std.time.Timer.start();
     const doc = try dump.dump(&t, pipelines);
-    const cost_factory = pp.F2.init(40);
+    const cost_factory = pp.F2.init(60);
 
     const t0 = time.lap();
     const best = try t.pick(allocator, cost_factory, doc);
