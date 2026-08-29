@@ -22,7 +22,6 @@ runs="${RUNS:-25}"
 stat_runs="${STAT_RUNS:-5}"
 profile_dir="${PROFILE_DIR:-${root_dir}/.profiles}"
 perf_data="${profile_dir}/zoot.data"
-perf_report="${profile_dir}/zoot.txt"
 binary="${root_dir}/zig-out/bin/zoot"
 mkdir -p "$profile_dir"
 
@@ -44,14 +43,9 @@ perf record \
   --output "${perf_data}" -- \
   bash -c 'for ((i = 0; i < runs; i++)); do "$binary" >/dev/null; done'
 
-echo "[4/4] generating report -> ${perf_report}"
-perf report \
-  --input "${perf_data}" \
-  --stdio \
-  --sort comm,dso,symbol \
-  > "$perf_report"
+echo "[4/4] opening interactive perf report"
+echo "      reopen later with: perf report --input ${perf_data}"
+perf report --input "$perf_data"
 
 echo "done:"
 echo "  raw profile: ${perf_data}"
-echo "  report:      ${perf_report}"
-echo "  interactive: perf report --input ${perf_data}"
