@@ -1069,6 +1069,7 @@ fn pl_init_loop(t_node_repr: swi.term_t, t_width: swi.term_t) callconv(.c) swi.f
         .tree = tree,
         .heap = &tree.heap,
         .cost = cost,
+        .limit = cost.defaultComputationWidth(),
         .memo = .init(allocator),
         .root = node,
         .exec = .{
@@ -1105,6 +1106,7 @@ fn pl_make_loop(t_node_repr: swi.term_t, t_width: swi.term_t, t_loop_blob: swi.t
         .tree = tree,
         .heap = &tree.heap,
         .cost = cost,
+        .limit = cost.defaultComputationWidth(),
         .memo = .init(allocator),
         .root = node,
         .exec = .{

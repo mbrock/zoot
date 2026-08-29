@@ -27,6 +27,34 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
+    var args = try std.process.argsWithAllocator(allocator);
+    defer args.deinit();
+    _ = args.skip();
+    const gc_tide = if (args.next()) |arg|
+        try std.fmt.parseInt(usize, arg, 10)
+    else
+        (pp.PickOptions{}).gc_tide;
+    var computation_width: ?u16 = null;
+    var trace_gc = false;
+    var trace_memo = false;
+    var memoize = true;
+    var memoize_forks = true;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "trace")) {
+            trace_gc = true;
+        } else if (std.mem.eql(u8, arg, "memodump")) {
+            trace_memo = true;
+        } else if (std.mem.eql(u8, arg, "nomemo")) {
+            memoize = false;
+        } else if (std.mem.eql(u8, arg, "noforkmemo")) {
+            memoize_forks = false;
+        } else if (std.mem.startsWith(u8, arg, "limit=")) {
+            computation_width = try std.fmt.parseInt(u16, arg["limit=".len..], 10);
+        } else {
+            return error.InvalidArgument;
+        }
+    }
+
     var buffer: [8192]u8 = undefined;
     var stdout_file = std.fs.File.stdout();
     var stdout_writer = stdout_file.writer(&buffer);
@@ -81,9 +109,17 @@ pub fn main() !void {
     var time = try std.time.Timer.start();
     const doc = try dump.dump(&t, pipelines);
     const cost_factory = pp.F2.init(60);
+    const effective_computation_width = computation_width orelse cost_factory.defaultComputationWidth();
 
     const t0 = time.lap();
-    const best = try t.pick(allocator, cost_factory, doc);
+    const best = try t.pickWithOptions(allocator, cost_factory, doc, .{
+        .gc_tide = gc_tide,
+        .computation_width = computation_width,
+        .trace_gc = trace_gc,
+        .trace_memo = trace_memo,
+        .memoize = memoize,
+        .memoize_forks = memoize_forks,
+    });
     const t1 = time.lap();
 
     const idea = best.idea;
@@ -91,15 +127,40 @@ pub fn main() !void {
 
     try writer.print(
         "  rank: overflow={d} height={d} tainted={}\n",
-        .{ rank.o, rank.h, cost_factory.icky(rank) },
+        .{ rank.o, rank.h, best.stat.cope_forced != 0 },
     );
     try writer.print(
         "  layouts: completions={d} frontier={d} queue_peak={d}\n",
         .{ best.stat.completions, best.stat.size, best.stat.peak },
     );
     try writer.print(
-        "  memo: hits={d} misses={d} entries={d}\n\n",
-        .{ best.stat.memo_hits, best.stat.memo_misses, best.stat.memo_entries },
+        "  computation: width={d} deferred={d} forced={d}\n",
+        .{ effective_computation_width, best.stat.cope_deferred, best.stat.cope_forced },
+    );
+    try writer.print(
+        "  memo: enabled={} hits={d} (hcat={d} fork={d}) misses={d} (hcat={d} fork={d}) entries={d}\n\n",
+        .{
+            memoize,
+            best.stat.memo_hits,
+            best.stat.memo_hits_hcat,
+            best.stat.memo_hits_fork,
+            best.stat.memo_misses,
+            best.stat.memo_misses_hcat,
+            best.stat.memo_misses_fork,
+            best.stat.memo_entries,
+        },
+    );
+    try writer.print(
+        "  gc: tide={d} collections={d} heap_peak={d} before_peak={d} live_peak={d} live_last={d} copied={d}\n\n",
+        .{
+            gc_tide,
+            best.stat.gc_count,
+            best.stat.heap_peak,
+            best.stat.gc_before_peak,
+            best.stat.gc_live_peak,
+            best.stat.gc_live_last,
+            best.stat.gc_copied_total,
+        },
     );
 
     try t.emit(writer, idea.node);

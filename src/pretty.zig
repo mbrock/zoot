@@ -15,6 +15,13 @@ pub const Loop = struct {
     best: std.ArrayList(Idea) = .empty,
     icky: ?Idea = null,
     tide: usize = 100_000_000,
+    limit: u16,
+    trace_gc: bool = false,
+    trace_memo: bool = false,
+    memoize: bool = true,
+    memoize_forks: bool = true,
+    memo_hit_regions: [3]usize = .{ 0, 0, 0 },
+    memo_miss_regions: [3]usize = .{ 0, 0, 0 },
 
     pub fn deinit(this: *@This()) void {
         this.best.deinit(this.heap.bank);
@@ -22,11 +29,15 @@ pub const Loop = struct {
     }
 
     fn tidy(this: *@This()) !void {
-        std.debug.print(
-            "memo {Bi:>6.2} ",
-            .{this.memo.count() * @sizeOf(Item) * @sizeOf(Deck)},
-        );
-        this.heap.new().dump();
+        const before = this.heap.size();
+        if (this.trace_gc) {
+            std.debug.print(
+                "gc {d} before: heap={Bi:.2} memo={d}\n",
+                .{ this.stat.gc_count + 1, before, this.memo.count() },
+            );
+            this.heap.new().dump();
+        }
+
         this.heap.flip();
         var memo = Memo.init(this.tree.bank);
         try this.heap.hash(&this.memo, &memo);
@@ -42,16 +53,26 @@ pub const Loop = struct {
             try this.heap.move(icky);
 
         try this.heap.scan();
-        std.debug.print(
-            "memo {Bi:>6.2} ",
-            .{this.memo.count() * @sizeOf(Item) * @sizeOf(Deck)},
-        );
+        const after = this.heap.size();
+        this.stat.gc_count += 1;
+        this.stat.gc_before_peak = @max(this.stat.gc_before_peak, before);
+        this.stat.gc_live_peak = @max(this.stat.gc_live_peak, after);
+        this.stat.gc_live_last = after;
+        this.stat.gc_copied_total +|= after;
 
-        this.heap.new().dump();
+        if (this.trace_gc) {
+            std.debug.print(
+                "gc {d} after: heap={Bi:.2} memo={d}\n",
+                .{ this.stat.gc_count, after, this.memo.count() },
+            );
+            this.heap.new().dump();
+        }
     }
 
     fn fuss(this: *@This()) !void {
-        if (this.heap.size() < this.tide) return;
+        const size = this.heap.size();
+        this.stat.heap_peak = @max(this.stat.heap_peak, size);
+        if (size < this.tide) return;
         //        const size0 = this.heap.size();
         try this.tidy();
         const size1 = this.heap.size();
@@ -65,6 +86,16 @@ pub const Loop = struct {
         cost: Cost,
         node: Node,
     ) !Best {
+        return pickWithOptions(tree, bank, cost, node, .{});
+    }
+
+    pub fn pickWithOptions(
+        tree: *Tree,
+        bank: Bank,
+        cost: Cost,
+        node: Node,
+        options: PickOptions,
+    ) !Best {
         var this = @This(){
             .tree = tree,
             .heap = &tree.heap,
@@ -75,6 +106,12 @@ pub const Loop = struct {
                 .node = node,
                 .tick = .{ .eval = .{} },
             },
+            .tide = options.gc_tide,
+            .limit = options.computation_width orelse cost.defaultComputationWidth(),
+            .trace_gc = options.trace_gc,
+            .trace_memo = options.trace_memo,
+            .memoize = options.memoize,
+            .memoize_forks = options.memoize_forks,
         };
         defer this.deinit();
 
@@ -87,6 +124,7 @@ pub const Loop = struct {
 
         this.stat.size = this.best.items.len;
         this.stat.memo_entries = this.memo.count();
+        if (this.trace_memo) try this.dumpMemo();
 
         if (this.best.items.len != 0) {
             var boss = this.best.items[0];
@@ -111,16 +149,149 @@ pub const Loop = struct {
         std.debug.panic("zero layouts discovered", .{});
     }
 
+    fn distributionBucket(value: usize) usize {
+        if (value <= 1) return value;
+        if (value <= 2) return 2;
+        if (value <= 4) return 3;
+        if (value <= 8) return 4;
+        if (value <= 16) return 5;
+        return 6;
+    }
+
+    fn contextRegion(this: *@This(), item: Item) usize {
+        const width = this.cost.width();
+        const reference_limit = width + width / 5;
+        const edge = @max(item.head, item.base);
+        if (edge <= width) return 0;
+        if (edge <= reference_limit) return 1;
+        return 2;
+    }
+
+    fn dumpMemo(this: *@This()) !void {
+        var node_contexts = std.AutoHashMap(Node, usize).init(this.tree.bank);
+        defer node_contexts.deinit();
+        var contexts = std.AutoHashMap(u32, void).init(this.tree.bank);
+        defer contexts.deinit();
+        var frontier_roots = std.AutoHashMap(Deck, void).init(this.tree.bank);
+        defer frontier_roots.deinit();
+
+        var tags = [_]usize{0} ** 8;
+        var frontier_buckets = [_]usize{0} ** 7;
+        var context_buckets = [_]usize{0} ** 7;
+        var frontier_cells: usize = 0;
+        var frontier_max: usize = 0;
+        var empty: usize = 0;
+        var thunks: usize = 0;
+        var head_max: u16 = 0;
+        var base_max: u16 = 0;
+        var entry_regions = [_]usize{0} ** 3;
+
+        var iter = this.memo.iterator();
+        while (iter.next()) |entry| {
+            const item = entry.key_ptr.*;
+            const deck = entry.value_ptr.*;
+            tags[@intFromEnum(item.node.tag)] += 1;
+            head_max = @max(head_max, item.head);
+            base_max = @max(base_max, item.base);
+            entry_regions[this.contextRegion(item)] += 1;
+            try contexts.put((@as(u32, item.base) << 16) | item.head, {});
+
+            const node_count = try node_contexts.getOrPut(item.node);
+            if (!node_count.found_existing) node_count.value_ptr.* = 0;
+            node_count.value_ptr.* += 1;
+
+            if (deck.item == Deck.none.item) {
+                empty += 1;
+                frontier_buckets[0] += 1;
+                continue;
+            }
+            if (deck.cope == 1) {
+                thunks += 1;
+                continue;
+            }
+            try frontier_roots.put(deck, {});
+
+            var len: usize = 0;
+            var curr = deck;
+            while (curr.item != Deck.none.item) {
+                len += 1;
+                curr = this.heap.new().duel.list.items[curr.item].next;
+            }
+            frontier_cells += len;
+            frontier_max = @max(frontier_max, len);
+            frontier_buckets[distributionBucket(len)] += 1;
+        }
+
+        var node_iter = node_contexts.valueIterator();
+        var contexts_max: usize = 0;
+        while (node_iter.next()) |count| {
+            contexts_max = @max(contexts_max, count.*);
+            context_buckets[distributionBucket(count.*)] += 1;
+        }
+
+        const entries = this.memo.count();
+        const unique_nodes = node_contexts.count();
+        const load = if (this.memo.capacity() == 0)
+            0
+        else
+            100.0 * @as(f64, @floatFromInt(entries)) /
+                @as(f64, @floatFromInt(this.memo.capacity()));
+        const contexts_average = if (unique_nodes == 0)
+            0
+        else
+            @as(f64, @floatFromInt(entries)) / @as(f64, @floatFromInt(unique_nodes));
+        const frontier_count = entries - empty - thunks;
+        const frontier_average = if (frontier_count == 0)
+            0
+        else
+            @as(f64, @floatFromInt(frontier_cells)) /
+                @as(f64, @floatFromInt(frontier_count));
+        std.debug.print(
+            "memo table: entries={d} capacity={d} load={d:.1}% key={d}B value={d}B\n",
+            .{
+                entries,
+                this.memo.capacity(),
+                load,
+                @sizeOf(Item),
+                @sizeOf(Deck),
+            },
+        );
+        std.debug.print(
+            "  keys: hcat={d} fork={d} nodes={d} context_pairs={d} head_max={d} base_max={d}\n",
+            .{ tags[@intFromEnum(Tag.hcat)], tags[@intFromEnum(Tag.fork)], unique_nodes, contexts.count(), head_max, base_max },
+        );
+        std.debug.print(
+            "  contexts/node [1,2,3-4,5-8,9-16,17+]={any} avg={d:.2} max={d}\n",
+            .{ context_buckets[1..], contexts_average, contexts_max },
+        );
+        std.debug.print(
+            "  context regions [<=width,<=1.2*width,beyond]: entries={any} hits={any} misses={any}\n",
+            .{ entry_regions, this.memo_hit_regions, this.memo_miss_regions },
+        );
+        std.debug.print(
+            "  values: empty={d} thunks={d} distinct_roots={d} referenced_cells={d} avg={d:.2} max={d}\n",
+            .{
+                empty,
+                thunks,
+                frontier_roots.count(),
+                frontier_cells,
+                frontier_average,
+                frontier_max,
+            },
+        );
+        std.debug.print(
+            "  frontier lengths [0,1,2,3-4,5-8,9-16,17+]={any}\n",
+            .{frontier_buckets},
+        );
+    }
+
     fn explore(this: *@This()) !void {
         while (true) {
             switch (this.exec.tick) {
                 .give => |deck| {
                     if (this.exec.then.kind == .none) {
                         if (deck.cope == 1) {
-                            const cope = this.heap.new().cope.list.items[deck.item];
-                            this.exec.node = cope.node;
-                            this.exec.tick = .{ .eval = cope.crux };
-
+                            try this.forceCope(deck);
                             continue;
                         }
 
@@ -152,57 +323,91 @@ pub const Loop = struct {
         return .{ .flip = this.heap.tick, .cope = 0, .item = @intCast(idx) };
     }
 
-    /// Check if idea is dominated by any idea in the frontier
-    fn dominated(this: *@This(), deck: Deck, gist: Gist) bool {
-        if (deck.item == 0x3FFFFFFF) return false;
-        var curr = deck;
-        while (curr.item != 0x3FFFFFFF) {
-            const duel = this.heap.new().duel.list.items[curr.item];
-            if (wins(this.cost, duel.gist, gist)) return true;
-            curr = duel.next;
-        }
-        return false;
+    fn delay(this: *@This(), node: Node, crux: Crux) !Deck {
+        var forced = crux;
+        forced.icky = true;
+        const idx = try this.heap.new().cope.push(this.heap.bank, .{
+            .node = node,
+            .crux = forced,
+        });
+        this.stat.cope_deferred += 1;
+        return .{ .flip = this.heap.tick, .cope = 1, .item = @intCast(idx) };
     }
 
-    /// Add idea to frontier, filtering out dominated ideas
-    fn cons_to_deck(this: *@This(), deck: Deck, node: Node, gist: Gist) !Deck {
-        // First check if new idea is dominated
-        if (this.dominated(deck, gist)) {
-            return deck;
-        }
+    fn resumeCope(this: *@This(), deck: Deck) void {
+        std.debug.assert(deck.cope == 1);
+        const cope = this.heap.new().cope.list.items[deck.item];
+        this.stat.cope_forced += 1;
+        this.exec.node = cope.node;
+        this.exec.tick = .{ .eval = cope.crux };
+    }
 
-        // Filter out ideas dominated by new idea, build new list
-        var result = Deck.none;
-        var kept: usize = 0;
-        var filtered: usize = 0;
-        if (deck.item != 0x3FFFFFFF) {
-            var curr = deck;
-            while (curr.item != 0x3FFFFFFF) {
-                const duel = this.heap.new().duel.list.items[curr.item];
-                if (!wins(this.cost, gist, duel.gist)) {
-                    // Keep this idea
-                    const idx = try this.heap.new().duel.push(this.heap.bank, .{
-                        .node = duel.node,
-                        .gist = duel.gist,
-                        .next = result,
-                    });
-                    result = .{ .flip = this.heap.tick, .cope = 0, .item = @intCast(idx) };
-                    kept += 1;
-                } else {
-                    filtered += 1;
+    fn forceCope(this: *@This(), deck: Deck) !void {
+        const then = this.exec.then;
+        this.exec.then = try Ktx2.make(.{ .then = then }, this.heap);
+        this.resumeCope(deck);
+    }
+
+    fn parentCrux(item: Item, origin_base: u16) Crux {
+        return .{ .last = item.head, .base = origin_base };
+    }
+
+    fn terminalExceedsLimit(this: *@This(), node: Node, crux: Crux) bool {
+        var column: u32 = crux.last;
+        if (column > this.limit or crux.base > this.limit) return true;
+
+        return switch (node.look()) {
+            .rune => |rune| blk: {
+                if (rune.code == '\n') break :blk false;
+                const width = std.unicode.utf8CodepointSequenceLength(rune.code) catch 1;
+                column += @as(u32, width) * rune.reps;
+                break :blk column > this.limit;
+            },
+            .span => |span| blk: {
+                if (span.char != 0 and span.side == .lchr) {
+                    if (span.char == '\n')
+                        column = crux.base
+                    else
+                        column += 1;
+                    if (column > this.limit) break :blk true;
                 }
-                curr = duel.next;
-            }
-        }
-
-        // Add new idea
-        const idx = try this.heap.new().duel.push(this.heap.bank, .{
-            .node = node,
-            .gist = gist,
-            .next = result,
-        });
-
-        return .{ .flip = this.heap.tick, .cope = 0, .item = @intCast(idx) };
+                const text = std.mem.sliceTo(this.tree.blob.items[span.text..], 0);
+                column += @intCast(text.len);
+                if (column > this.limit) break :blk true;
+                if (span.char != 0 and span.side == .rchr) {
+                    if (span.char == '\n')
+                        column = crux.base
+                    else
+                        column += 1;
+                }
+                break :blk column > this.limit;
+            },
+            .quad => |quad| blk: {
+                for ([_]u7{ quad.ch0, quad.ch1, quad.ch2, quad.ch3 }) |char| {
+                    if (char == 0) break;
+                    if (char == '\n')
+                        column = crux.base
+                    else
+                        column += 1;
+                    if (column > this.limit) break :blk true;
+                }
+                break :blk false;
+            },
+            .trip => |trip| blk: {
+                const glyph = trip.slice();
+                for (0..trip.repeatCount()) |_| {
+                    for (glyph[0..trip.unitLen()]) |char| {
+                        if (char == '\n')
+                            column = crux.base
+                        else
+                            column += 1;
+                        if (column > this.limit) break :blk true;
+                    }
+                }
+                break :blk false;
+            },
+            .hcat, .fork, .cons => column > this.limit or crux.base > this.limit,
+        };
     }
 
     /// Merge two frontiers, keeping only pareto-optimal ideas (OCaml-style)
@@ -266,10 +471,11 @@ pub const Loop = struct {
             }
         }
 
-        return result;
+        // We prepend above, but frontiers must be ordered by decreasing `last`.
+        return try this.reverse_deck(result);
     }
 
-    /// Helper to add to deck without dominance check (for merge)
+    /// Prepend an idea without a dominance check.
     fn cons_to_deck_raw(this: *@This(), deck: Deck, node: Node, gist: Gist) !Deck {
         const idx = try this.heap.new().duel.push(this.heap.bank, .{
             .node = node,
@@ -277,6 +483,36 @@ pub const Loop = struct {
             .next = deck,
         });
         return .{ .flip = this.heap.tick, .cope = 0, .item = @intCast(idx) };
+    }
+
+    fn reverse_deck(this: *@This(), deck: Deck) !Deck {
+        std.debug.assert(deck.cope == 0);
+        var result = Deck.none;
+        var curr = deck;
+        while (curr.item != 0x3FFFFFFF) {
+            const duel = this.heap.new().duel.list.items[curr.item];
+            result = try this.cons_to_deck_raw(result, duel.node, duel.gist);
+            curr = duel.next;
+        }
+        return result;
+    }
+
+    /// Preserve a choice node's local indentation modifier after eliminating
+    /// the choice itself from every resolved layout.
+    fn wrap_deck(this: *@This(), deck: Deck, frob: Frob) !Deck {
+        if (deck.item == 0x3FFFFFFF or (frob.warp == 0 and frob.nest == 0))
+            return deck;
+
+        std.debug.assert(deck.cope == 0);
+        var reversed = Deck.none;
+        var curr = deck;
+        while (curr.item != 0x3FFFFFFF) {
+            const duel = this.heap.new().duel.list.items[curr.item];
+            const node = try this.tree.cons(frob, duel.node, Node.halt);
+            reversed = try this.cons_to_deck_raw(reversed, node, duel.gist);
+            curr = duel.next;
+        }
+        return try this.reverse_deck(reversed);
     }
 
     /// Helper: emit a node to a string buffer for debugging
@@ -321,18 +557,38 @@ pub const Loop = struct {
                 // We are about to evaluate a node.
                 var crux = eval;
 
-                if (!this.exec.node.easy()) {
+                if (!crux.icky and this.terminalExceedsLimit(this.exec.node, crux)) {
+                    this.exec.tick = .{ .give = try this.delay(this.exec.node, crux) };
+                    return;
+                }
+
+                const memoize_node = this.shouldMemoize(this.exec.node, crux);
+                if (memoize_node) {
                     // Computing this node may be costlier than looking it up.
 
                     if (this.memo.get(crux.item(this.exec.node))) |deck| {
                         // We found a precomputed frontier for the node.
                         this.stat.memo_hits += 1;
+                        if (this.trace_memo)
+                            this.memo_hit_regions[this.contextRegion(crux.item(this.exec.node))] += 1;
+                        switch (this.exec.node.tag) {
+                            .hcat => this.stat.memo_hits_hcat += 1,
+                            .fork => this.stat.memo_hits_fork += 1,
+                            else => unreachable,
+                        }
                         // Use the memoized frontier as-is (includes overflow layouts)
                         this.exec.tick = .{ .give = deck };
                         return;
                     } else {
                         // Alas, we must compute.
                         this.stat.memo_misses += 1;
+                        if (this.trace_memo)
+                            this.memo_miss_regions[this.contextRegion(crux.item(this.exec.node))] += 1;
+                        switch (this.exec.node.tag) {
+                            .hcat => this.stat.memo_misses_hcat += 1,
+                            .fork => this.stat.memo_misses_fork += 1,
+                            else => unreachable,
+                        }
                     }
                 }
 
@@ -359,6 +615,7 @@ pub const Loop = struct {
                     },
                     .hcat => |oper| {
                         const hcat = this.heap.new().hcat.list.items[oper.item];
+                        const origin = crux;
 
                         // Apply local indent state to the crux.
                         if (oper.frob.warp == 1) crux.warp();
@@ -375,7 +632,9 @@ pub const Loop = struct {
                             // Afterwards, proceed with the hcat tail.
                             .node = hcat.tail,
                             // Use the same indent base.
-                            .base = eval.base,
+                            .base = crux.base,
+                            .origin_base = origin.base,
+                            .forced = origin.icky,
                             // After the hcat tail, return to the current continuation.
                             .then = then,
                             // Remember what item we are evaluating.
@@ -388,6 +647,7 @@ pub const Loop = struct {
                     },
                     .fork => |fork| {
                         const pair = this.heap.new().fork.list.items[fork.item];
+                        const origin = crux;
 
                         // Apply local indent state to the crux.
                         if (fork.frob.warp == 1) crux.warp();
@@ -404,6 +664,8 @@ pub const Loop = struct {
                         this.exec.then = try Ktx1.make(.{
                             .node = pair.tail,
                             .base = crux.base,
+                            .origin_base = origin.base,
+                            .forced = origin.icky,
                             .item = item,
                             .then = then,
                         }, this.heap);
@@ -421,10 +683,23 @@ pub const Loop = struct {
                     .head => |cont| {
                         const left_deck = this.exec.tick.give;
 
+                        if (left_deck.cope == 1 and cont.forced) {
+                            try this.forceCope(left_deck);
+                            return;
+                        }
+
                         // Check if this is a fork or hcat by examining the item node
                         const is_fork = cont.item.node.tag == .fork;
 
                         if (is_fork) {
+                            if (cont.forced) {
+                                const oper = Node.view(Oper, cont.item.node);
+                                const result = try this.wrap_deck(left_deck, oper.frob);
+                                this.exec.tick = .{ .give = result };
+                                this.exec.then = cont.then;
+                                return;
+                            }
+
                             // We have evaluated the left branch of a fork.
                             // Now evaluate the right branch.
                             this.exec.node = cont.node;
@@ -434,6 +709,8 @@ pub const Loop = struct {
                                 .item = cont.item,
                                 .then = cont.then,
                                 .left_deck = left_deck,
+                                .origin_base = cont.origin_base,
+                                .forced = cont.forced,
                             }, this.heap);
 
                             // Evaluate right branch with same context as left
@@ -442,7 +719,7 @@ pub const Loop = struct {
                                     .base = cont.base,
                                     .last = cont.item.head,
                                     .rows = 0,
-                                    .icky = false,
+                                    .icky = cont.forced,
                                 },
                             };
 
@@ -452,9 +729,19 @@ pub const Loop = struct {
                             const head_deck = left_deck;
                             const oper = Node.view(Oper, cont.item.node);
 
+                            if (head_deck.cope == 1) {
+                                this.exec.tick = .{ .give = try this.delay(
+                                    cont.item.node,
+                                    parentCrux(cont.item, cont.origin_base),
+                                ) };
+                                this.exec.then = cont.then;
+                                return;
+                            }
+
                             // If head has no valid layouts, the whole hcat has none
                             if (head_deck.item == 0x3FFFFFFF) {
-                                try this.memo.put(cont.item, Deck.none);
+                                if (this.shouldMemoizeItem(cont.item, cont.forced))
+                                    try this.memo.put(cont.item, Deck.none);
                                 this.exec.tick = .{ .give = Deck.none };
                                 this.exec.then = cont.then;
                                 return;
@@ -472,6 +759,8 @@ pub const Loop = struct {
                                 .item = cont.item,
                                 .base = cont.base,
                                 .frob = oper.frob,
+                                .origin_base = cont.origin_base,
+                                .forced = cont.forced,
                                 .then = cont.then,
                             }, this.heap);
 
@@ -483,7 +772,7 @@ pub const Loop = struct {
                                     .base = cont.base,
                                     .last = first_duel.gist.last,
                                     .rows = first_duel.gist.rows,
-                                    .icky = this.cost.icky(first_duel.gist.rank),
+                                    .icky = cont.forced and first_duel.gist.rows == 0,
                                 },
                             };
 
@@ -495,12 +784,22 @@ pub const Loop = struct {
                         // Combine this (head, tail) pair and continue iteration
                         const tail_deck = this.exec.tick.give;
 
-                        // If tail has no layouts, skip this head
-                        if (tail_deck.item != 0x3FFFFFFF) {
+                        if (tail_deck.cope == 1 and cont.forced) {
+                            try this.forceCope(tail_deck);
+                            return;
+                        } else if (tail_deck.cope == 1) {
+                            const delayed = try this.delay(
+                                cont.item.node,
+                                parentCrux(cont.item, cont.origin_base),
+                            );
+                            const merged = try this.merge_decks(cont.result_deck, delayed);
+                            this.exec.then.load(this.heap).iter.result_deck = merged;
+                        } else if (tail_deck.item != 0x3FFFFFFF) {
+                            // If tail has no layouts, skip this head.
                             // Get current head Duel
                             const head_duel = this.heap.new().duel.list.items[cont.current_head.item];
                             // Do "running best" scan through tail (like OCaml)
-                            var partial = Deck.none;
+                            var partial_reversed = Deck.none;
                             var current_best: ?struct { gist: Gist, node: Node } = null;
                             var tail_curr = tail_deck;
                             while (tail_curr.item != 0x3FFFFFFF) {
@@ -509,10 +808,14 @@ pub const Loop = struct {
                                 const node = try this.tree.cons(cont.frob, head_duel.node, tail_duel.node);
 
                                 if (current_best) |best| {
-                                    if (this.cost.wins(gist.rank, best.gist.rank)) {
+                                    if (cost_le(gist.rank, best.gist.rank)) {
                                         current_best = .{ .gist = gist, .node = node };
                                     } else {
-                                        partial = try this.cons_to_deck(partial, best.node, best.gist);
+                                        partial_reversed = try this.cons_to_deck_raw(
+                                            partial_reversed,
+                                            best.node,
+                                            best.gist,
+                                        );
                                         current_best = .{ .gist = gist, .node = node };
                                     }
                                 } else {
@@ -524,10 +827,15 @@ pub const Loop = struct {
 
                             // Add final current_best
                             if (current_best) |best| {
-                                partial = try this.cons_to_deck(partial, best.node, best.gist);
+                                partial_reversed = try this.cons_to_deck_raw(
+                                    partial_reversed,
+                                    best.node,
+                                    best.gist,
+                                );
                             }
 
                             // Merge this head's results with accumulated results
+                            const partial = try this.reverse_deck(partial_reversed);
                             const foo = try this.merge_decks(cont.result_deck, partial);
                             this.exec.then.load(this.heap).iter.result_deck = foo;
                         }
@@ -539,7 +847,8 @@ pub const Loop = struct {
                         if (next_head.item == 0x3FFFFFFF) {
                             // No more heads - iteration complete
                             const result = this.exec.then.load(this.heap).iter.result_deck;
-                            try this.memo.put(cont.item, result);
+                            if (result.cope == 0 and this.shouldMemoizeItem(cont.item, cont.forced))
+                                try this.memo.put(cont.item, result);
                             this.exec.tick = .{ .give = result };
                             this.exec.then = cont.then;
                             return;
@@ -555,15 +864,24 @@ pub const Loop = struct {
                                     .base = cont.base,
                                     .last = next_head_duel.gist.last,
                                     .rows = next_head_duel.gist.rows,
-                                    .icky = this.cost.icky(next_head_duel.gist.rank),
+                                    .icky = cont.forced and next_head_duel.gist.rows == 0,
                                 },
                             };
 
                             return;
                         }
                     },
-                    .tail => |_| {
-                        unreachable;
+                    .tail => |cont| {
+                        const forced = this.exec.tick.give;
+                        if (forced.cope == 1) {
+                            this.resumeCope(forced);
+                            return;
+                        }
+                        std.debug.assert(forced.item != Deck.none.item);
+                        const chosen = this.heap.new().duel.list.items[forced.item];
+                        this.exec.tick = .{ .give = try this.singleton(chosen.node, chosen.gist) };
+                        this.exec.then = cont.then;
+                        return;
                     },
                     .fork => |cont| {
                         // We have evaluated both branches of a fork.
@@ -573,10 +891,19 @@ pub const Loop = struct {
                         const right_deck = this.exec.tick.give;
 
                         // Merge the two frontiers
-                        const result = try this.merge_decks(left_deck, right_deck);
+                        const merged = try this.merge_decks(left_deck, right_deck);
+                        const oper = Node.view(Oper, cont.item.node);
+                        const result = if (merged.cope == 1)
+                            try this.delay(
+                                cont.item.node,
+                                parentCrux(cont.item, cont.origin_base),
+                            )
+                        else
+                            try this.wrap_deck(merged, oper.frob);
 
                         // Memoize the result frontier
-                        try this.memo.put(cont.item, result);
+                        if (result.cope == 0 and this.shouldMemoizeItem(cont.item, cont.forced))
+                            try this.memo.put(cont.item, result);
 
                         this.exec = .{
                             .tick = .{ .give = result },
@@ -596,10 +923,28 @@ pub const Loop = struct {
         }
     }
 
+    fn cost_le(a: Rank, b: Rank) bool {
+        return a.toU64() <= b.toU64();
+    }
+
+    fn shouldMemoize(this: *@This(), node: Node, crux: Crux) bool {
+        if (!this.memoize or crux.icky or node.easy()) return false;
+        if (crux.last > this.limit or crux.base > this.limit) return false;
+        if (!this.memoize_forks and node.tag == .fork) return false;
+        return true;
+    }
+
+    fn shouldMemoizeItem(this: *@This(), item: Item, forced: bool) bool {
+        if (!this.memoize or forced or item.node.easy()) return false;
+        if (item.head > this.limit or item.base > this.limit) return false;
+        if (!this.memoize_forks and item.node.tag == .fork) return false;
+        return true;
+    }
+
     fn wins(_: Cost, a: Gist, b: Gist) bool {
-        // OCaml's <==: a dominates b if ALL metrics are ≤ (including equal!)
-        // When equal, we keep the first one to deduplicate
-        return a.last <= b.last and a.rank.o <= b.rank.o and a.rank.h <= b.rank.h;
+        // OCaml's <== compares the final column and the cost factory's total
+        // cost order. Equality keeps the first measure and deduplicates it.
+        return a.last <= b.last and cost_le(a.rank, b.rank);
     }
 
     fn meld(this: *@This(), idea: Idea) !void {
@@ -811,6 +1156,8 @@ pub const Kont = packed struct {
 pub const Ktx1 = struct {
     node: Node,
     base: u16,
+    origin_base: u16,
+    forced: bool,
     item: Item,
     then: Kont,
 
@@ -827,9 +1174,8 @@ pub const Ktx1 = struct {
 };
 
 pub const Ktx2 = struct {
-    head_deck: Deck,
-    item: Item,
     then: Kont,
+    _pad: u32 = 0,
 
     pub fn make(k2: Ktx2, heap: *Heap) !Kont {
         const idx = try heap.new().ktx2.push(heap.bank, k2);
@@ -837,14 +1183,14 @@ pub const Ktx2 = struct {
     }
 
     pub fn drag(k2: *Ktx2, heap: *Heap) !void {
-        try heap.move(&k2.head_deck);
-        try heap.move(&k2.item.node);
         try heap.move(&k2.then);
     }
 };
 
 pub const Ktx3 = struct {
     left_deck: Deck,
+    origin_base: u16,
+    forced: bool,
     item: Item,
     then: Kont,
 
@@ -867,6 +1213,8 @@ pub const Ktx4 = struct {
     item: Item, // For memoization
     base: u16, // Indentation base
     frob: Frob, // Operator frob from hcat
+    origin_base: u16,
+    forced: bool,
     then: Kont, // Outer continuation
 
     pub fn make(k4: Ktx4, heap: *Heap) !Kont {
@@ -887,6 +1235,17 @@ pub const Ktx4 = struct {
 pub const Cost = union(enum) {
     f1: u16, // page width
     f2: u16, // page width
+
+    pub fn width(self: Cost) u16 {
+        return switch (self) {
+            inline else => |page_width| page_width,
+        };
+    }
+
+    pub fn defaultComputationWidth(self: Cost) u16 {
+        const page_width = self.width();
+        return page_width +| page_width / 5;
+    }
 
     pub fn plus(_: Cost, lhs: Rank, rhs: Rank) Rank {
         return .{
@@ -955,8 +1314,29 @@ pub const Stat = struct {
     completions: usize = 0,
     memo_hits: usize = 0,
     memo_misses: usize = 0,
+    memo_hits_hcat: usize = 0,
+    memo_hits_fork: usize = 0,
+    memo_misses_hcat: usize = 0,
+    memo_misses_fork: usize = 0,
     memo_entries: usize = 0,
     size: usize = 0,
+    gc_count: usize = 0,
+    gc_before_peak: usize = 0,
+    gc_live_peak: usize = 0,
+    gc_live_last: usize = 0,
+    gc_copied_total: usize = 0,
+    heap_peak: usize = 0,
+    cope_deferred: usize = 0,
+    cope_forced: usize = 0,
+};
+
+pub const PickOptions = struct {
+    gc_tide: usize = 100_000_000,
+    computation_width: ?u16 = null,
+    trace_gc: bool = false,
+    trace_memo: bool = false,
+    memoize: bool = true,
+    memoize_forks: bool = true,
 };
 
 pub const Best = struct {
@@ -1270,6 +1650,16 @@ pub const Tree = struct {
 
     pub fn pick(tree: *Tree, bank: Bank, cost: Cost, node: Node) !Best {
         return try Loop.pick(tree, bank, cost, node);
+    }
+
+    pub fn pickWithOptions(
+        tree: *Tree,
+        bank: Bank,
+        cost: Cost,
+        node: Node,
+        options: PickOptions,
+    ) !Best {
+        return try Loop.pickWithOptions(tree, bank, cost, node, options);
     }
 
     pub fn rank(
@@ -1917,6 +2307,11 @@ pub fn Rack(Elem: type) type {
         pub fn deinit(rack: *@This(), bank: Bank) void {
             rack.list.deinit(bank);
         }
+
+        pub fn clearRetainingCapacity(rack: *@This()) void {
+            rack.list.clearRetainingCapacity();
+            rack.scan = 0;
+        }
     };
 }
 
@@ -1941,6 +2336,18 @@ pub const Half = struct {
         this.ktx4.deinit(bank);
         this.duel.deinit(bank);
         this.cope.deinit(bank);
+    }
+
+    pub fn clearRetainingCapacity(this: *@This()) void {
+        this.hcat.clearRetainingCapacity();
+        this.fork.clearRetainingCapacity();
+        this.cons.clearRetainingCapacity();
+        this.ktx1.clearRetainingCapacity();
+        this.ktx2.clearRetainingCapacity();
+        this.ktx3.clearRetainingCapacity();
+        this.ktx4.clearRetainingCapacity();
+        this.duel.clearRetainingCapacity();
+        this.cope.clearRetainingCapacity();
     }
 
     pub fn calm(this: @This()) bool {
@@ -2018,8 +2425,7 @@ pub const Heap = struct {
     /// Begin GC: flip and clear new space
     pub fn flip(heap: *Heap) void {
         heap.tick ^= 1;
-        heap.heap[heap.tick].deinit(heap.bank);
-        heap.heap[heap.tick] = .{};
+        heap.heap[heap.tick].clearRetainingCapacity();
     }
 
     pub fn move(heap: *Heap, thing: anytype) !void {
@@ -2382,6 +2788,128 @@ test "maze evaluation chooses best layout" {
     try expectEqualStrings("foo bar", sink.buffered());
 }
 
+test "concatenation preserves shorter costlier frontier layout" {
+    var tree = Tree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    const cheap_long = try tree.text("12345");
+    const costly_short = try tree.plus(Node.nl, try tree.text("x"));
+    const tradeoff = try tree.fork(cheap_long, costly_short);
+    const prefix_choice = try tree.plus(try tree.text("a"), tradeoff);
+    const doc = try tree.plus(prefix_choice, try tree.text("ZZZZZZ"));
+
+    const result = try tree.pick(std.testing.allocator, F1.init(6), doc);
+    try expectEqual(1, result.idea.gist.rank.o);
+    try expectEqual(1, result.idea.gist.rank.h);
+    try expectEmitString(&tree, "a\nxZZZZZZ", result.idea.node);
+}
+
+test "nest context reaches a right-associated hcat tail" {
+    var tree = Tree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    const tail = try tree.cat(&.{
+        Node.nl,
+        try tree.text("12345"),
+        Node.nl,
+        try tree.text("b"),
+    });
+    const doc = try tree.nest(2, try tree.plus(try tree.text("a"), tail));
+    const result = try tree.pick(std.testing.allocator, F1.init(6), doc);
+
+    try expectEqual(1, result.idea.gist.rank.o);
+    try expectEqual(2, result.idea.gist.rank.h);
+    try expectEqual(3, result.idea.gist.last);
+    try expectEmitString(&tree, "a\n  12345\n  b", result.idea.node);
+}
+
+test "nest modifier survives fork elimination" {
+    var tree = Tree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    const branch_a = try tree.cat(&.{ try tree.text("a"), Node.nl, try tree.text("b") });
+    const branch_b = try tree.cat(&.{ try tree.text("c"), Node.nl, try tree.text("d") });
+    const doc = try tree.nest(3, try tree.fork(branch_a, branch_b));
+    const result = try tree.pick(std.testing.allocator, F1.init(6), doc);
+
+    try expectEqual(4, result.idea.gist.last);
+    try expectEmitString(&tree, "a\n   b", result.idea.node);
+}
+
+test "computation width delays and forces unavoidable overflow" {
+    var tree = Tree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    const doc = try tree.text("abcdefgh");
+    const result = try tree.pickWithOptions(std.testing.allocator, F1.init(4), doc, .{
+        .computation_width = 4,
+    });
+
+    try expectEqual(4, result.idea.gist.rank.o);
+    try expectEqual(1, result.stat.cope_deferred);
+    try expectEqual(1, result.stat.cope_forced);
+    try expectEmitString(&tree, "abcdefgh", result.idea.node);
+}
+
+test "concatenation propagates a delayed tail" {
+    var tree = Tree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    const doc = try tree.plus(try tree.text("abc"), try tree.text("def"));
+    const result = try tree.pickWithOptions(std.testing.allocator, F1.init(4), doc, .{
+        .computation_width = 4,
+    });
+
+    try expectEqual(2, result.idea.gist.rank.o);
+    try expect(result.stat.cope_deferred >= 2);
+    try expectEqual(1, result.stat.cope_forced);
+    try expectEmitString(&tree, "abcdef", result.idea.node);
+}
+
+test "a bounded choice wins over a delayed choice" {
+    var tree = Tree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    const doc = try tree.fork(try tree.text("abcdefgh"), try tree.text("ok"));
+    const result = try tree.pickWithOptions(std.testing.allocator, F1.init(4), doc, .{
+        .computation_width = 4,
+    });
+
+    try expectEqual(0, result.idea.gist.rank.o);
+    try expect(result.stat.cope_deferred >= 1);
+    try expectEqual(0, result.stat.cope_forced);
+    try expectEmitString(&tree, "ok", result.idea.node);
+}
+
+test "forced computation becomes bounded again after newline" {
+    var tree = Tree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    const suffix = try tree.fork(try tree.text("abcdefgh"), try tree.text("ok"));
+    const doc = try tree.cat(&.{ try tree.text("abcdefgh"), Node.nl, suffix });
+    const result = try tree.pickWithOptions(std.testing.allocator, F1.init(4), doc, .{
+        .computation_width = 4,
+    });
+
+    try expect(result.stat.cope_forced >= 1);
+    try expectEmitString(&tree, "abcdefgh\nok", result.idea.node);
+}
+
+test "forcing a computation selects one recovered measure" {
+    var tree = Tree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    const short_costly = try tree.plus(Node.nl, try tree.text("x"));
+    const suffix = try tree.fork(try tree.text("1234"), short_costly);
+    const doc = try tree.cat(&.{ try tree.text("abcdefgh"), Node.nl, suffix });
+    const result = try tree.pickWithOptions(std.testing.allocator, F1.init(4), doc, .{
+        .computation_width = 4,
+    });
+
+    try expect(result.stat.cope_forced >= 1);
+    try expectEqual(1, result.stat.size);
+}
+
 test "flatten fused text <> nl" {
     var t = Tree.init(std.testing.allocator);
     defer t.deinit();
@@ -2472,10 +3000,7 @@ test "F2 cost matches example" {
     const rank2 = try t.rank(cost, d2);
 
     try expectEqual(3, rank2.h);
-
-    // TODO: this was 4*4 + 3*3 + 1, but something changed?
-    // need to investigate the paper etc
-    try expectEqual(4 * 4 + 3 * 3 + 0, rank2.o);
+    try expectEqual(4 * 4 + 3 * 3 + 1, rank2.o);
 }
 
 test "flatten('a' <> nl <> 'b')" {

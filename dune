@@ -1,11 +1,3 @@
 (executable
- (name test_pretty)
- (libraries pretty_expressive))
-
-(executable
- (name benchmark_pretty)
- (libraries pretty_expressive unix))
-
-(executable
- (name bench_explore)
+ (name benchmark_pipeline_ocaml)
  (libraries pretty_expressive unix))
