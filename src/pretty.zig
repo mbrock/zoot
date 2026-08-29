@@ -19,7 +19,6 @@ pub const Loop = struct {
     trace_gc: bool = false,
     trace_memo: bool = false,
     memoize: bool = true,
-    memoize_forks: bool = true,
     memo_hit_regions: [3]usize = .{ 0, 0, 0 },
     memo_miss_regions: [3]usize = .{ 0, 0, 0 },
 
@@ -111,7 +110,6 @@ pub const Loop = struct {
             .trace_gc = options.trace_gc,
             .trace_memo = options.trace_memo,
             .memoize = options.memoize,
-            .memoize_forks = options.memoize_forks,
         };
         defer this.deinit();
 
@@ -545,6 +543,7 @@ pub const Loop = struct {
                 .tail => |k| k.then,
                 .fork => |k| k.then,
                 .iter => |k| k.then,
+                .memo => |k| k.then,
             };
         }
         return depth;
@@ -560,36 +559,6 @@ pub const Loop = struct {
                 if (!crux.icky and this.terminalExceedsLimit(this.exec.node, crux)) {
                     this.exec.tick = .{ .give = try this.delay(this.exec.node, crux) };
                     return;
-                }
-
-                const memoize_node = this.shouldMemoize(this.exec.node, crux);
-                if (memoize_node) {
-                    // Computing this node may be costlier than looking it up.
-
-                    if (this.memo.get(crux.item(this.exec.node))) |deck| {
-                        // We found a precomputed frontier for the node.
-                        this.stat.memo_hits += 1;
-                        if (this.trace_memo)
-                            this.memo_hit_regions[this.contextRegion(crux.item(this.exec.node))] += 1;
-                        switch (this.exec.node.tag) {
-                            .hcat => this.stat.memo_hits_hcat += 1,
-                            .fork => this.stat.memo_hits_fork += 1,
-                            else => unreachable,
-                        }
-                        // Use the memoized frontier as-is (includes overflow layouts)
-                        this.exec.tick = .{ .give = deck };
-                        return;
-                    } else {
-                        // Alas, we must compute.
-                        this.stat.memo_misses += 1;
-                        if (this.trace_memo)
-                            this.memo_miss_regions[this.contextRegion(crux.item(this.exec.node))] += 1;
-                        switch (this.exec.node.tag) {
-                            .hcat => this.stat.memo_misses_hcat += 1,
-                            .fork => this.stat.memo_misses_fork += 1,
-                            else => unreachable,
-                        }
-                    }
                 }
 
                 switch (this.exec.node.look()) {
@@ -623,6 +592,39 @@ pub const Loop = struct {
 
                         const then = this.exec.then;
                         const item = crux.item(this.exec.node);
+
+                        if (hcat.head == Node.memo_mark) {
+                            const memoize_node = this.memoize and
+                                !crux.icky and
+                                crux.last <= this.limit and
+                                crux.base <= this.limit;
+                            if (memoize_node) {
+                                if (this.memo.get(item)) |deck| {
+                                    this.stat.memo_hits += 1;
+                                    this.stat.memo_hits_hcat += 1;
+                                    if (this.trace_memo)
+                                        this.memo_hit_regions[this.contextRegion(item)] += 1;
+                                    this.exec.tick = .{ .give = deck };
+                                    return;
+                                }
+                                this.stat.memo_misses += 1;
+                                this.stat.memo_misses_hcat += 1;
+                                if (this.trace_memo)
+                                    this.memo_miss_regions[this.contextRegion(item)] += 1;
+                            }
+
+                            this.exec.node = hcat.tail;
+                            this.exec.tick = .{ .eval = crux };
+                            this.exec.then = try Ktx5.make(.{
+                                .item = item,
+                                .frob = oper.frob,
+                                .origin_base = origin.base,
+                                .forced = origin.icky,
+                                .store = memoize_node,
+                                .then = then,
+                            }, this.heap);
+                            return;
+                        }
 
                         // We will start evaluating the hcat head.
                         this.exec.node = hcat.head;
@@ -740,8 +742,6 @@ pub const Loop = struct {
 
                             // If head has no valid layouts, the whole hcat has none
                             if (head_deck.item == 0x3FFFFFFF) {
-                                if (this.shouldMemoizeItem(cont.item, cont.forced))
-                                    try this.memo.put(cont.item, Deck.none);
                                 this.exec.tick = .{ .give = Deck.none };
                                 this.exec.then = cont.then;
                                 return;
@@ -847,8 +847,6 @@ pub const Loop = struct {
                         if (next_head.item == 0x3FFFFFFF) {
                             // No more heads - iteration complete
                             const result = this.exec.then.load(this.heap).iter.result_deck;
-                            if (result.cope == 0 and this.shouldMemoizeItem(cont.item, cont.forced))
-                                try this.memo.put(cont.item, result);
                             this.exec.tick = .{ .give = result };
                             this.exec.then = cont.then;
                             return;
@@ -901,16 +899,33 @@ pub const Loop = struct {
                         else
                             try this.wrap_deck(merged, oper.frob);
 
-                        // Memoize the result frontier
-                        if (result.cope == 0 and this.shouldMemoizeItem(cont.item, cont.forced))
-                            try this.memo.put(cont.item, result);
-
                         this.exec = .{
                             .tick = .{ .give = result },
                             .node = Node.halt,
                             .then = cont.then,
                         };
 
+                        return;
+                    },
+                    .memo => |cont| {
+                        const child = this.exec.tick.give;
+                        if (child.cope == 1 and cont.forced) {
+                            try this.forceCope(child);
+                            return;
+                        }
+
+                        const result = if (child.cope == 1)
+                            try this.delay(
+                                cont.item.node,
+                                parentCrux(cont.item, cont.origin_base),
+                            )
+                        else
+                            try this.wrap_deck(child, cont.frob);
+
+                        if (cont.store)
+                            try this.memo.put(cont.item, result);
+                        this.exec.tick = .{ .give = result };
+                        this.exec.then = cont.then;
                         return;
                     },
                     .none => {},
@@ -925,20 +940,6 @@ pub const Loop = struct {
 
     fn cost_le(a: Rank, b: Rank) bool {
         return a.toU64() <= b.toU64();
-    }
-
-    fn shouldMemoize(this: *@This(), node: Node, crux: Crux) bool {
-        if (!this.memoize or crux.icky or node.easy()) return false;
-        if (crux.last > this.limit or crux.base > this.limit) return false;
-        if (!this.memoize_forks and node.tag == .fork) return false;
-        return true;
-    }
-
-    fn shouldMemoizeItem(this: *@This(), item: Item, forced: bool) bool {
-        if (!this.memoize or forced or item.node.easy()) return false;
-        if (item.head > this.limit or item.base > this.limit) return false;
-        if (!this.memoize_forks and item.node.tag == .fork) return false;
-        return true;
     }
 
     fn wins(_: Cost, a: Gist, b: Gist) bool {
@@ -1104,7 +1105,7 @@ pub const Item = packed struct {
 pub const Memo = std.AutoHashMap(Item, Deck);
 
 pub const Kont = packed struct {
-    pub const Kind = enum(u3) { none, head, tail, fork, iter };
+    pub const Kind = enum(u3) { none, head, tail, fork, iter, memo };
 
     kind: Kind = .none,
     flip: u1 = 0,
@@ -1120,12 +1121,13 @@ pub const Kont = packed struct {
         return this.flip == flap;
     }
 
-    pub fn load(this: Kont, heap: *Heap) union(enum) { head: *Ktx1, tail: *Ktx2, fork: *Ktx3, iter: *Ktx4, none } {
+    pub fn load(this: Kont, heap: *Heap) union(enum) { head: *Ktx1, tail: *Ktx2, fork: *Ktx3, iter: *Ktx4, memo: *Ktx5, none } {
         return switch (this.kind) {
             .head => .{ .head = &heap.new().ktx1.list.items[this.item] },
             .tail => .{ .tail = &heap.new().ktx2.list.items[this.item] },
             .fork => .{ .fork = &heap.new().ktx3.list.items[this.item] },
             .iter => .{ .iter = &heap.new().ktx4.list.items[this.item] },
+            .memo => .{ .memo = &heap.new().ktx5.list.items[this.item] },
             .none => .none,
         };
     }
@@ -1140,6 +1142,7 @@ pub const Kont = packed struct {
             .tail => try heap.copy(Ktx2, &heap.old().ktx2, &heap.new().ktx2, word.item),
             .fork => try heap.copy(Ktx3, &heap.old().ktx3, &heap.new().ktx3, word.item),
             .iter => try heap.copy(Ktx4, &heap.old().ktx4, &heap.new().ktx4, word.item),
+            .memo => try heap.copy(Ktx5, &heap.old().ktx5, &heap.new().ktx5, word.item),
             else => return word,
         };
         return word.onto(@intCast(next));
@@ -1228,6 +1231,26 @@ pub const Ktx4 = struct {
         try heap.move(&k4.tail_node);
         try heap.move(&k4.item.node);
         try heap.move(&k4.then);
+    }
+};
+
+pub const Ktx5 = struct {
+    item: Item,
+    frob: Frob,
+    origin_base: u16,
+    forced: bool,
+    store: bool,
+    then: Kont,
+    _pad: u32 = 0,
+
+    pub fn make(k5: Ktx5, heap: *Heap) !Kont {
+        const idx = try heap.new().ktx5.push(heap.bank, k5);
+        return Kont.make(.memo, heap.tick, @intCast(idx));
+    }
+
+    pub fn drag(k5: *Ktx5, heap: *Heap) !void {
+        try heap.move(&k5.item.node);
+        try heap.move(&k5.then);
     }
 };
 
@@ -1336,7 +1359,6 @@ pub const PickOptions = struct {
     trace_gc: bool = false,
     trace_memo: bool = false,
     memoize: bool = true,
-    memoize_forks: bool = true,
 };
 
 pub const Best = struct {
@@ -1805,8 +1827,16 @@ pub const Tree = struct {
             },
             .hcat => |oper| blk: {
                 const pair = tree.heap.new().hcat.list.items[oper.item];
-                const head = try tree.flat(pair.head);
                 const tail = try tree.flat(pair.tail);
+                if (pair.head == Node.memo_mark) {
+                    var flat_frob = oper.frob;
+                    flat_frob.nest = 0;
+                    if (tail == pair.tail and flat_frob.nest == oper.frob.nest)
+                        break :blk doc;
+                    break :blk try tree.rawHcat(flat_frob, Node.memo_mark, tail);
+                }
+
+                const head = try tree.flat(pair.head);
                 const changed =
                     head.repr() != pair.head.repr() or
                     tail.repr() != pair.tail.repr();
@@ -1828,11 +1858,7 @@ pub const Tree = struct {
                     tail.repr() != pair.tail.repr();
                 if (!changed) break :blk doc;
 
-                const next: u21 = @intCast(try tree.heap.new().fork.push(
-                    tree.bank,
-                    .{ .head = head, .tail = tail },
-                ));
-                break :blk Node.fromOper(.fork, oper.frob, tree.heap.tick, next);
+                break :blk try tree.makePair(.fork, oper.frob, head, tail);
             },
             .cons => unreachable,
         };
@@ -1905,20 +1931,80 @@ pub const Tree = struct {
         }
     }
 
-    pub fn hcat(tree: *Tree, frob: Frob, lhs: Node, rhs: Node) !Node {
+    const initial_memo_weight: u3 = 6;
+
+    fn calcMemoWeight(weight: u3) u3 {
+        return if (weight == 0) initial_memo_weight else weight - 1;
+    }
+
+    fn memoWeight(tree: *Tree, node: Node) u3 {
+        return switch (node.look()) {
+            .hcat => |oper| blk: {
+                const pair = tree.heap.new().hcat.list.items[oper.item];
+                if (pair.head == Node.memo_mark) break :blk 0;
+                break :blk @min(
+                    calcMemoWeight(tree.memoWeight(pair.head)),
+                    calcMemoWeight(tree.memoWeight(pair.tail)),
+                );
+            },
+            .fork => |oper| blk: {
+                const pair = tree.heap.new().fork.list.items[oper.item];
+                break :blk @min(
+                    calcMemoWeight(tree.memoWeight(pair.head)),
+                    calcMemoWeight(tree.memoWeight(pair.tail)),
+                );
+            },
+            else => initial_memo_weight,
+        };
+    }
+
+    fn rawHcat(tree: *Tree, frob: Frob, lhs: Node, rhs: Node) !Node {
         const next: u21 = @intCast(try tree.heap.new().hcat.push(tree.bank, .{
             .head = lhs,
             .tail = rhs,
         }));
         return Node.fromOper(.hcat, frob, tree.heap.tick, next);
-        //        return try tree.hashcat(frob, lhs, rhs);
+    }
+
+    fn rawFork(tree: *Tree, frob: Frob, lhs: Node, rhs: Node) !Node {
+        const next: u21 = @intCast(try tree.heap.new().fork.push(tree.bank, .{
+            .head = lhs,
+            .tail = rhs,
+        }));
+        return Node.fromOper(.fork, frob, tree.heap.tick, next);
+    }
+
+    fn makePair(tree: *Tree, tag: Tag, frob: Frob, lhs: Node, rhs: Node) !Node {
+        std.debug.assert(tag == .hcat or tag == .fork);
+        const weight = @min(
+            calcMemoWeight(tree.memoWeight(lhs)),
+            calcMemoWeight(tree.memoWeight(rhs)),
+        );
+        const node = switch (tag) {
+            .hcat => try tree.rawHcat(frob, lhs, rhs),
+            .fork => try tree.rawFork(frob, lhs, rhs),
+            else => unreachable,
+        };
+        if (weight != 0) return node;
+        return tree.rawHcat(.{}, Node.memo_mark, node);
+    }
+
+    pub fn hcat(tree: *Tree, frob: Frob, lhs: Node, rhs: Node) !Node {
+        return tree.makePair(.hcat, frob, lhs, rhs);
     }
 
     pub fn hashcat(tree: *Tree, frob: Frob, head: Node, tail: Node) !Node {
         const pair = Pair{ .head = head, .tail = tail };
 
+        const weight = @min(
+            calcMemoWeight(tree.memoWeight(head)),
+            calcMemoWeight(tree.memoWeight(tail)),
+        );
+
         if (tree.hcatmemo.get(pair)) |idx| {
-            return Node.fromOper(.hcat, frob, tree.heap.tick, @intCast(idx));
+            const node = Node.fromOper(.hcat, frob, tree.heap.tick, @intCast(idx));
+            if (weight != 0) return node;
+            return tree.hashcat(.{}, Node.memo_mark, node);
         }
 
         const idx = tree.heap.new().hcat.list.items.len;
@@ -1929,7 +2015,8 @@ pub const Tree = struct {
 
         try tree.heap.new().hcat.list.append(tree.bank, pair);
         try tree.hcatmemo.put(pair, @intCast(idx));
-        return node;
+        if (weight != 0) return node;
+        return tree.hashcat(.{}, Node.memo_mark, node);
     }
 
     pub fn cons(tree: *Tree, frob: Frob, lhs: Node, rhs: Node) !Node {
@@ -1976,11 +2063,7 @@ pub const Tree = struct {
     }
 
     pub fn fork(tree: *Tree, lhs: Node, rhs: Node) !Node {
-        const next: u21 = @intCast(try tree.heap.new().fork.push(tree.bank, .{
-            .head = lhs,
-            .tail = rhs,
-        }));
-        return Node.fromOper(.fork, .{}, tree.heap.tick, next);
+        return tree.makePair(.fork, .{}, lhs, rhs);
     }
 
     /// Concatenate multiple nodes in sequence
@@ -2323,6 +2406,7 @@ pub const Half = struct {
     ktx2: Rack(Ktx2) = .empty,
     ktx3: Rack(Ktx3) = .empty,
     ktx4: Rack(Ktx4) = .empty,
+    ktx5: Rack(Ktx5) = .empty,
     duel: Rack(Duel) = .empty,
     cope: Rack(Cope) = .empty,
 
@@ -2334,6 +2418,7 @@ pub const Half = struct {
         this.ktx2.deinit(bank);
         this.ktx3.deinit(bank);
         this.ktx4.deinit(bank);
+        this.ktx5.deinit(bank);
         this.duel.deinit(bank);
         this.cope.deinit(bank);
     }
@@ -2346,6 +2431,7 @@ pub const Half = struct {
         this.ktx2.clearRetainingCapacity();
         this.ktx3.clearRetainingCapacity();
         this.ktx4.clearRetainingCapacity();
+        this.ktx5.clearRetainingCapacity();
         this.duel.clearRetainingCapacity();
         this.cope.clearRetainingCapacity();
     }
@@ -2358,6 +2444,7 @@ pub const Half = struct {
             this.ktx2.calm() and
             this.ktx3.calm() and
             this.ktx4.calm() and
+            this.ktx5.calm() and
             this.duel.calm() and
             this.cope.calm();
     }
@@ -2365,20 +2452,24 @@ pub const Half = struct {
     pub fn size(this: @This()) usize {
         return this.hcat.size() + this.fork.size() + this.cons.size() +
             this.ktx1.size() + this.ktx2.size() + this.ktx3.size() + this.ktx4.size() +
+            this.ktx5.size() +
             this.duel.size() + this.cope.size();
     }
 
     pub fn dump(this: @This()) void {
         std.debug.print(
-            "hcat {Bi:>6.0} fork {Bi:>6.0} cons {Bi:>6.0} ktx1 {Bi:>6.0} ktx3 {Bi:>6.0} ktx4 {Bi:>6.0} duel {Bi:>6.0}\n",
+            "hcat {Bi:>6.0} fork {Bi:>6.0} cons {Bi:>6.0} ktx1 {Bi:>6.0} ktx2 {Bi:>6.0} ktx3 {Bi:>6.0} ktx4 {Bi:>6.0} ktx5 {Bi:>6.0} duel {Bi:>6.0} cope {Bi:>6.0}\n",
             .{
                 this.hcat.size(),
                 this.fork.size(),
                 this.cons.size(),
                 this.ktx1.size(),
+                this.ktx2.size(),
                 this.ktx3.size(),
                 this.ktx4.size(),
+                this.ktx5.size(),
                 this.duel.size(),
+                this.cope.size(),
             },
         );
     }
@@ -2391,6 +2482,7 @@ pub const Half = struct {
         try this.ktx2.pull(heap);
         try this.ktx3.pull(heap);
         try this.ktx4.pull(heap);
+        try this.ktx5.pull(heap);
         try this.duel.pull(heap);
         try this.cope.pull(heap);
     }
@@ -2535,6 +2627,8 @@ pub const Node = packed struct {
     };
 
     pub const halt = Node.fromRune(0, 0);
+    /// Reserved empty rune used only as the head of an internal memo wrapper.
+    pub const memo_mark = Node.fromRune(0, 1);
 
     pub fn view(comptime T: type, this: Node) T {
         return @bitCast(this);
@@ -2834,6 +2928,67 @@ test "nest modifier survives fork elimination" {
 
     try expectEqual(4, result.idea.gist.last);
     try expectEmitString(&tree, "a\n   b", result.idea.node);
+}
+
+test "structural memo weight inserts a transparent checkpoint" {
+    var tree = Tree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    var doc = try tree.text("a");
+    for (0..5) |_| {
+        doc = try tree.hcat(.{}, doc, try tree.text("a"));
+        const pair = tree.heap.new().hcat.list.items[Node.view(Oper, doc).item];
+        try expect(pair.head != Node.memo_mark);
+    }
+    doc = try tree.hcat(.{}, doc, try tree.text("a"));
+
+    const wrapper = tree.heap.new().hcat.list.items[Node.view(Oper, doc).item];
+    try expectEqual(Node.memo_mark, wrapper.head);
+    try expectEqual(0, tree.memoWeight(doc));
+    try expectEmitString(&tree, "aaaaaaa", doc);
+}
+
+test "hash-consed hcats share structural memo checkpoints" {
+    var tree = Tree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    var doc = try tree.text("a");
+    for (0..5) |_| doc = try tree.hashcat(.{}, doc, try tree.text("a"));
+    const checkpoint = try tree.hashcat(.{}, doc, try tree.text("a"));
+    const same_checkpoint = try tree.hashcat(.{}, doc, try tree.text("a"));
+
+    try expectEqual(checkpoint, same_checkpoint);
+    const wrapper = tree.heap.new().hcat.list.items[Node.view(Oper, checkpoint).item];
+    try expectEqual(Node.memo_mark, wrapper.head);
+    try expectEmitString(&tree, "aaaaaaa", checkpoint);
+}
+
+test "shared memo checkpoint is reused" {
+    var tree = Tree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    var shared = try tree.text("a");
+    for (0..6) |_| shared = try tree.hcat(.{}, shared, try tree.text("a"));
+    const doc = try tree.fork(shared, shared);
+    const result = try tree.pick(std.testing.allocator, F1.init(80), doc);
+
+    try expectEqual(1, result.stat.memo_hits);
+    try expectEqual(1, result.stat.memo_entries);
+    try expectEmitString(&tree, "aaaaaaa", result.idea.node);
+}
+
+test "flatten preserves memo checkpoints" {
+    var tree = Tree.init(std.testing.allocator);
+    defer tree.deinit();
+
+    var doc = try tree.text("a");
+    for (0..5) |_| doc = try tree.hcat(.{}, doc, try tree.text("a"));
+    doc = try tree.hcat(.{}, doc, Node.nl);
+    const flattened = try tree.flat(doc);
+
+    const wrapper = tree.heap.new().hcat.list.items[Node.view(Oper, flattened).item];
+    try expectEqual(Node.memo_mark, wrapper.head);
+    try expectEmitString(&tree, "aaaaaa ", flattened);
 }
 
 test "computation width delays and forces unavoidable overflow" {

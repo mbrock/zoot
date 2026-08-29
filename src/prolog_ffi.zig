@@ -264,6 +264,7 @@ fn kontToTerm(kont: pretty.Kont, term: swi.term_t) void {
         .tail => "tail",
         .fork => "fork",
         .iter => "iter",
+        .memo => "memo",
     };
     _ = swi.PL_put_atom_chars(kind, kind_name.ptr);
     _ = swi.PL_put_int64(flip, @intCast(kont.flip));
@@ -804,6 +805,8 @@ fn termToKont(term: swi.term_t) !pretty.Kont {
         .iter
     else if (std.mem.eql(u8, kind_str, "fork"))
         .fork
+    else if (std.mem.eql(u8, kind_str, "memo"))
+        .memo
     else
         return error.BadKont;
 

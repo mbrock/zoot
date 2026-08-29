@@ -38,7 +38,6 @@ pub fn main() !void {
     var trace_gc = false;
     var trace_memo = false;
     var memoize = true;
-    var memoize_forks = true;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "trace")) {
             trace_gc = true;
@@ -46,8 +45,6 @@ pub fn main() !void {
             trace_memo = true;
         } else if (std.mem.eql(u8, arg, "nomemo")) {
             memoize = false;
-        } else if (std.mem.eql(u8, arg, "noforkmemo")) {
-            memoize_forks = false;
         } else if (std.mem.startsWith(u8, arg, "limit=")) {
             computation_width = try std.fmt.parseInt(u16, arg["limit=".len..], 10);
         } else {
@@ -118,7 +115,6 @@ pub fn main() !void {
         .trace_gc = trace_gc,
         .trace_memo = trace_memo,
         .memoize = memoize,
-        .memoize_forks = memoize_forks,
     });
     const t1 = time.lap();
 
