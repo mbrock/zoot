@@ -3,4 +3,5 @@ zig-out
 *.dot
 *.json
 /.heapdumps/
+/.profiles/
 .amp/portals/*
