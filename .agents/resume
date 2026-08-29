@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+zig_version="0.15.1"
+zig_binary="$HOME/.local/share/zig/${zig_version}/zig"
+
+if [[ ! -x "$zig_binary" ]] || [[ "$($zig_binary version)" != "$zig_version" ]]; then
+  echo "Zig $zig_version is missing; rerun .agents/setup" >&2
+  exit 1
+fi
+
+mkdir -p "$HOME/.local/bin"
+ln -sfn "$zig_binary" "$HOME/.local/bin/zig"

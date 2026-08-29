@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+zig_version="0.15.1"
+zig_sha256="c61c5da6edeea14ca51ecd5e4520c6f4189ef5250383db33d01848293bfafe05"
+zig_archive="zig-x86_64-linux-${zig_version}.tar.xz"
+zig_url="https://ziglang.org/download/${zig_version}/${zig_archive}"
+install_root="$HOME/.local/share/zig/${zig_version}"
+
+started_at=$SECONDS
+printf '[orb setup] Ensuring Zig %s is installed\n' "$zig_version"
+
+missing_packages=()
+command -v curl >/dev/null 2>&1 || missing_packages+=(curl ca-certificates)
+command -v tar >/dev/null 2>&1 || missing_packages+=(tar)
+command -v xz >/dev/null 2>&1 || missing_packages+=(xz-utils)
+command -v sha256sum >/dev/null 2>&1 || missing_packages+=(coreutils)
+
+if ((${#missing_packages[@]})); then
+  printf '[orb setup] Installing system prerequisites: %s\n' "${missing_packages[*]}"
+  sudo_command=()
+  if ((EUID != 0)); then
+    sudo_command=(sudo)
+  fi
+  "${sudo_command[@]}" apt-get update
+  "${sudo_command[@]}" apt-get install -y "${missing_packages[@]}"
+fi
+
+if [[ ! -x "$install_root/zig" ]] || [[ "$($install_root/zig version)" != "$zig_version" ]]; then
+  temp_dir="$(mktemp -d)"
+  trap 'rm -rf -- "$temp_dir"' EXIT
+
+  printf '[orb setup] Downloading %s\n' "$zig_url"
+  curl --fail --location --silent --show-error \
+    --output "$temp_dir/$zig_archive" "$zig_url"
+  printf '%s  %s\n' "$zig_sha256" "$temp_dir/$zig_archive" | sha256sum --check --status
+  tar -xJf "$temp_dir/$zig_archive" -C "$temp_dir"
+
+  mkdir -p "$HOME/.local/share/zig"
+  rm -rf -- "$install_root"
+  mv -- "$temp_dir/zig-x86_64-linux-${zig_version}" "$install_root"
+fi
+
+mkdir -p "$HOME/.local/bin"
+ln -sfn "$install_root/zig" "$HOME/.local/bin/zig"
+
+profile_marker="# zoot orb toolchain"
+if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
+  cat >> "$HOME/.bash_profile" <<'EOF'
+
+# zoot orb toolchain
+case ":$PATH:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) export PATH="$HOME/.local/bin:$PATH" ;;
+esac
+EOF
+fi
+
+printf '[orb setup] Warming Zig build cache\n'
+"$install_root/zig" build
+"$install_root/zig" build test
+
+printf '[orb setup] Complete in %ss (Zig %s)\n' "$((SECONDS - started_at))" \
+  "$("$install_root/zig" version)"
