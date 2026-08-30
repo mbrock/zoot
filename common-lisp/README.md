@@ -11,6 +11,8 @@ Zig's compact representation:
 - each document kind has its own structure type, sharing memo state through a
   base structure; evaluator and renderer semantics use generic dispatch;
 - Pareto frontiers are unrestricted adjustable vectors;
+- evaluator results use vectors directly for frontiers and functions directly
+  for tainted promises, with generic methods handling their combinations;
 - dominance compares final column and lexicographic `(overflow, height)` cost;
 - both linear-overflow F1 and squared-overflow F2 costs are available;
 - text cost is an actual function value and may be dynamically overridden by

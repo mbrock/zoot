@@ -223,46 +223,47 @@ last column and rank. Frontiers are unrestricted adjustable vectors."
             do (frontier-add result candidate)))
     (sort result #'> :key #'candidate-last)))
 
-(defstruct (evaluation (:constructor %evaluation (kind value)))
-  (kind :frontier :type (member :frontier :tainted) :read-only t)
-  ;; A frontier vector, or a thunk that returns one candidate.
-  (value #() :type (or vector function) :read-only t))
-
-(defun frontier-evaluation (frontier)
-  (%evaluation :frontier frontier))
+(deftype evaluation () '(or vector function))
 
 (defun tainted-evaluation (evaluator thunk)
   (incf (statistics-taints-deferred (evaluator-statistics evaluator)))
-  (%evaluation
-   :tainted
-   (lambda ()
-     (incf (statistics-taints-forced (evaluator-statistics evaluator)))
-     (funcall thunk))))
+  (lambda ()
+    (incf (statistics-taints-forced (evaluator-statistics evaluator)))
+    (funcall thunk)))
 
 (defun evaluation-empty-p (evaluation)
-  (and (eq :frontier (evaluation-kind evaluation))
-       (zerop (length (evaluation-value evaluation)))))
+  (and (vectorp evaluation) (zerop (length evaluation))))
 
-(defun force-evaluation (evaluation)
-  (ecase (evaluation-kind evaluation)
-    (:tainted (funcall (evaluation-value evaluation)))
-    (:frontier
-     (let ((frontier (evaluation-value evaluation)))
-       (when (zerop (length frontier))
-         (error "Cannot choose from an empty frontier"))
-       (aref frontier 0)))))
+(defgeneric force-evaluation (evaluation))
 
-(defun merge-evaluations (left right)
-  "Merge like Pretty Expressive's measure sets: a normal frontier always
+(defmethod force-evaluation ((evaluation function))
+  (funcall evaluation))
+
+(defmethod force-evaluation ((evaluation vector))
+  (when (zerop (length evaluation))
+    (error "Cannot choose from an empty frontier"))
+  (aref evaluation 0))
+
+(defgeneric merge-evaluations (left right)
+  (:documentation
+   "Merge like Pretty Expressive's measure sets: a normal frontier always
 wins over taint, since taint means that computation has left the bounded
-region. If both sides are tainted, retain the left promise."
-  (cond
-    ((evaluation-empty-p left) right)
-    ((evaluation-empty-p right) left)
-    ((eq :tainted (evaluation-kind right)) left)
-    ((eq :tainted (evaluation-kind left)) right)
-    (t (frontier-evaluation
-        (frontier-union (evaluation-value left) (evaluation-value right))))))
+region. If both sides are tainted, retain the left promise."))
+
+(defmethod merge-evaluations ((left vector) (right vector))
+  (cond ((evaluation-empty-p left) right)
+        ((evaluation-empty-p right) left)
+        (t (frontier-union left right))))
+
+(defmethod merge-evaluations ((left vector) (right function))
+  (if (evaluation-empty-p left) right left))
+
+(defmethod merge-evaluations ((left function) (right vector))
+  (if (evaluation-empty-p right) left right))
+
+(defmethod merge-evaluations ((left function) (right function))
+  (declare (ignore right))
+  left)
 
 ;;; Recursive evaluator
 
@@ -291,9 +292,13 @@ region. If both sides are tainted, retain the left promise."
     (incf (gethash length histogram 0)))
   frontier)
 
-(defun note-evaluation (evaluator evaluation)
-  (when (eq :frontier (evaluation-kind evaluation))
-    (note-frontier evaluator (evaluation-value evaluation)))
+(defgeneric note-evaluation (evaluator evaluation))
+
+(defmethod note-evaluation (evaluator (evaluation vector))
+  (note-frontier evaluator evaluation))
+
+(defmethod note-evaluation (evaluator (evaluation function))
+  (declare (ignore evaluator))
   evaluation)
 
 (defun document-context-table (evaluator document)
@@ -358,15 +363,14 @@ region. If both sides are tainted, retain the left promise."
   (declare (ignore base))
   (let* ((string (text-document-text document))
          (length (length string)))
-    (frontier-evaluation
-     (vector
-      (%candidate document (+ last length)
-                  (text-rank (evaluator-cost evaluator) last length))))))
+    (vector
+     (%candidate document (+ last length)
+                 (text-rank (evaluator-cost evaluator) last length)))))
 
 (defmethod evaluate-document
     (evaluator (document newline-document) last base)
   (declare (ignore evaluator last))
-  (frontier-evaluation (vector (%candidate document base (%rank 0 1)))))
+  (vector (%candidate document base (%rank 0 1))))
 
 (defmethod evaluate-document
     (evaluator (document choice-document) last base)
@@ -425,16 +429,17 @@ region. If both sides are tainted, retain the left promise."
    (candidate-last candidate)
    (candidate-rank candidate)))
 
-(defun wrap-evaluation (evaluator kind amount evaluation)
-  (ecase (evaluation-kind evaluation)
-    (:frontier
-     (frontier-evaluation
-      (wrap-frontier kind amount (evaluation-value evaluation))))
-    (:tainted
-     (tainted-evaluation
-      evaluator
-      (lambda ()
-        (wrap-candidate kind amount (force-evaluation evaluation)))))))
+(defgeneric wrap-evaluation (evaluator kind amount evaluation))
+
+(defmethod wrap-evaluation (evaluator kind amount (evaluation vector))
+  (declare (ignore evaluator))
+  (wrap-frontier kind amount evaluation))
+
+(defmethod wrap-evaluation (evaluator kind amount (evaluation function))
+  (tainted-evaluation
+   evaluator
+   (lambda ()
+     (wrap-candidate kind amount (force-evaluation evaluation)))))
 
 (defun concatenate-candidates (left right)
   (%candidate
@@ -442,42 +447,55 @@ region. If both sides are tainted, retain the left promise."
    (candidate-last right)
    (rank+ (candidate-rank left) (candidate-rank right))))
 
+(defgeneric concatenate-right-evaluation (evaluator left right))
+
+(defmethod concatenate-right-evaluation
+    (evaluator left (right vector))
+  (declare (ignore evaluator))
+  (let ((result (empty-frontier)))
+    (loop for candidate across right
+          do (frontier-add result (concatenate-candidates left candidate)))
+    (sort result #'> :key #'candidate-last)))
+
+(defmethod concatenate-right-evaluation
+    (evaluator left (right function))
+  (tainted-evaluation
+   evaluator
+   (lambda ()
+     (concatenate-candidates left (force-evaluation right)))))
+
 (defun concatenate-right (evaluator document left base)
-  (let ((right
-          (evaluate evaluator (concatenation-document-right document)
-                    (candidate-last left) base)))
-    (ecase (evaluation-kind right)
-      (:frontier
-       (let ((result (empty-frontier)))
-         (loop for candidate across (evaluation-value right)
-               do (frontier-add result
-                                (concatenate-candidates left candidate)))
-         (frontier-evaluation (sort result #'> :key #'candidate-last))))
-      (:tainted
-       (tainted-evaluation
-        evaluator
-        (lambda ()
-          (concatenate-candidates left (force-evaluation right))))))))
+  (concatenate-right-evaluation
+   evaluator left
+   (evaluate evaluator (concatenation-document-right document)
+             (candidate-last left) base)))
+
+(defgeneric concatenate-left-evaluation
+    (evaluator document base left))
+
+(defmethod concatenate-left-evaluation
+    (evaluator document base (left function))
+  (tainted-evaluation
+   evaluator
+   (lambda ()
+     (let* ((left-candidate (force-evaluation left))
+            (right (concatenate-right evaluator document left-candidate base)))
+       (force-evaluation right)))))
+
+(defmethod concatenate-left-evaluation
+    (evaluator document base (left vector))
+  (let ((result (empty-frontier)))
+    (loop for candidate across left
+          do (setf result
+                   (merge-evaluations
+                    result
+                    (concatenate-right evaluator document candidate base))))
+    result))
 
 (defun evaluate-concatenation (evaluator document last base)
-  (let ((left
-          (evaluate evaluator (concatenation-document-left document) last base)))
-    (ecase (evaluation-kind left)
-      (:tainted
-       (tainted-evaluation
-        evaluator
-        (lambda ()
-          (let* ((left-candidate (force-evaluation left))
-                 (right (concatenate-right evaluator document left-candidate base)))
-            (force-evaluation right)))))
-      (:frontier
-       (let ((result (frontier-evaluation (empty-frontier))))
-         (loop for candidate across (evaluation-value left)
-               do (setf result
-                        (merge-evaluations
-                         result
-                         (concatenate-right evaluator document candidate base))))
-         result)))))
+  (concatenate-left-evaluation
+   evaluator document base
+   (evaluate evaluator (concatenation-document-left document) last base)))
 
 (defstruct (result (:constructor %result
                        (candidate frontier statistics tainted-p)))
@@ -494,11 +512,11 @@ candidate, as in Pretty Expressive and recursive.zig."
         (*cost-measure* (or *cost-measure* (cost-measure cost))))
     (unwind-protect
          (let* ((evaluation (evaluate evaluator document 0 0))
-                (tainted-p (eq :tainted (evaluation-kind evaluation)))
+                (tainted-p (functionp evaluation))
                 (frontier
                   (if tainted-p
                       (vector (force-evaluation evaluation))
-                      (evaluation-value evaluation)))
+                      evaluation))
                 (statistics (evaluator-statistics evaluator)))
            (when (zerop (length frontier))
              (error "Document has no layouts"))
