@@ -22,16 +22,7 @@
   "Number of structural levels between memo checkpoints, as in the OCaml
 reference implementation (its PARAM_MEMO_LIMIT is 7, with initial weight 6).")
 
-(defstruct (document
-            (:constructor %document
-                (kind &key text left right child amount
-                           (memo-weight +initial-memo-weight+))))
-  (kind nil :type symbol :read-only t)
-  (text nil :type (or null string) :read-only t)
-  (left nil :type (or null document) :read-only t)
-  (right nil :type (or null document) :read-only t)
-  (child nil :type (or null document) :read-only t)
-  (amount 0 :type (integer 0) :read-only t)
+(defstruct (document (:constructor nil))
   (memo-weight +initial-memo-weight+
                :type (integer 0 6)
                :read-only t)
@@ -39,6 +30,38 @@ reference implementation (its PARAM_MEMO_LIMIT is 7, with initial weight 6).")
   ;; picks to reuse its allocation, but its entries never cross a pick.
   (memo-owner nil)
   (memo-table nil :type (or null hash-table)))
+
+(defstruct (text-document
+            (:include document)
+            (:constructor %text-document (text)))
+  (text "" :type string :read-only t))
+
+(defstruct (newline-document
+            (:include document)
+            (:constructor %newline-document ())))
+
+(defstruct (concatenation-document
+            (:include document)
+            (:constructor %concatenation-document (left right memo-weight)))
+  (left nil :type document :read-only t)
+  (right nil :type document :read-only t))
+
+(defstruct (choice-document
+            (:include document)
+            (:constructor %choice-document (left right memo-weight)))
+  (left nil :type document :read-only t)
+  (right nil :type document :read-only t))
+
+(defstruct (nest-document
+            (:include document)
+            (:constructor %nest-document (amount child memo-weight)))
+  (amount 0 :type (integer 0) :read-only t)
+  (child nil :type document :read-only t))
+
+(defstruct (align-document
+            (:include document)
+            (:constructor %align-document (child memo-weight)))
+  (child nil :type document :read-only t))
 
 (defun next-memo-weight (document)
   (let ((weight (document-memo-weight document)))
@@ -49,42 +72,33 @@ reference implementation (its PARAM_MEMO_LIMIT is 7, with initial weight 6).")
   (check-type string string)
   (when (find #\Newline string)
     (error "TEXT terminals cannot contain newlines: ~S" string))
-  (%document :text :text string))
+  (%text-document string))
 
-(defparameter +newline+ (%document :newline)
+(defparameter +newline+ (%newline-document)
   "A hard newline. Its following indentation is determined by NEST and ALIGN.")
 
 (defun concatenate (left right)
   "Unaligned concatenation: place RIGHT immediately after LEFT."
-  (%document :concatenate
-             :left left
-             :right right
-             :memo-weight (min (next-memo-weight left)
-                               (next-memo-weight right))))
+  (%concatenation-document
+   left right
+   (min (next-memo-weight left) (next-memo-weight right))))
 
 (defun choice (left right)
   "An arbitrary choice between two documents."
-  (%document :choice
-             :left left
-             :right right
-             :memo-weight (min (next-memo-weight left)
-                               (next-memo-weight right))))
+  (%choice-document
+   left right
+   (min (next-memo-weight left) (next-memo-weight right))))
 
 (defun nest (amount document)
   "Indent lines after the first by AMOUNT columns."
   (check-type amount (integer 0))
   (if (zerop amount)
       document
-      (%document :nest
-                 :amount amount
-                 :child document
-                 :memo-weight (next-memo-weight document))))
+      (%nest-document amount document (next-memo-weight document))))
 
 (defun align (document)
   "Use the current column as DOCUMENT's indentation base."
-  (%document :align
-             :child document
-             :memo-weight (next-memo-weight document)))
+  (%align-document document (next-memo-weight document)))
 
 (defun cat (&rest documents)
   (reduce #'concatenate documents :initial-value (text "")))
@@ -97,20 +111,22 @@ reference implementation (its PARAM_MEMO_LIMIT is 7, with initial weight 6).")
               (rest documents)
               :initial-value (first documents))))
 
-(defun flatten (document)
-  "Replace newlines with spaces and recursively flatten both choice branches."
-  (case (document-kind document)
-    (:text document)
-    (:newline (text " "))
-    (:concatenate
-     (concatenate (flatten (document-left document))
-                  (flatten (document-right document))))
-    (:choice
-     (choice (flatten (document-left document))
-             (flatten (document-right document))))
-    (:nest (flatten (document-child document)))
-    (:align (align (flatten (document-child document))))
-    (otherwise (error "Unknown document kind ~S" (document-kind document)))))
+(defgeneric flatten (document)
+  (:documentation
+   "Replace newlines with spaces and recursively flatten both choice branches."))
+
+(defmethod flatten ((document text-document)) document)
+(defmethod flatten ((document newline-document)) (text " "))
+(defmethod flatten ((document concatenation-document))
+  (concatenate (flatten (concatenation-document-left document))
+               (flatten (concatenation-document-right document))))
+(defmethod flatten ((document choice-document))
+  (choice (flatten (choice-document-left document))
+          (flatten (choice-document-right document))))
+(defmethod flatten ((document nest-document))
+  (flatten (nest-document-child document)))
+(defmethod flatten ((document align-document))
+  (align (flatten (align-document-child document))))
 
 (defun group (document)
   "Choose between DOCUMENT and its flattened form."
@@ -321,12 +337,60 @@ region. If both sides are tainted, retain the left promise."
             (incf (statistics-memo-entries
                    (evaluator-statistics evaluator))))))))
 
-(defun exceeds-computation-limit-p (evaluator document last base)
+(defgeneric exceeds-computation-limit-p (evaluator document last base))
+
+(defmethod exceeds-computation-limit-p
+    (evaluator (document document) last base)
+  (let ((limit (cost-limit (evaluator-cost evaluator))))
+    (or (> base limit) (> last limit))))
+
+(defmethod exceeds-computation-limit-p
+    (evaluator (document text-document) last base)
   (let ((limit (cost-limit (evaluator-cost evaluator))))
     (or (> base limit)
-        (if (eq :text (document-kind document))
-            (> (+ last (length (document-text document))) limit)
-            (> last limit)))))
+        (> (+ last (length (text-document-text document))) limit))))
+
+(defgeneric evaluate-document (evaluator document last base)
+  (:documentation "Evaluate one document node after memo and taint checks."))
+
+(defmethod evaluate-document
+    (evaluator (document text-document) last base)
+  (declare (ignore base))
+  (let* ((string (text-document-text document))
+         (length (length string)))
+    (frontier-evaluation
+     (vector
+      (%candidate document (+ last length)
+                  (text-rank (evaluator-cost evaluator) last length))))))
+
+(defmethod evaluate-document
+    (evaluator (document newline-document) last base)
+  (declare (ignore evaluator last))
+  (frontier-evaluation (vector (%candidate document base (%rank 0 1)))))
+
+(defmethod evaluate-document
+    (evaluator (document choice-document) last base)
+  (merge-evaluations
+   (evaluate evaluator (choice-document-left document) last base)
+   (evaluate evaluator (choice-document-right document) last base)))
+
+(defmethod evaluate-document
+    (evaluator (document nest-document) last base)
+  (let ((amount (nest-document-amount document)))
+    (wrap-evaluation
+     evaluator :nest amount
+     (evaluate evaluator (nest-document-child document) last (+ base amount)))))
+
+(defmethod evaluate-document
+    (evaluator (document align-document) last base)
+  (declare (ignore base))
+  (wrap-evaluation
+   evaluator :align 0
+   (evaluate evaluator (align-document-child document) last last)))
+
+(defmethod evaluate-document
+    (evaluator (document concatenation-document) last base)
+  (evaluate-concatenation evaluator document last base))
 
 (defun evaluate (evaluator document last base)
   (memoized
@@ -336,36 +400,7 @@ region. If both sides are tainted, retain the left promise."
      (labels ((core ()
                 (note-evaluation
                  evaluator
-                 (case (document-kind document)
-                   (:text
-                    (let* ((string (document-text document))
-                           (length (length string)))
-                      (frontier-evaluation
-                       (vector
-                        (%candidate
-                         document (+ last length)
-                         (text-rank (evaluator-cost evaluator) last length))))))
-                   (:newline
-                    (frontier-evaluation
-                     (vector (%candidate document base (%rank 0 1)))))
-                   (:choice
-                    (merge-evaluations
-                     (evaluate evaluator (document-left document) last base)
-                     (evaluate evaluator (document-right document) last base)))
-                   (:nest
-                    (wrap-evaluation
-                     evaluator :nest (document-amount document)
-                     (evaluate evaluator (document-child document) last
-                               (+ base (document-amount document)))))
-                   (:align
-                    (wrap-evaluation
-                     evaluator :align 0
-                     (evaluate evaluator (document-child document) last last)))
-                   (:concatenate
-                    (evaluate-concatenation evaluator document last base))
-                   (otherwise
-                    (error "Unknown document kind ~S"
-                           (document-kind document)))))))
+                 (evaluate-document evaluator document last base))))
        (if (exceeds-computation-limit-p evaluator document last base)
            (tainted-evaluation evaluator
                                (lambda () (force-evaluation (core))))
@@ -376,9 +411,8 @@ region. If both sides are tainted, retain the left promise."
        (lambda (candidate)
          (%candidate
           (ecase kind
-            (:nest (%document :nest :amount amount
-                              :child (candidate-layout candidate)))
-            (:align (%document :align :child (candidate-layout candidate))))
+            (:nest (nest amount (candidate-layout candidate)))
+            (:align (align (candidate-layout candidate))))
           (candidate-last candidate)
           (candidate-rank candidate)))
        frontier))
@@ -386,8 +420,8 @@ region. If both sides are tainted, retain the left promise."
 (defun wrap-candidate (kind amount candidate)
   (%candidate
    (ecase kind
-     (:nest (%document :nest :amount amount :child (candidate-layout candidate)))
-     (:align (%document :align :child (candidate-layout candidate))))
+     (:nest (nest amount (candidate-layout candidate)))
+     (:align (align (candidate-layout candidate))))
    (candidate-last candidate)
    (candidate-rank candidate)))
 
@@ -404,15 +438,13 @@ region. If both sides are tainted, retain the left promise."
 
 (defun concatenate-candidates (left right)
   (%candidate
-   (%document :concatenate
-              :left (candidate-layout left)
-              :right (candidate-layout right))
+   (concatenate (candidate-layout left) (candidate-layout right))
    (candidate-last right)
    (rank+ (candidate-rank left) (candidate-rank right))))
 
 (defun concatenate-right (evaluator document left base)
   (let ((right
-          (evaluate evaluator (document-right document)
+          (evaluate evaluator (concatenation-document-right document)
                     (candidate-last left) base)))
     (ecase (evaluation-kind right)
       (:frontier
@@ -428,7 +460,8 @@ region. If both sides are tainted, retain the left promise."
           (concatenate-candidates left (force-evaluation right))))))))
 
 (defun evaluate-concatenation (evaluator document last base)
-  (let ((left (evaluate evaluator (document-left document) last base)))
+  (let ((left
+          (evaluate evaluator (concatenation-document-left document) last base)))
     (ecase (evaluation-kind left)
       (:tainted
        (tainted-evaluation
@@ -479,27 +512,39 @@ candidate, as in Pretty Expressive and recursive.zig."
 
 ;;; Rendering
 
-(defun render-layout (document stream last base)
-  (case (document-kind document)
-    (:text
-     (write-string (document-text document) stream)
-     (+ last (length (document-text document))))
-    (:newline
-     (terpri stream)
-     (dotimes (index base) (declare (ignore index)) (write-char #\Space stream))
-     base)
-    (:concatenate
-     (render-layout
-      (document-right document) stream
-      (render-layout (document-left document) stream last base)
-      base))
-    (:nest
-     (render-layout (document-child document) stream last
-                    (+ base (document-amount document))))
-    (:align
-     (render-layout (document-child document) stream last last))
-    (:choice (error "Cannot render an unresolved choice"))
-    (otherwise (error "Unknown document kind ~S" (document-kind document)))))
+(defgeneric render-layout (document stream last base))
+
+(defmethod render-layout ((document text-document) stream last base)
+  (declare (ignore base))
+  (write-string (text-document-text document) stream)
+  (+ last (length (text-document-text document))))
+
+(defmethod render-layout ((document newline-document) stream last base)
+  (declare (ignore last))
+  (terpri stream)
+  (dotimes (index base)
+    (declare (ignore index))
+    (write-char #\Space stream))
+  base)
+
+(defmethod render-layout
+    ((document concatenation-document) stream last base)
+  (render-layout
+   (concatenation-document-right document) stream
+   (render-layout (concatenation-document-left document) stream last base)
+   base))
+
+(defmethod render-layout ((document nest-document) stream last base)
+  (render-layout (nest-document-child document) stream last
+                 (+ base (nest-document-amount document))))
+
+(defmethod render-layout ((document align-document) stream last base)
+  (declare (ignore base))
+  (render-layout (align-document-child document) stream last last))
+
+(defmethod render-layout ((document choice-document) stream last base)
+  (declare (ignore stream last base))
+  (error "Cannot render an unresolved choice"))
 
 (defun render (candidate &optional stream)
   "Render CANDIDATE. Return a string when STREAM is omitted."

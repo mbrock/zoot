@@ -8,7 +8,8 @@ evaluator. It follows the arbitrary-choice and concatenation semantics from
 The implementation is intentionally a reference animal rather than a port of
 Zig's compact representation:
 
-- documents and resolved layouts are immutable structures;
+- each document kind has its own structure type, sharing memo state through a
+  base structure; evaluator and renderer semantics use generic dispatch;
 - Pareto frontiers are unrestricted adjustable vectors;
 - dominance compares final column and lexicographic `(overflow, height)` cost;
 - both linear-overflow F1 and squared-overflow F2 costs are available;

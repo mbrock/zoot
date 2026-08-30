@@ -23,6 +23,16 @@
   (check overflow (rank-overflow (candidate-rank candidate)) "overflow differs")
   (check height (rank-height (candidate-rank candidate)) "height differs"))
 
+;;; Document kinds are distinct structure types under the common base type.
+
+(check t (typep (text "x") 'zoot::text-document))
+(check t (typep +newline+ 'zoot::newline-document))
+(check t (typep (concatenate (text "a") (text "b"))
+                'zoot::concatenation-document))
+(check t (typep (choice (text "a") (text "b")) 'zoot::choice-document))
+(check t (typep (nest 2 (cat +newline+ (text "x"))) 'zoot::nest-document))
+(check t (typep (align (cat +newline+ (text "x"))) 'zoot::align-document))
+
 ;;; These cases mirror the semantic tests in src/pretty.zig.
 
 (let* ((inline (cat (text "foo") (text " ") (text "bar")))
