@@ -45,7 +45,7 @@ reference implementation (its PARAM_MEMO_LIMIT is 7, with initial weight 6).")
   ;; Each checkpoint owns its context table for the document's lifetime.
   ;; Entries are keyed by evaluation context under one cost configuration,
   ;; so a document belongs to the configuration it is first picked with.
-  (contexts (make-hash-table :test #'eql) :type hash-table :read-only t)
+  (contexts (make-hash-table :test #'eq) :type hash-table :read-only t)
   (child nil :read-only t))
 
 (deftype document ()
@@ -223,12 +223,6 @@ nonnegative integer. Newline count remains the secondary rank component.")
   (first nil :type candidate :read-only t)
   (second nil :type candidate :read-only t))
 
-(defun make-duel (left right)
-  (declare (type candidate left right))
-  (if (> (candidate-last left) (candidate-last right))
-      (%duel left right)
-      (%duel right left)))
-
 (defstruct statistics
   (evaluations 0 :type nonnegative-fixnum)
   (memo-hits 0 :type nonnegative-fixnum)
@@ -294,7 +288,69 @@ nonnegative integer. Newline count remains the secondary rank component.")
   (base 0 :type nonnegative-fixnum :read-only t)
   (evaluation nil :type t :read-only t))
 
-(deftype evaluation () '(or null candidate duel vector tainted-context))
+(deftype evaluation ()
+  '(or null candidate duel simple-vector tainted-context))
+
+;;; Frontier shapes
+;;;
+;;; A normal, non-empty evaluation is a Pareto frontier of one, two, or
+;;; many candidates, ordered by strictly decreasing final column and so
+;;; by strictly increasing rank. These helpers treat the three
+;;; representations uniformly.
+
+(declaim (inline frontier-length frontier-ref))
+
+(defun frontier-length (frontier)
+  (etypecase frontier
+    (candidate 1)
+    (duel 2)
+    (simple-vector (length frontier))))
+
+(defun frontier-ref (frontier index)
+  (declare (type nonnegative-fixnum index))
+  (etypecase frontier
+    (candidate frontier)
+    (duel (if (zerop index) (duel-first frontier) (duel-second frontier)))
+    (simple-vector (svref frontier index))))
+
+(defmacro map-frontier ((candidate frontier) &body body)
+  "Rebuild FRONTIER, replacing each CANDIDATE with the value of BODY.
+Purely syntactic so that no closure is ever allocated."
+  (let ((shape (gensym "FRONTIER"))
+        (index (gensym "INDEX"))
+        (result (gensym "RESULT")))
+    `(let ((,shape ,frontier))
+       (flet ((transform (,candidate) ,@body))
+         (declare (inline transform))
+         (etypecase ,shape
+           (candidate (transform ,shape))
+           (duel (%duel (transform (duel-first ,shape))
+                        (transform (duel-second ,shape))))
+           (simple-vector
+            (let ((,result (make-array (length ,shape))))
+              (dotimes (,index (length ,shape) ,result)
+                (setf (svref ,result ,index)
+                      (transform (svref ,shape ,index)))))))))))
+
+(defmacro do-frontier ((candidate frontier) &body body)
+  "Execute BODY for each CANDIDATE, in decreasing final column order."
+  (let ((shape (gensym "FRONTIER")) (index (gensym "INDEX")))
+    `(let ((,shape ,frontier))
+       (etypecase ,shape
+         (candidate (let ((,candidate ,shape)) ,@body))
+         (duel (let ((,candidate (duel-first ,shape))) ,@body)
+               (let ((,candidate (duel-second ,shape))) ,@body))
+         (simple-vector
+          (dotimes (,index (length ,shape))
+            (let ((,candidate (svref ,shape ,index))) ,@body)))))))
+
+(defun finalize-frontier (buffer count)
+  "Pack COUNT ordered candidates from BUFFER into the smallest shape."
+  (declare (type simple-vector buffer) (type nonnegative-fixnum count))
+  (case count
+    (1 (svref buffer 0))
+    (2 (%duel (svref buffer 0) (svref buffer 1)))
+    (t (subseq buffer 0 count))))
 
 (defun tainted-evaluation (context)
   (declare (type tainted-context context))
@@ -336,146 +392,59 @@ nonnegative integer. Newline count remains the secondary rank component.")
                        (tainted-left-context-base evaluation))))
           (force-evaluation right)))))))
 
+(defun merge-frontiers (left right)
+  "The ordered Pareto merge from Pretty Expressive: walk both frontiers
+in decreasing final column order, dropping dominated candidates. Linear,
+because a candidate that survives the other side's head cannot be
+dominated by anything behind that head."
+  (let* ((left-length (frontier-length left))
+         (right-length (frontier-length right))
+         (total (+ left-length right-length))
+         (small (make-array 8))
+         (buffer (if (<= total 8) small (make-array total)))
+         (count 0)
+         (i 0)
+         (j 0))
+    (declare (dynamic-extent small)
+             (type nonnegative-fixnum count i j))
+    (flet ((emit (candidate)
+             (setf (svref buffer count) candidate)
+             (incf count)))
+      (loop while (and (< i left-length) (< j right-length))
+            do (let ((a (frontier-ref left i))
+                     (b (frontier-ref right j)))
+                 ;; On equal points the left candidate is retained,
+                 ;; matching ordered incremental insertion.
+                 (cond ((dominates-p a b) (incf j))
+                       ((dominates-p b a) (incf i))
+                       ((> (candidate-last a) (candidate-last b))
+                        (emit a) (incf i))
+                       (t (emit b) (incf j)))))
+      (loop while (< i left-length)
+            do (emit (frontier-ref left i)) (incf i))
+      (loop while (< j right-length)
+            do (emit (frontier-ref right j)) (incf j)))
+    (finalize-frontier buffer count)))
+
 (defun merge-evaluations (left right)
   "Merge like Pretty Expressive's measure sets: a normal frontier always
 wins over taint, since taint means that computation has left the bounded
 region. If both sides are tainted, retain the left promise."
   (declare (type evaluation left right))
-  (labels ((merge-candidates (left right)
-             (declare (type candidate left right))
-             (cond ((dominates-p left right) left)
-                   ((dominates-p right left) right)
-                   (t (make-duel left right))))
-           (merge-candidate-duel (candidate duel)
-             (declare (type candidate candidate) (type duel duel))
-             (let ((first (duel-first duel))
-                   (second (duel-second duel)))
-               (cond ((or (dominates-p first candidate)
-                          (dominates-p second candidate))
-                      duel)
-                     ((and (dominates-p candidate first)
-                           (dominates-p candidate second))
-                      candidate)
-                     ((dominates-p candidate first)
-                      (make-duel candidate second))
-                     ((dominates-p candidate second)
-                      (make-duel candidate first))
-                     (t
-                      (sort (vector candidate first second)
-                            #'> :key #'candidate-last)))))
-           (merge-candidate-frontier (candidate frontier)
-             (declare (type candidate candidate) (type (vector t) frontier))
-             (when (loop for item across frontier
-                         thereis (dominates-p item candidate))
-               (return-from merge-candidate-frontier frontier))
-             (let ((survivors
-                     (loop for item across frontier
-                           count (not (dominates-p candidate item)))))
-               (case survivors
-                 (0 candidate)
-                 (1
-                  (make-duel
-                   candidate
-                   (loop for item across frontier
-                         unless (dominates-p candidate item)
-                           return item)))
-                 (otherwise
-                  (let ((result (make-array (1+ survivors)))
-                        (index 1))
-                    (setf (aref result 0) candidate)
-                    (loop for item across frontier
-                          unless (dominates-p candidate item)
-                            do (setf (aref result index) item)
-                               (incf index))
-                    (sort result #'> :key #'candidate-last))))))
-           (merge-candidate-normal (candidate evaluation)
-             (typecase evaluation
-               (null candidate)
-               (candidate (merge-candidates candidate evaluation))
-               (duel (merge-candidate-duel candidate evaluation))
-               (vector (merge-candidate-frontier candidate evaluation))))
-           (merge-frontiers (left right)
-             (let ((left-length (length left))
-                   (total (+ (length left) (length right))))
-               (labels ((item-at (index)
-                          (if (< index left-length)
-                              (aref left index)
-                              (aref right (- index left-length))))
-                        (survives-p (index)
-                          (let ((candidate (item-at index)))
-                            (not
-                             (loop for other-index below total
-                                   thereis
-                                   (and
-                                    (/= index other-index)
-                                    (let ((other (item-at other-index)))
-                                      (and
-                                       (dominates-p other candidate)
-                                       ;; Equal points retain the earlier
-                                       ;; representative, matching ordered
-                                       ;; incremental insertion.
-                                       (or (< other-index index)
-                                           (not (dominates-p
-                                                 candidate other)))))))))))
-                 (let ((count (loop for index below total
-                                    count (survives-p index))))
-                   (labels ((survivor (ordinal)
-                              (loop for index below total
-                                    when (survives-p index)
-                                      do (when (zerop ordinal)
-                                           (return (item-at index)))
-                                         (decf ordinal))))
-                     (case count
-                       (1 (survivor 0))
-                       (2 (make-duel (survivor 0) (survivor 1)))
-                       (otherwise
-                        (let ((result (make-array count))
-                              (write 0))
-                          (loop for index below total
-                                when (survives-p index)
-                                  do (setf (aref result write)
-                                           (item-at index))
-                                     (incf write))
-                          (sort result #'> :key #'candidate-last))))))))))
-    (typecase left
-      (null right)
-      (vector
-       (typecase right
-         (null left)
-         (vector (merge-frontiers left right))
-         (candidate (merge-candidate-frontier right left))
-         (duel
-          (merge-candidate-normal
-           (duel-second right)
-           (merge-candidate-frontier (duel-first right) left)))
-         (tainted-context left)))
-      (candidate
-       (typecase right
-         (null left)
-         (vector (merge-candidate-frontier left right))
-         (candidate (merge-candidates left right))
-         (duel (merge-candidate-duel left right))
-         (tainted-context left)))
-      (duel
-       (typecase right
-         (null left)
-         (vector
-          (merge-candidate-normal
-           (duel-second left)
-           (merge-candidate-frontier (duel-first left) right)))
-         (candidate (merge-candidate-duel right left))
-         (duel
-          (merge-candidate-normal
-           (duel-second right)
-           (merge-candidate-normal (duel-first right) left)))
-         (tainted-context left)))
-      (tainted-context
-       (typecase right
-         (null left)
-         (vector right)
-         (candidate right)
-         (duel right)
-         (tainted-context left))))))
+  (cond ((null left) right)
+        ((null right) left)
+        ((tainted-context-p left)
+         (if (tainted-context-p right) left right))
+        ((tainted-context-p right) left)
+        ;; Two singletons are the overwhelmingly common case; settle
+        ;; them without the merge buffer.
+        ((and (candidate-p left) (candidate-p right))
+         (cond ((dominates-p left right) left)
+               ((dominates-p right left) right)
+               ((> (candidate-last left) (candidate-last right))
+                (%duel left right))
+               (t (%duel right left))))
+        (t (merge-frontiers left right))))
 
 ;;; Recursive evaluator
 
@@ -630,22 +599,15 @@ call sites do not re-check child slots on every traversal."
    (candidate-overflow candidate)
    (candidate-height candidate)))
 
-(defun wrap-frontier (kind amount frontier)
-  (declare (type nonnegative-fixnum amount) (type (vector t) frontier))
-  (map 'vector
-       (lambda (candidate) (wrap-candidate kind amount candidate))
-       frontier))
-
 (defun wrap-evaluation (kind amount evaluation)
   (etypecase evaluation
     (null evaluation)
-    (candidate (wrap-candidate kind amount evaluation))
-    (duel (%duel (wrap-candidate kind amount (duel-first evaluation))
-                 (wrap-candidate kind amount (duel-second evaluation))))
-    (vector (wrap-frontier kind amount evaluation))
     (tainted-context
      (tainted-evaluation
-      (%tainted-wrap-context kind amount evaluation)))))
+      (%tainted-wrap-context kind amount evaluation)))
+    ((or candidate duel simple-vector)
+     (map-frontier (candidate evaluation)
+       (wrap-candidate kind amount candidate)))))
 
 (defun concatenate-candidates (left right)
   (declare (type candidate left right))
@@ -661,17 +623,13 @@ call sites do not re-check child slots on every traversal."
   (declare (type candidate left))
   (etypecase right
     (null right)
-    (candidate (concatenate-candidates left right))
-    (duel (%duel (concatenate-candidates left (duel-first right))
-                 (concatenate-candidates left (duel-second right))))
-    ;; Adding the same left rank preserves right-side dominance and ordering.
-    (vector
-     (map 'simple-vector
-          (lambda (candidate) (concatenate-candidates left candidate))
-          right))
     (tainted-context
      (tainted-evaluation
-      (%tainted-right-context left right)))))
+      (%tainted-right-context left right)))
+    ;; Adding the same left rank preserves right-side dominance and ordering.
+    ((or candidate duel simple-vector)
+     (map-frontier (candidate right)
+       (concatenate-candidates left candidate)))))
 
 (defun concatenate-right (document left base)
   (declare (type cons document))
@@ -684,22 +642,18 @@ call sites do not re-check child slots on every traversal."
            (type nonnegative-fixnum base))
   (etypecase left
     (null left)
-    (candidate (concatenate-right document left base))
-    (duel
-     (merge-evaluations
-      (concatenate-right document (duel-first left) base)
-      (concatenate-right document (duel-second left) base)))
-    (vector
-     (let ((result nil))
-       (loop for candidate across left
-             do (setf result
-                      (merge-evaluations
-                       result
-                       (concatenate-right document candidate base))))
-       result))
     (tainted-context
      (tainted-evaluation
-      (%tainted-left-context document base left)))))
+      (%tainted-left-context document base left)))
+    (candidate (concatenate-right document left base))
+    ((or duel simple-vector)
+     (let ((result nil))
+       (do-frontier (candidate left)
+         (setf result
+               (merge-evaluations
+                result
+                (concatenate-right document candidate base))))
+       result))))
 
 (defun evaluate-concatenation (document last base)
   (declare (type cons document)
