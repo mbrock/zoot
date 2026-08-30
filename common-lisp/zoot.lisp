@@ -254,7 +254,8 @@ serial on a subtree shared across documents cannot collide with a fresh one.")
          (type nonnegative-fixnum *memo-serial*))
 
 #+sbcl
-(declaim (sb-ext:always-bound *cost* *cost-measure* *statistics*))
+(declaim (sb-ext:always-bound
+          *cost* *cost-measure* *statistics* *memo-table* *memo-serial*))
 
 (defmacro note-statistic (place)
   #+zoot-statistics `(incf ,place)
@@ -579,9 +580,10 @@ region. If both sides are tainted, retain the left promise."
            limit))))
 
 (defun evaluate-document (document last base)
-  "Evaluate one document node after memo and taint checks."
-  (declare (type document document)
-           (type nonnegative-fixnum last base))
+  "Evaluate one document node after memo and taint checks. The ETYPECASE
+is the document type check; the argument is deliberately undeclared so
+call sites do not re-check child slots on every traversal."
+  (declare (type nonnegative-fixnum last base))
   (etypecase document
     (cons
      (evaluate-concatenation document last base))
@@ -611,8 +613,7 @@ region. If both sides are tainted, retain the left promise."
      (evaluate (memo-document-child document) last base))))
 
 (defun evaluate (document last base)
-  (declare (type document document)
-           (type nonnegative-fixnum last base))
+  (declare (type nonnegative-fixnum last base))
   (if (memo-document-p document)
       (let ((limit (cost-limit *cost*)))
         (if (and (<= last limit) (<= base limit))
