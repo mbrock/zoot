@@ -3,6 +3,7 @@ set -euo pipefail
 
 started_at=$SECONDS
 repo_root="$(cd "$(dirname "$0")/.." && pwd)"
+flake="path:$repo_root/nix"
 nix_profile="/nix/var/nix/profiles/default"
 
 printf '[orb setup] Ensuring Nix is installed\n'
@@ -23,6 +24,8 @@ fi
 # The installer cannot update this running process's environment.
 # shellcheck disable=SC1091
 source "$nix_profile/etc/profile.d/nix-daemon.sh"
+mkdir -p "$HOME/.local/bin"
+ln -sfn "$nix_profile/bin/nix" "$HOME/.local/bin/nix"
 
 printf '[orb setup] Configuring the repository development shell\n'
 hook_directory="$HOME/.config/zoot"
@@ -30,7 +33,7 @@ hook="$hook_directory/nix-profile.sh"
 mkdir -p "$hook_directory"
 cat > "$hook" <<EOF
 if [[ -z "\${IN_NIX_SHELL:-}" && "\${PWD}" == "$repo_root" ]]; then
-  eval "\$("$nix_profile/bin/nix" print-dev-env "$repo_root")"
+  eval "\$("$nix_profile/bin/nix" print-dev-env "$flake")"
   export PATH="$nix_profile/bin:\$PATH"
 fi
 EOF
@@ -49,6 +52,7 @@ EOF
 fi
 
 printf '[orb setup] Building and testing in the flake environment\n'
-"$nix_profile/bin/nix" develop "$repo_root" --command make test
+cd "$repo_root"
+"$nix_profile/bin/nix" develop "$flake" --command make test
 
 printf '[orb setup] Complete in %ss\n' "$((SECONDS - started_at))"
