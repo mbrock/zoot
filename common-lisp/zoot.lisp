@@ -185,12 +185,18 @@ nonnegative integer. Newline count remains the secondary rank component.")
 
 (defun text-overflow (cost column length)
   (declare (type nonnegative-fixnum column length))
+  ;; VALUES truncates the measure's result to one value, so the type
+  ;; assertion compiles to an inline fixnum test instead of a full
+  ;; multiple-values check.
   (the nonnegative-fixnum
-       (funcall (the function *cost-measure*)
-                (cost-width cost) column length)))
+       (values (funcall (the function *cost-measure*)
+                        (cost-width cost) column length))))
 
 ;;; Candidates carry their rank components as raw slots so that combining
 ;;; and comparing candidates never allocates intermediate RANK objects.
+;;; Inlining the constructor lets callers with already-derived slot types
+;;; allocate directly without re-checking them.
+(declaim (inline %candidate))
 (defstruct (candidate (:constructor %candidate (layout last overflow height)))
   (layout nil :type document :read-only t)
   (last 0 :type nonnegative-fixnum :read-only t)
@@ -534,6 +540,7 @@ region. If both sides are tainted, retain the left promise."
 (defmethod note-evaluation ((evaluation tainted-context))
   evaluation)
 
+(declaim (inline document-memo-serial memo-context-key))
 (defun document-memo-serial (document)
   (or (document-memo-id document)
       (setf (document-memo-id document)
