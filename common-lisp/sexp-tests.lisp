@@ -40,6 +40,12 @@
  "(if (predicate value) (consequent value) (alternative value))"
  30)
 
+(let ((zoot:*indentation-width* 4))
+  (check-format
+   (format nil "(when (predicate value)~%    (consequent value)~%    (alternative value))~%")
+   "(when (predicate value) (consequent value) (alternative value))"
+   30))
+
 (check-format
  (format nil "(loop~%  while (ready-p item)~%  do (process item))~%")
  "(loop while (ready-p item) do (process item))"

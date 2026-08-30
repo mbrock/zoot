@@ -35,7 +35,7 @@
 (defun cell-document (cell width last-p)
   (let* ((text (cell-text cell))
          (content
-           (cond ((not (stringp text)) (align text))
+           (cond ((not (stringp text)) (aligned-to-current-column text))
                  ((and last-p (eq (cell-align cell) :left)) text)
                  ((eq (cell-align cell) :left)
                   (format nil "~VA" width text))
@@ -68,11 +68,11 @@
                                                     (cell-text cell)))
                                               (length (cell-text cell))
                                               0)))))))
-    (reduce (lambda (left right) (cat left +newline+ right))
-            (mapcar (lambda (row) (row-document row widths)) rows))))
+    (one-per-line
+     (mapcar (lambda (row) (row-document row widths)) rows))))
 
 (defun section-document (title rows)
-  (cat (span "1" title) +newline+ (table-document rows)))
+  (cat (span "1" title) (starting-on-next-line (table-document rows))))
 
 (defun heading-cells (&rest titles)
   (loop for title in titles

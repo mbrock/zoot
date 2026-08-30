@@ -39,6 +39,32 @@
 (check t (typep (nest 2 (cat +newline+ (text "x"))) 'zoot::nest-document))
 (check t (typep (align (cat +newline+ (text "x"))) 'zoot::align-document))
 
+;;; Descriptive combinators preserve the distinction between constructing a
+;;; multiline document and subsequently offering its one-line form.
+
+(flet ((make-document ()
+         (surrounded-by-parentheses
+          (aligned-to-current-column
+           (possibly-collapsed-to-one-line
+            (one-per-line (list (text "alpha") (text "beta"))))))))
+  (check "(alpha beta)" (format-document (make-document) (make-f1 20)))
+  (check (format nil "(alpha~% beta)")
+         (format-document (make-document) (make-f1 7))))
+
+(check "alpha beta gamma"
+       (format-document
+        (separated-by-spaces (list "alpha" "beta" "gamma"))
+        (make-f1 80)))
+(check "{}" (format-document (surrounded-by-braces "") (make-f1 80)))
+(check "[]" (format-document (surrounded-by-square-brackets "")
+                            (make-f1 80)))
+
+(let ((*indentation-width* 4))
+  (check (format nil "head~%    body")
+         (format-document
+          (cat "head" (indented (starting-on-next-line "body")))
+          (make-f1 80))))
+
 ;;; These cases mirror the semantic tests in src/pretty.zig.
 
 (let* ((inline (cat (text "foo") (text " ") (text "bar")))

@@ -10,7 +10,11 @@
 (defpackage #:zoot-sexp
   (:use #:cl)
   (:import-from #:zoot
-                #:verbatim #:+newline+ #:cat #:choice #:nest #:align
+                #:verbatim #:+newline+ #:cat #:choice
+                #:separated-by-spaces #:one-per-line
+                #:indented #:starting-on-next-line
+                #:aligned-to-current-column
+                #:surrounded-by #:surrounded-by-parentheses
                 #:span #:span-document #:span-document-meta
                 #:render-layout
                 #:pick #:render #:result-candidate #:make-f2)
@@ -399,7 +403,7 @@ their elements flow as a filled paragraph instead of code lines.")
     ("when" 1) ("unless" 1)
     ;; The fourth field is the number of leading forms in each body clause.
     ;; Those forms stay on the clause head; the remaining forms are offered
-    ;; as a two-space-indented body instead of generic call arguments.
+    ;; as an indented body instead of generic call arguments.
     ("cond" 0 nil 1)
     ("case" 1 nil 1) ("ecase" 1 nil 1) ("ccase" 1 nil 1)
     ("typecase" 1 nil 1) ("etypecase" 1 nil 1) ("ctypecase" 1 nil 1)
@@ -469,14 +473,11 @@ FOR, and similar clause heads, never between a clause head and its operand."
     (when group (push (nreverse group) groups))
     (fill-join
      (mapcar (lambda (items)
-               (reduce (lambda (left right)
-                         (cat left " " (values (node-docs right))))
-                       (rest items)
-                       :initial-value (values (node-docs (first items)))))
+               (separated-by-spaces
+                (mapcar (lambda (item)
+                          (values (node-docs item)))
+                        items)))
              (nreverse groups)))))
-
-(defun join-flat (flats)
-  (reduce (lambda (left right) (cat left " " right)) flats))
 
 (defun fill-join (docs)
   "Join document DOCS with individual space-or-newline choices."
@@ -506,7 +507,8 @@ as :test #'eq keep keyword and value on one line."
     (multiple-value-bind (value-doc value-flat) (node-docs value)
       (let ((keyword (values (node-docs key))))
         (values (choice (cat keyword " " value-doc)
-                        (cat keyword (nest 2 (cat +newline+ value-doc))))
+                        (cat keyword
+                             (indented (starting-on-next-line value-doc))))
                 (when value-flat (cat keyword " " value-flat)))))))
 
 (defun stack-docs (items &optional clause-head-count)
@@ -553,7 +555,7 @@ whether the last line ends in a remark."
                (rest lines)
                :initial-value (car (first lines))))
      (when (and flat-p flats)
-       (join-flat (nreverse flats)))
+       (separated-by-spaces (nreverse flats)))
      ends-with-remark-p)))
 
 (defun close-paren (ends-with-remark-p)
@@ -576,7 +578,8 @@ offer the remaining forms as a body nested two spaces from the opening."
           (stack-docs body-items)
         (let* ((head (cat (paren-open node) (or head-flat head-doc)))
                (broken (if body-doc
-                           (cat head (nest 2 (cat +newline+ body-doc))
+                           (cat head
+                                (indented (starting-on-next-line body-doc))
                                 (close-paren ends-with-remark-p))
                            (cat head ")")))
                (flat (when (and head-flat body-flat)
@@ -584,9 +587,6 @@ offer the remaining forms as a body nested two spaces from the opening."
           (if flat
               (values (choice flat broken) flat)
               (values broken nil)))))))
-
-(defun stack-list (docs)
-  (reduce (lambda (left right) (cat left +newline+ right)) docs))
 
 (defun specials-head (open operator specials binding-style)
   "The head line: opening, operator, and distinguished arguments, on
@@ -605,9 +605,11 @@ one line when they fit or aligned under the first otherwise."
     (let ((head (cat open (span :special operator))))
       (cond ((null specials) head)
             (flat-p
-             (choice (cat head " " (join-flat flats))
-                     (cat head " " (align (stack-list docs)))))
-            (t (cat head " " (align (stack-list docs))))))))
+             (choice (cat head " " (separated-by-spaces flats))
+                     (cat head " "
+                          (aligned-to-current-column (one-per-line docs)))))
+            (t (cat head " "
+                    (aligned-to-current-column (one-per-line docs))))))))
 
 (defun binding-list-docs (bindings)
   "A FLET or LABELS binding list: each binding formats like a DEFUN."
@@ -626,16 +628,19 @@ one line when they fit or aligned under the first otherwise."
            (push document docs)
            (if flat (push flat flats) (setf flat-p nil))))))
     (setf docs (nreverse docs) flats (nreverse flats))
-    (let* ((broken (cat "(" (align (stack-list docs)) ")"))
+    (let* ((broken
+             (surrounded-by-parentheses
+              (aligned-to-current-column (one-per-line docs))))
            (flat (when (and flat-p flats)
-                   (cat "(" (join-flat flats) ")"))))
+                   (surrounded-by-parentheses
+                    (separated-by-spaces flats)))))
       (if flat
           (values (choice flat broken) flat)
           (values broken nil)))))
 
 (defun rule-docs (node rule)
   "Body-form layout: distinguished arguments on the head line, body
-indented two below. Returns NIL when the shape does not apply."
+indented by *INDENTATION-WIDTH*. Returns NIL when the shape does not apply."
   (destructuring-bind (count &optional binding-style clause-head-count) rule
     (let* ((items (paren-items node))
            (operator (raw-text (first items)))
@@ -651,12 +656,12 @@ indented two below. Returns NIL when the shape does not apply."
           (declare (ignore body-flat))
           (cat (specials-head (paren-open node) operator specials
                               binding-style)
-               (nest 2 (cat +newline+ body-doc))
+               (indented (starting-on-next-line body-doc))
                (close-paren ends-with-remark-p)))))))
 
 (defun call-docs (node)
   "Function-call layouts: arguments either hang under the first or form a
-two-space-indented vertical body below the operator."
+vertical body indented by *INDENTATION-WIDTH* below the operator."
   (let* ((items (paren-items node))
          (head (first items)))
     (multiple-value-bind (head-doc head-flat) (node-docs head)
@@ -669,14 +674,16 @@ two-space-indented vertical body below the operator."
             (let ((close (close-paren ends-with-remark-p)))
               (let ((hanging
                       (cat (paren-open node) head-doc " "
-                           (align arguments-doc) close)))
+                           (aligned-to-current-column arguments-doc) close)))
                 (if (and (raw-p head)
                          (not (member (bare-name (raw-text head))
                                       *hanging-only-heads*
                                       :test #'string-equal)))
                     (choice hanging
                             (cat (paren-open node) head-doc
-                                 (nest 2 (cat +newline+ arguments-doc)) close))
+                                 (indented
+                                  (starting-on-next-line arguments-doc))
+                                 close))
                     hanging)))
             (cat (paren-open node) head-doc ")"))))))
 
@@ -698,11 +705,11 @@ two-space-indented vertical body below the operator."
                                         (values (node-docs item)))
                                       (rest items))))))
               (let ((hanging (cat (paren-open node) head-doc " "
-                                  (align tail) ")")))
+                                  (aligned-to-current-column tail) ")")))
                 (if loop-p
                     (choice hanging
                             (cat (paren-open node) head-doc
-                                 (nest 2 (cat +newline+ tail)) ")"))
+                                 (indented (starting-on-next-line tail)) ")"))
                     hanging))))
           (cat (paren-open node)
                (values (node-docs (first items)))
@@ -730,9 +737,10 @@ two-space-indented vertical body below the operator."
                      (fill-docs node))
                    (if (and (raw-p head) (rest items))
                        (call-docs node)
-                       (cat (paren-open node)
-                            (align all-doc)
-                            (close-paren ends-with-remark-p))))))
+                       (surrounded-by
+                        (paren-open node)
+                        (close-paren ends-with-remark-p)
+                        (aligned-to-current-column all-doc))))))
         (if flat
             (values (choice flat broken) flat)
             (values broken nil))))))
@@ -759,7 +767,7 @@ two-space-indented vertical body below the operator."
                     (t *data-context-p*))))
        (multiple-value-bind (document flat) (node-docs (wrap-child node))
          (values (if (string= prefix "`")
-                     (cat prefix (align document))
+                     (cat prefix (aligned-to-current-column document))
                      (cat prefix document))
                  (when flat (cat prefix flat))))))
     (guard

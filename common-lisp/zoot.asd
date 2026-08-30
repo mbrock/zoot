@@ -4,6 +4,7 @@
   :serial t
   :components ((:file "package")
                (:file "documents")
+               (:file "combinators")
                (:file "costs-frontiers")
                (:file "evaluator")
                (:file "render")))

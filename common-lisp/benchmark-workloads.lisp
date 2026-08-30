@@ -4,22 +4,14 @@
 
 (in-package #:zoot-benchmark)
 
-(defun join-documents (separator documents)
-  (if (null documents)
-      (text "")
-      (reduce (lambda (left right)
-                (cat left separator right))
-              (rest documents)
-              :initial-value (first documents))))
-
 (defun call-document (items)
   "A token-preserving choice between horizontal and vertical S-expression
 layout. Both branches contain exactly the same non-whitespace tokens."
-  (let ((horizontal (join-documents (text " ") items))
-        (vertical (apply #'vcat items)))
-    (cat (text "(")
-         (align (choice horizontal vertical))
-         (text ")"))))
+  (let ((horizontal (separated-by-spaces items))
+        (vertical (one-per-line items)))
+    (surrounded-by-parentheses
+     (aligned-to-current-column
+      (choice horizontal vertical)))))
 
 (defun ternary-document (depth)
   "Construct a fresh full ternary expression tree with choices at each call."
@@ -47,8 +39,11 @@ layout. Both branches contain exactly the same non-whitespace tokens."
                          (cat +newline+ (text "s")))
                  (let ((child (walk (1- remaining))))
                    (choice
-                    (cat (text "(") child (text " ") child (text ")"))
-                    (cat (text "(") (align (vcat child child)) (text ")")))))))
+                    (surrounded-by-parentheses
+                     (separated-by-spaces (list child child)))
+                    (surrounded-by-parentheses
+                     (aligned-to-current-column
+                      (one-per-line (list child child)))))))))
     (walk depth)))
 
 (defun tainted-document (count)
