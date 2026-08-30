@@ -102,8 +102,9 @@
            (pick (cat (text "one") (text "two")) (make-f2 80)))))
     (check-rank 2 0 candidate)))
 
-;;; The unrestricted vector representation intentionally accepts a frontier
-;;; that recursive.zig's current two-Duel representation rejects.
+;;; Unrestricted frontiers intentionally accept a third Pareto point that
+;;; recursive.zig's current two-Duel representation rejects. Completed larger
+;;; frontiers are fixed simple vectors, never adjustable construction buffers.
 
 (let* ((wide (text "123456789"))
        (middle (cat +newline+ (text "12345")))
@@ -112,6 +113,19 @@
   (check 3 (length (result-frontier result)) "frontier should have three points")
   (check 3 (statistics-frontier-maximum (result-statistics result)))
   (check "123456789" (render (result-candidate result))))
+
+(let ((frontier nil)
+      (layout (text "point")))
+  (dolist (point '((9 0) (5 1) (1 2)))
+    (setf frontier
+          (zoot::merge-evaluations
+           frontier
+           (zoot::%candidate layout (first point)
+                             (zoot::%rank (second point) 0)))))
+  (check-true (typep frontier 'simple-vector)
+              "three-point frontier should be a simple vector")
+  (check nil (array-has-fill-pointer-p frontier)
+         "completed frontier should not have a fill pointer"))
 
 ;;; Group and alignment smoke tests.
 

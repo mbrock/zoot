@@ -10,10 +10,10 @@ Zig's compact representation:
 
 - each document kind has its own structure type, sharing memo state through a
   base structure; evaluator and renderer semantics use generic dispatch;
-- Pareto frontiers remain unrestricted, but the common cardinalities avoid
-  adjustable vectors: singleton frontiers are bare candidates and two-point
-  frontiers are immutable `duel` structures; `nil` is empty and vectors
-  represent frontiers of three or more points;
+- Pareto frontiers remain unrestricted, but completed frontiers are compact:
+  `nil` is empty, singleton frontiers are bare candidates, two-point frontiers
+  are immutable `duel` structures, and fixed simple vectors represent three or
+  more points;
 - tainted promises are explicit small continuation-context structures rather
   than closures;
 - dominance compares final column and lexicographic `(overflow, height)` cost;
