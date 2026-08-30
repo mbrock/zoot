@@ -12,8 +12,8 @@ Zig's compact representation:
   base structure; evaluator and renderer semantics use generic dispatch;
 - Pareto frontiers remain unrestricted, but the common cardinalities avoid
   adjustable vectors: singleton frontiers are bare candidates and two-point
-  frontiers are immutable `duel` structures; vectors represent empty and
-  larger frontiers;
+  frontiers are immutable `duel` structures; `nil` is empty and vectors
+  represent frontiers of three or more points;
 - tainted promises are explicit small continuation-context structures rather
   than closures;
 - dominance compares final column and lexicographic `(overflow, height)` cost;

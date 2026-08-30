@@ -253,7 +253,7 @@ nonnegative integer. Newline count remains the secondary rank component.")
   (and (<= (candidate-last left) (candidate-last right))
        (rank<= (candidate-rank left) (candidate-rank right))))
 
-(defun empty-frontier ()
+(defun frontier-buffer ()
   ;; Most observed frontiers contain one or two candidates. Reserve those
   ;; slots up front so the first pushes do not immediately reallocate.
   (make-array 2 :adjustable t :fill-pointer 0))
@@ -276,7 +276,7 @@ last column and rank. Frontiers are unrestricted adjustable vectors."
 
 (defun frontier-union (left right)
   (declare (type (vector t) left right))
-  (let ((result (empty-frontier)))
+  (let ((result (frontier-buffer)))
     (loop for candidate across left
           do (frontier-add result candidate))
     (loop for candidate across right
@@ -286,6 +286,7 @@ last column and rank. Frontiers are unrestricted adjustable vectors."
 (defun canonicalize-frontier (frontier)
   (declare (type (vector t) frontier))
   (case (length frontier)
+    (0 nil)
     (1 (aref frontier 0))
     (2 (%duel (aref frontier 0) (aref frontier 1)))
     (otherwise frontier)))
@@ -319,7 +320,7 @@ last column and rank. Frontiers are unrestricted adjustable vectors."
   (base 0 :type nonnegative-fixnum :read-only t)
   (evaluation nil :type t :read-only t))
 
-(deftype evaluation () '(or candidate duel vector tainted-context))
+(deftype evaluation () '(or null candidate duel vector tainted-context))
 
 (defun tainted-evaluation (context)
   (declare (type tainted-context context))
@@ -327,10 +328,10 @@ last column and rank. Frontiers are unrestricted adjustable vectors."
    (statistics-taints-deferred (the statistics *statistics*)))
   context)
 
-(defun evaluation-empty-p (evaluation)
-  (and (vectorp evaluation) (zerop (length evaluation))))
-
 (defgeneric force-evaluation (evaluation))
+
+(defmethod force-evaluation ((evaluation null))
+  (error "Cannot choose from an empty frontier"))
 
 (defmethod force-evaluation ((evaluation tainted-context))
   (note-statistic
@@ -367,8 +368,6 @@ last column and rank. Frontiers are unrestricted adjustable vectors."
 
 (defmethod force-evaluation ((evaluation vector))
   (declare (type (vector t) evaluation))
-  (when (zerop (length evaluation))
-    (error "Cannot choose from an empty frontier"))
   (aref evaluation 0))
 
 (defun merge-evaluations (left right)
@@ -396,47 +395,47 @@ region. If both sides are tainted, retain the left promise."
                      ((dominates-p candidate second)
                       (make-duel candidate first))
                      (t
-                      (let ((frontier (empty-frontier)))
+                      (let ((frontier (frontier-buffer)))
                         (frontier-add frontier candidate)
                         (frontier-add frontier first)
                         (frontier-add frontier second)
                         (sort frontier #'> :key #'candidate-last))))))
            (merge-candidate-frontier (candidate frontier)
              (declare (type candidate candidate) (type (vector t) frontier))
-             (if (evaluation-empty-p frontier)
-                 candidate
-                 (let ((result (empty-frontier)))
-                   (frontier-add result candidate)
-                   (loop for item across frontier
-                         do (frontier-add result item))
-                   (canonicalize-frontier
-                    (sort result #'> :key #'candidate-last)))))
+             (let ((result (frontier-buffer)))
+               (frontier-add result candidate)
+               (loop for item across frontier
+                     do (frontier-add result item))
+               (canonicalize-frontier
+                (sort result #'> :key #'candidate-last))))
            (merge-candidate-normal (candidate evaluation)
              (typecase evaluation
+               (null candidate)
                (candidate (merge-candidates candidate evaluation))
                (duel (merge-candidate-duel candidate evaluation))
                (vector (merge-candidate-frontier candidate evaluation)))))
     (typecase left
+      (null right)
       (vector
        (typecase right
-         (vector
-          (cond ((evaluation-empty-p left) right)
-                ((evaluation-empty-p right) left)
-                (t (canonicalize-frontier (frontier-union left right)))))
+         (null left)
+         (vector (canonicalize-frontier (frontier-union left right)))
          (candidate (merge-candidate-frontier right left))
          (duel
           (merge-candidate-normal
            (duel-second right)
            (merge-candidate-frontier (duel-first right) left)))
-         (tainted-context (if (evaluation-empty-p left) right left))))
+         (tainted-context left)))
       (candidate
        (typecase right
+         (null left)
          (vector (merge-candidate-frontier left right))
          (candidate (merge-candidates left right))
          (duel (merge-candidate-duel left right))
          (tainted-context left)))
       (duel
        (typecase right
+         (null left)
          (vector
           (merge-candidate-normal
            (duel-second left)
@@ -449,7 +448,8 @@ region. If both sides are tainted, retain the left promise."
          (tainted-context left)))
       (tainted-context
        (typecase right
-         (vector (if (evaluation-empty-p right) left right))
+         (null left)
+         (vector right)
          (candidate right)
          (duel right)
          (tainted-context left))))))
@@ -472,6 +472,15 @@ region. If both sides are tainted, retain the left promise."
 
 #+zoot-statistics
 (defgeneric note-evaluation (evaluation))
+
+#+zoot-statistics
+(defmethod note-evaluation ((evaluation null))
+  (let* ((statistics (the statistics *statistics*))
+         (histogram (statistics-frontier-histogram statistics)))
+    (setf (gethash 0 histogram)
+          (the nonnegative-fixnum
+               (1+ (the nonnegative-fixnum (gethash 0 histogram 0))))))
+  evaluation)
 
 #+zoot-statistics
 (defmethod note-evaluation ((evaluation vector))
@@ -655,6 +664,10 @@ whose context lies inside the computation limit."
 
 (defgeneric wrap-evaluation (kind amount evaluation))
 
+(defmethod wrap-evaluation (kind amount (evaluation null))
+  (declare (ignore kind amount))
+  evaluation)
+
 (defmethod wrap-evaluation (kind amount (evaluation vector))
   (wrap-frontier kind amount evaluation))
 
@@ -677,10 +690,14 @@ whose context lies inside the computation limit."
 
 (defgeneric concatenate-right-evaluation (left right))
 
+(defmethod concatenate-right-evaluation (left (right null))
+  (declare (ignore left))
+  right)
+
 (defmethod concatenate-right-evaluation
     (left (right vector))
   (declare (type candidate left) (type (vector t) right))
-  (let ((result (empty-frontier)))
+  (let ((result (frontier-buffer)))
     (loop for candidate across right
           do (frontier-add result (concatenate-candidates left candidate)))
     (canonicalize-frontier (sort result #'> :key #'candidate-last))))
@@ -709,6 +726,11 @@ whose context lies inside the computation limit."
     (document base left))
 
 (defmethod concatenate-left-evaluation
+    (document base (left null))
+  (declare (ignore document base))
+  left)
+
+(defmethod concatenate-left-evaluation
     (document base (left tainted-context))
   (tainted-evaluation
    (%tainted-left-context document base left)))
@@ -717,7 +739,7 @@ whose context lies inside the computation limit."
     (document base (left vector))
   (declare (type concatenation-document document)
            (type nonnegative-fixnum base) (type (vector t) left))
-  (let ((result (empty-frontier)))
+  (let ((result nil))
     (loop for candidate across left
           do (setf result
                    (merge-evaluations
@@ -766,6 +788,7 @@ Expressive and recursive.zig."
            (frontier
              (the (vector t)
                   (etypecase evaluation
+                    (null #())
                     (tainted-context
                      (vector (force-evaluation evaluation)))
                     (candidate (vector evaluation))
