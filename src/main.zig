@@ -2,6 +2,7 @@ const std = @import("std");
 const pp = @import("zoot").PrettyGoodMachine;
 const viz = @import("zoot").PrettyViz;
 const dump = @import("zoot").dump;
+const recursive = @import("zoot").Recursive;
 
 const Step = union(enum) {
     run: Run,
@@ -28,14 +29,12 @@ pub fn main(init: std.process.Init) !void {
     var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
     defer args.deinit();
     _ = args.skip();
-    const gc_tide = if (args.next()) |arg|
-        try std.fmt.parseInt(usize, arg, 10)
-    else
-        (pp.PickOptions{}).gc_tide;
+    var gc_tide = (pp.PickOptions{}).gc_tide;
     var computation_width: ?u16 = null;
     var trace_gc = false;
     var trace_memo = false;
     var memoize = true;
+    var use_recursive = false;
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "trace")) {
             trace_gc = true;
@@ -43,8 +42,12 @@ pub fn main(init: std.process.Init) !void {
             trace_memo = true;
         } else if (std.mem.eql(u8, arg, "nomemo")) {
             memoize = false;
+        } else if (std.mem.eql(u8, arg, "recursive")) {
+            use_recursive = true;
         } else if (std.mem.startsWith(u8, arg, "limit=")) {
             computation_width = try std.fmt.parseInt(u16, arg["limit=".len..], 10);
+        } else if (arg.len != 0 and std.ascii.isDigit(arg[0])) {
+            gc_tide = try std.fmt.parseInt(usize, arg, 10);
         } else {
             return error.InvalidArgument;
         }
@@ -109,13 +112,17 @@ pub fn main(init: std.process.Init) !void {
     var now = std.Io.Clock.Timestamp.now(init.io, .awake);
     const t0 = checkpoint.durationTo(now).raw;
     checkpoint = now;
-    const best = try t.pickWithOptions(allocator, cost_factory, doc, .{
+    const options: pp.PickOptions = .{
         .gc_tide = gc_tide,
         .computation_width = computation_width,
         .trace_gc = trace_gc,
         .trace_memo = trace_memo,
         .memoize = memoize,
-    });
+    };
+    const best = if (use_recursive)
+        try recursive.pickWithOptions(&t, allocator, cost_factory, doc, options)
+    else
+        try t.pickWithOptions(allocator, cost_factory, doc, options);
     now = std.Io.Clock.Timestamp.now(init.io, .awake);
     const t1 = checkpoint.durationTo(now).raw;
     checkpoint = now;
