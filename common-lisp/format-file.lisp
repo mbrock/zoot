@@ -3,6 +3,12 @@
 
 (require "asdf")
 (setf *features* (remove :zoot-statistics *features*))
+;; Eclector comes from the Nix dev shell's SBCL package registry when
+;; available, and from Quicklisp otherwise.
+(handler-case (asdf:load-system "eclector")
+  (error ()
+    (load (merge-pathnames "quicklisp/setup.lisp" (user-homedir-pathname)))
+    (asdf:load-system "eclector")))
 (asdf:load-asd (merge-pathnames "zoot.asd" *load-truename*))
 (asdf:load-system "zoot/sexp")
 

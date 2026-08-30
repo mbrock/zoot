@@ -1,7 +1,7 @@
 ;;; A pretty-printer for Common Lisp source text, built on Zoot.
 ;;;
-;;; Source is read without interning: atoms, strings, and characters stay
-;;; raw token text, so formatting needs no packages, preserves case
+;;; Source is read with Eclector, but without interning: symbols stay
+;;; raw source slices, so formatting needs no packages, preserves case
 ;;; exactly, and keeps comments, feature guards, and blank lines. Each
 ;;; top-level form becomes a Zoot document offering one-line and broken
 ;;; layouts at every level, and PICK finds the optimal layout under the
@@ -18,213 +18,271 @@
 
 ;;; Source nodes
 
-(defstruct (raw (:constructor raw (text)))
-  "An atom, string, or character literal, kept as raw source text."
-  (text "" :type string :read-only t))
+(defstruct (raw (:constructor raw (text &optional start end)))
+  "An atom of any kind, kept as its raw source text."
+  (text "" :type string :read-only t)
+  (start 0 :type fixnum :read-only t)
+  (end 0 :type fixnum :read-only t))
 
-(defstruct (wrap (:constructor wrap (prefix child)))
+(defstruct (wrap (:constructor wrap (prefix child start end)))
   "A read-macro prefix such as ', `, ,@, #', or #. applied to one form."
   (prefix "" :type string :read-only t)
-  (child nil :read-only t))
+  (child nil)
+  (start 0 :type fixnum :read-only t)
+  (end 0 :type fixnum :read-only t))
 
-(defstruct (guard (:constructor guard (prefix condition form)))
+(defstruct (guard (:constructor guard (prefix condition form start end)))
   "A #+ or #- feature expression guarding one form."
   (prefix "" :type string :read-only t)
-  (condition nil :read-only t)
-  (form nil :read-only t))
+  (condition nil)
+  (form nil)
+  (start 0 :type fixnum :read-only t)
+  (end 0 :type fixnum :read-only t))
 
-(defstruct (paren (:constructor paren (open items)))
+(defstruct (paren (:constructor paren (open items start end)))
   "A parenthesized form, or a #( vector."
   (open "(" :type string :read-only t)
-  (items nil :type list :read-only t))
+  (items nil :type list)
+  (start 0 :type fixnum :read-only t)
+  (end 0 :type fixnum :read-only t))
 
-(defstruct (remark (:constructor remark (text trailing-p)))
+(defstruct (remark (:constructor remark (text start end)))
   "A comment. Trailing remarks stay on the previous item's line."
   (text "" :type string :read-only t)
-  (trailing-p nil :type boolean :read-only t))
+  (trailing-p nil :type boolean)
+  (start 0 :type fixnum :read-only t)
+  (end 0 :type fixnum :read-only t))
+
+(defstruct (pending (:constructor pending (start end)))
+  "A feature guard whose branch this image's features rejected; its
+region is re-read after the enclosing read completes."
+  (start 0 :type fixnum :read-only t)
+  (end 0 :type fixnum :read-only t))
 
 (defstruct (gap (:constructor gap ()))
   "A blank line between items.")
 
-;;; Reading
+(deftype node ()
+  '(or raw wrap guard paren remark pending))
 
-(defstruct (cursor (:constructor cursor (source)))
-  (source "" :type string :read-only t)
-  (index 0 :type fixnum))
+(defun node-start (node)
+  (etypecase node
+    (raw (raw-start node))
+    (wrap (wrap-start node))
+    (guard (guard-start node))
+    (paren (paren-start node))
+    (remark (remark-start node))
+    (pending (pending-start node))))
 
-(defun peek (cursor &optional (offset 0))
-  (let ((index (+ (cursor-index cursor) offset)))
-    (when (< index (length (cursor-source cursor)))
-      (char (cursor-source cursor) index))))
+(defun node-end (node)
+  (etypecase node
+    (raw (raw-end node))
+    (wrap (wrap-end node))
+    (guard (guard-end node))
+    (paren (paren-end node))
+    (remark (remark-end node))
+    (pending (pending-end node))))
 
-(defun advance (cursor)
-  (incf (cursor-index cursor)))
+;;; The Eclector client
+;;;
+;;; Symbols are interpreted as bare name strings and every result node
+;;; is built from its source slice, so nothing is interned and nothing
+;;; is evaluated. Feature expressions are evaluated by name against
+;;; *FEATURES* only so that reading can proceed; a rejected branch
+;;; becomes a PENDING node and is re-read afterwards, so both branches
+;;; of a guard format identically whatever the features say.
 
-(defun grab (cursor start)
-  (subseq (cursor-source cursor) start (cursor-index cursor)))
+(defclass client (eclector.parse-result:parse-result-client)
+  ((text :initarg :text :reader client-text)))
 
-(defun whitespace-p (char)
-  (member char '(#\Space #\Tab #\Newline #\Return #\Page)))
+(defmethod eclector.reader:interpret-symbol
+    ((client client) input-stream package-indicator symbol-name internp)
+  (declare (ignore input-stream package-indicator internp))
+  symbol-name)
 
-(defun delimiter-p (char)
-  (or (null char) (whitespace-p char) (find char "()\";'`,")))
+(defmethod eclector.reader:wrap-in-quote ((client client) material)
+  (list :prefix "'" material))
 
-(defun scan-atom (cursor)
-  (let ((start (cursor-index cursor)))
+(defmethod eclector.reader:wrap-in-function ((client client) name)
+  (list :prefix "#'" name))
+
+(defmethod eclector.reader:wrap-in-quasiquote ((client client) form)
+  (list :prefix "`" form))
+
+(defmethod eclector.reader:wrap-in-unquote ((client client) form)
+  (list :prefix "," form))
+
+(defmethod eclector.reader:wrap-in-unquote-splicing ((client client) form)
+  (list :prefix ",@" form))
+
+(defmethod eclector.reader:evaluate-expression ((client client) expression)
+  (list :prefix "#." expression))
+
+(defmethod eclector.reader:evaluate-feature-expression
+    ((client client) expression)
+  (labels ((feature-p (expression)
+             (typecase expression
+               (string (and (member expression *features*
+                                    :test #'string-equal)
+                            t))
+               (cons
+                (let ((operator (first expression)))
+                  (when (stringp operator)
+                    (cond ((string-equal operator "and")
+                           (every #'feature-p (rest expression)))
+                          ((string-equal operator "or")
+                           (some #'feature-p (rest expression)))
+                          ((string-equal operator "not")
+                           (not (feature-p (second expression))))))))
+               (t nil))))
+    (feature-p expression)))
+
+(defmethod eclector.reader:check-feature-expression
+    ((client client) expression)
+  (declare (ignore expression))
+  t)
+
+(defun node-children (children)
+  (remove-if-not (lambda (child) (typep child 'node)) children))
+
+(defun guard-prefix-at (text start)
+  (and (< (1+ start) (length text))
+       (char= (char text start) #\#)
+       (member (char text (1+ start)) '(#\+ #\-))
+       (subseq text start (+ start 2))))
+
+(defun dotted-tail-p (result)
+  (and (consp result)
+       (loop for tail = result then (cdr tail)
+             when (atom tail) return (not (null tail)))))
+
+(defmethod eclector.parse-result:make-expression-result
+    ((client client) result children source)
+  (let* ((start (car source))
+         (end (cdr source))
+         (text (client-text client))
+         (slice (subseq text start end))
+         (children (node-children children))
+         (forms (remove-if #'remark-p children)))
+    (cond
+      ((and (consp result) (eq (first result) :prefix))
+       (wrap (second result) (first (last forms)) start end))
+      ((and (guard-prefix-at text start) (= (length forms) 2))
+       (guard (guard-prefix-at text start)
+              (first forms) (second forms) start end))
+      ((char= (char slice 0) #\()
+       (paren "(" (place-list-dot result children text) start end))
+      ((and (>= (length slice) 2) (string= slice "#(" :end1 2))
+       (paren "#(" children start end))
+      (t (raw slice start end)))))
+
+(defun place-list-dot (result children text)
+  "Insert a dot atom into a dotted list's children."
+  (if (and (dotted-tail-p result) (>= (length children) 2))
+      (let* ((tail (last children 2))
+             (dot (position #\. text
+                            :start (node-end (first tail))
+                            :end (node-start (second tail)))))
+        (if dot
+            (append (butlast children 1)
+                    (list (raw "." dot (1+ dot)) (first tail)))
+            children))
+      children))
+
+(defmethod eclector.parse-result:make-skipped-input-result
+    ((client client) stream reason children source)
+  (declare (ignore stream children))
+  (let ((start (car source))
+        (end (cdr source)))
+    (cond ((or (and (consp reason)
+                    (member (car reason)
+                            '(:sharpsign-plus :sharpsign-minus)))
+               (member reason '(:sharpsign-plus :sharpsign-minus)))
+           (pending start end))
+          ((or (eq reason :block-comment)
+               (and (consp reason) (eq (car reason) :line-comment)))
+           (let ((slice (string-right-trim
+                         '(#\Newline #\Return)
+                         (subseq (client-text client) start end))))
+             (remark slice start (+ start (length slice)))))
+          (t :discard))))
+
+;;; Reading and post-processing
+
+(defun read-nodes (client stream)
+  (let ((eof (list :eof))
+        (nodes '()))
     (loop
-      (let ((char (peek cursor)))
-        (cond ((null char) (return))
-              ((char= char #\\)
-               (advance cursor)
-               (when (peek cursor) (advance cursor)))
-              ((char= char #\|)
-               (advance cursor)
-               (loop for inner = (peek cursor)
-                     until (or (null inner) (char= inner #\|))
-                     do (advance cursor)
-                     finally (when inner (advance cursor))))
-              ((delimiter-p char) (return))
-              (t (advance cursor)))))
-    (raw (grab cursor start))))
+      (multiple-value-bind (result orphans)
+          (eclector.parse-result:read client stream nil eof)
+        (dolist (orphan (node-children orphans))
+          (push orphan nodes))
+        (when (eq result eof)
+          (return))
+        (push result nodes)))
+    (nreverse nodes)))
 
-(defun scan-string (cursor)
-  (let ((start (cursor-index cursor)))
-    (advance cursor)
-    (loop
-      (let ((char (peek cursor)))
-        (cond ((null char) (error "Unterminated string"))
-              ((char= char #\\)
-               (advance cursor)
-               (when (peek cursor) (advance cursor)))
-              ((char= char #\")
-               (advance cursor)
-               (return))
-              (t (advance cursor)))))
-    (raw (grab cursor start))))
+(defun reparse-guard (client node)
+  "Re-read a guard whose branch was rejected during the first pass."
+  (let* ((start (pending-start node))
+         (text (client-text client))
+         (stream (make-string-input-stream text)))
+    (file-position stream (+ start 2))
+    (let* ((condition (eclector.parse-result:read client stream))
+           (form (eclector.parse-result:read client stream)))
+      (guard (guard-prefix-at text start) condition form
+             start (pending-end node)))))
 
-(defun scan-line-comment (cursor trailing-p)
-  (let ((start (cursor-index cursor)))
-    (loop for char = (peek cursor)
-          until (or (null char) (char= char #\Newline))
-          do (advance cursor))
-    (remark (grab cursor start) trailing-p)))
+(defun resolve (node client)
+  "Replace PENDING guards throughout NODE by their re-read forms."
+  (etypecase node
+    (pending (resolve (reparse-guard client node) client))
+    (paren
+     (setf (paren-items node)
+           (mapcar (lambda (item) (resolve item client))
+                   (paren-items node)))
+     node)
+    (wrap
+     (setf (wrap-child node) (resolve (wrap-child node) client))
+     node)
+    (guard
+     (setf (guard-condition node) (resolve (guard-condition node) client)
+           (guard-form node) (resolve (guard-form node) client))
+     node)
+    ((or raw remark) node)))
 
-(defun scan-block-comment (cursor)
-  (let ((start (cursor-index cursor))
-        (depth 0))
-    (loop
-      (let ((char (peek cursor)))
-        (cond ((null char) (error "Unterminated block comment"))
-              ((and (char= char #\#) (eql (peek cursor 1) #\|))
-               (advance cursor)
-               (advance cursor)
-               (incf depth))
-              ((and (char= char #\|) (eql (peek cursor 1) #\#))
-               (advance cursor)
-               (advance cursor)
-               (when (zerop (decf depth)) (return)))
-              (t (advance cursor)))))
-    (remark (grab cursor start) nil)))
+(defun arrange (nodes text)
+  "Insert blank-line gaps between nodes and mark trailing remarks,
+recursively, using source positions."
+  (let ((result '())
+        (previous nil))
+    (dolist (node nodes)
+      (arrange-children node text)
+      (when previous
+        (let ((newlines (count #\Newline text
+                               :start (node-end previous)
+                               :end (node-start node))))
+          (cond ((>= newlines 2) (push (gap) result))
+                ((and (remark-p node) (zerop newlines))
+                 (setf (remark-trailing-p node) t)))))
+      (push node result)
+      (setf previous node))
+    (nreverse result)))
 
-(defun scan-character (cursor)
-  (let ((start (cursor-index cursor)))
-    (advance cursor)
-    (advance cursor)
-    (when (peek cursor) (advance cursor))
-    (loop for char = (peek cursor)
-          until (delimiter-p char)
-          do (advance cursor))
-    (raw (grab cursor start))))
-
-(defun skip-whitespace (cursor)
-  "Skip whitespace, returning the number of newlines crossed."
-  (let ((newlines 0))
-    (loop for char = (peek cursor)
-          while (and char (whitespace-p char))
-          do (when (char= char #\Newline) (incf newlines))
-             (advance cursor))
-    newlines))
-
-(defun read-prefixed-form (cursor)
-  (skip-whitespace cursor)
-  (read-form cursor))
-
-(defun read-dispatch (cursor)
-  (case (peek cursor 1)
-    (#\( (advance cursor)
-         (advance cursor)
-         (paren "#(" (read-body cursor nil)))
-    (#\' (advance cursor)
-         (advance cursor)
-         (wrap "#'" (read-prefixed-form cursor)))
-    (#\. (advance cursor)
-         (advance cursor)
-         (wrap "#." (read-prefixed-form cursor)))
-    (#\\ (scan-character cursor))
-    (#\| (scan-block-comment cursor))
-    ((#\+ #\-)
-     (let ((start (cursor-index cursor)))
-       (advance cursor)
-       (advance cursor)
-       (let ((prefix (grab cursor start))
-             (condition (read-prefixed-form cursor)))
-         (guard prefix condition (read-prefixed-form cursor)))))
-    ((#\p #\P)
-     (let ((start (cursor-index cursor)))
-       (advance cursor)
-       (advance cursor)
-       (wrap (grab cursor start) (scan-string cursor))))
-    (t (scan-atom cursor))))
-
-(defun read-form (cursor)
-  (case (peek cursor)
-    (#\( (advance cursor)
-         (paren "(" (read-body cursor nil)))
-    (#\" (scan-string cursor))
-    (#\' (advance cursor)
-         (wrap "'" (read-prefixed-form cursor)))
-    (#\` (advance cursor)
-         (wrap "`" (read-prefixed-form cursor)))
-    (#\, (advance cursor)
-         (case (peek cursor)
-           (#\@ (advance cursor)
-                (wrap ",@" (read-prefixed-form cursor)))
-           (#\. (advance cursor)
-                (wrap ",." (read-prefixed-form cursor)))
-           (t (wrap "," (read-prefixed-form cursor)))))
-    (#\# (read-dispatch cursor))
-    (t (scan-atom cursor))))
-
-(defun read-body (cursor toplevel-p)
-  (let ((items '()))
-    (loop
-      (let* ((newlines (skip-whitespace cursor))
-             (char (peek cursor)))
-        (when (and (>= newlines 2) items (not (gap-p (first items))))
-          (push (gap) items))
-        (cond ((null char)
-               (unless toplevel-p (error "Unbalanced open parenthesis"))
-               (return))
-              ((char= char #\))
-               (when toplevel-p (error "Unbalanced close parenthesis"))
-               (advance cursor)
-               (return))
-              ((char= char #\;)
-               (push (scan-line-comment
-                      cursor
-                      (and (zerop newlines)
-                           items
-                           (not (gap-p (first items)))
-                           t))
-                     items))
-              (t (push (read-form cursor) items)))))
-    ;; A blank line before the closing parenthesis is dropped.
-    (when (and items (gap-p (first items)))
-      (pop items))
-    (nreverse items)))
+(defun arrange-children (node text)
+  (etypecase node
+    (paren (setf (paren-items node) (arrange (paren-items node) text)))
+    (wrap (arrange-children (wrap-child node) text))
+    (guard (arrange-children (guard-condition node) text)
+           (arrange-children (guard-form node) text))
+    ((or raw remark) nil)))
 
 (defun parse (source)
-  (read-body (cursor source) t))
+  (let* ((client (make-instance 'client :text source))
+         (stream (make-string-input-stream source)))
+    (arrange (mapcar (lambda (node) (resolve node client))
+                     (read-nodes client stream))
+             source)))
 
 ;;; Token equivalence, for checking that formatting reorders nothing.
 
@@ -378,6 +436,9 @@ whether the last line ends in a remark."
 (defun close-paren (ends-with-remark-p)
   (if ends-with-remark-p (cat +newline+ ")") ")"))
 
+(defun stack-list (docs)
+  (reduce (lambda (left right) (cat left +newline+ right)) docs))
+
 (defun specials-head (open operator specials binding-style)
   "The head line: opening, operator, and distinguished arguments, on
 one line when they fit or aligned under the first otherwise."
@@ -398,9 +459,6 @@ one line when they fit or aligned under the first otherwise."
              (choice (cat head " " (join-flat flats))
                      (cat head " " (align (stack-list docs)))))
             (t (cat head " " (align (stack-list docs))))))))
-
-(defun stack-list (docs)
-  (reduce (lambda (left right) (cat left +newline+ right)) docs))
 
 (defun binding-list-docs (bindings)
   "A FLET or LABELS binding list: each binding formats like a DEFUN."
@@ -468,15 +526,16 @@ indented two below. Returns NIL when the shape does not apply."
   (let ((items (paren-items node)))
     (when (notany (lambda (item) (or (remark-p item) (gap-p item)))
                   items)
-      (let ((docs (mapcar #'node-docs items)))
-        (if (rest docs)
-            (multiple-value-bind (head-doc) (node-docs (first items))
-              (cat (paren-open node) head-doc " "
-                   (align (fill-join (mapcar (lambda (item)
-                                               (values (node-docs item)))
-                                             (rest items))))
-                   ")"))
-            (cat (paren-open node) (first docs) ")"))))))
+      (if (rest items)
+          (multiple-value-bind (head-doc) (node-docs (first items))
+            (cat (paren-open node) head-doc " "
+                 (align (fill-join (mapcar (lambda (item)
+                                             (values (node-docs item)))
+                                           (rest items))))
+                 ")"))
+          (cat (paren-open node)
+               (values (node-docs (first items)))
+               ")")))))
 
 (defun paren-docs (node &optional forced-rule)
   (let ((items (paren-items node)))

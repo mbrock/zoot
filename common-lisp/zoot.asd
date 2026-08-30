@@ -6,7 +6,7 @@
 
 (asdf:defsystem "zoot/sexp"
   :description "A Lisp source pretty-printer built on Zoot"
-  :depends-on ("zoot")
+  :depends-on ("zoot" "eclector")
   :components ((:file "sexp")))
 
 (asdf:defsystem "zoot/tests"

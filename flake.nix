@@ -26,7 +26,7 @@
               typst
               ocaml
               dune_3
-              sbcl
+              (sbcl.withPackages (ps: [ ps.eclector ]))
               git
             ] ++ lib.optionals stdenv.hostPlatform.isLinux [ perf ];
           };
