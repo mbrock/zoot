@@ -77,12 +77,12 @@
   (format t "~18A  ~5A  ~9A  ~9A  ~9A  ~8A  ~10A  ~8A  ~7A~%"
           "case" "runs" "total ms" "build ms" "plan ms" "chars" "overflow"
           "newlines" "tainted")
-  (format t "~18A  ~5A  ~9A  ~9A  ~9A  ~8A  ~10A  ~8A  ~7A~%"
+  (format t "~18A  ~5A  ~9A  ~9A  ~9A  ~8A  ~10A  ~8A  ~8A  ~7A~%"
           "------------------" "-----" "---------" "---------" "---------"
-          "--------" "----------" "--------" "-------")
+          "--------" "----------" "--------" "--------" "-------")
   (dolist (sample samples)
     (let ((rank (sample-rank sample)))
-      (format t "~18A  ~5D  ~9,3F  ~9,3F  ~9,3F  ~8D  ~10D  ~8D  ~7A~%"
+      (format t "~18A  ~5D  ~9,3F  ~9,3F  ~9,3F  ~8D  ~10D  ~8D  ~8D  ~7A~%"
               (sample-name sample)
               (sample-runs sample)
               (sample-total-average sample)
@@ -90,6 +90,7 @@
               (sample-plan-average sample)
               (sample-bytes sample)
               (rank-overflow rank)
+              (rank-indentation rank)
               (rank-height rank)
               (if (sample-tainted-p sample) "yes" "no")))))
 

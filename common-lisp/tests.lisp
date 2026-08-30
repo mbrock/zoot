@@ -24,6 +24,11 @@
   (check overflow (rank-overflow (candidate-rank candidate)) "overflow differs")
   (check height (rank-height (candidate-rank candidate)) "height differs"))
 
+(defun check-indentation (indentation candidate)
+  (check indentation
+         (rank-indentation (candidate-rank candidate))
+         "indentation differs"))
+
 ;;; Document kinds are plain data: strings, the newline character, conses,
 ;;; and small structs for choice, indentation, and memo checkpoints.
 
@@ -72,6 +77,7 @@
        (candidate (result-candidate (pick document (make-f1 6)))))
   (check (format nil "a~%  12345~%  b") (render candidate))
   (check 3 (candidate-last candidate))
+  (check-indentation 4 candidate)
   (check-rank 1 2 candidate))
 
 (let* ((branch-a (cat (text "a") +newline+ (text "b")))
@@ -96,6 +102,7 @@
   (check-rank 400 0 one-line)
   (check (format nil "   = func(~%  pretty,~%  print~%)")
          (render many-lines))
+  (check-indentation 4 many-lines)
   (check-rank 26 3 many-lines))
 
 ;;; Cost measurement is a dynamically bindable function value. This objective
@@ -128,7 +135,7 @@
     (setf frontier
           (zoot::merge-evaluations
            frontier
-           (zoot::%candidate layout (first point) (second point) 0))))
+           (zoot::%candidate layout (first point) (second point) 0 0))))
   (check-true (typep frontier 'simple-vector)
               "three-point frontier should be a simple vector")
   (check nil (array-has-fill-pointer-p frontier)

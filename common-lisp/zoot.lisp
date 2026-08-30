@@ -9,7 +9,7 @@
    #:*cost-measure* #:linear-overflow-cost #:squared-overflow-cost
    #:result-candidate #:result-frontier #:result-statistics #:result-tainted-p
    #:candidate-last #:candidate-rank
-   #:rank-overflow #:rank-height
+   #:rank-overflow #:rank-indentation #:rank-height
    #:statistics-evaluations #:statistics-memo-hits
    #:statistics-memo-entries #:statistics-frontier-maximum
    #:statistics-frontier-histogram
@@ -197,8 +197,10 @@ nonnegative integer. Newline count remains the secondary rank component.")
   (%cost #'squared-overflow-cost page-width
          (or computation-width (default-computation-width page-width))))
 
-(defstruct (rank (:constructor %rank (&optional (overflow 0) (height 0))))
+(defstruct (rank (:constructor %rank
+                     (&optional (overflow 0) (indentation 0) (height 0))))
   (overflow 0 :type nonnegative-fixnum :read-only t)
+  (indentation 0 :type nonnegative-fixnum :read-only t)
   (height 0 :type nonnegative-fixnum :read-only t))
 
 (defun text-overflow (cost column length)
@@ -215,23 +217,33 @@ nonnegative integer. Newline count remains the secondary rank component.")
 ;;; Inlining the constructor lets callers with already-derived slot types
 ;;; allocate directly without re-checking them.
 (declaim (inline %candidate))
-(defstruct (candidate (:constructor %candidate (layout last overflow height)))
+(defstruct (candidate
+            (:constructor %candidate
+                (layout last overflow indentation height)))
   (layout nil :type document :read-only t)
   (last 0 :type nonnegative-fixnum :read-only t)
   (overflow 0 :type nonnegative-fixnum :read-only t)
+  (indentation 0 :type nonnegative-fixnum :read-only t)
   (height 0 :type nonnegative-fixnum :read-only t))
 
 (defun candidate-rank (candidate)
   "The candidate's (overflow, height) rank as a fresh RANK object."
-  (%rank (candidate-overflow candidate) (candidate-height candidate)))
+  (%rank (candidate-overflow candidate)
+         (candidate-indentation candidate)
+         (candidate-height candidate)))
 
 (declaim (inline better-rank-p))
 (defun better-rank-p (left right)
-  "Strict lexicographic (overflow, height) order between candidates."
+  "Strict lexicographic (overflow, indentation, height) candidate order."
   (declare (type candidate left right))
   (or (< (candidate-overflow left) (candidate-overflow right))
       (and (= (candidate-overflow left) (candidate-overflow right))
-           (< (candidate-height left) (candidate-height right)))))
+           (or (< (candidate-indentation left)
+                  (candidate-indentation right))
+               (and (= (candidate-indentation left)
+                       (candidate-indentation right))
+                    (< (candidate-height left)
+                       (candidate-height right)))))))
 
 (defstruct (duel (:constructor %duel (first second)))
   "The common two-point Pareto frontier, ordered by decreasing final column."
@@ -272,7 +284,12 @@ nonnegative integer. Newline count remains the secondary rank component.")
   (and (<= (candidate-last left) (candidate-last right))
        (or (< (candidate-overflow left) (candidate-overflow right))
            (and (= (candidate-overflow left) (candidate-overflow right))
-                (<= (candidate-height left) (candidate-height right))))))
+                (or (< (candidate-indentation left)
+                       (candidate-indentation right))
+                    (and (= (candidate-indentation left)
+                            (candidate-indentation right))
+                         (<= (candidate-height left)
+                             (candidate-height right))))))))
 
 (defstruct (tainted-context (:constructor nil)))
 
@@ -552,6 +569,7 @@ call sites do not re-check child slots on every traversal."
        (%candidate document
                    (the nonnegative-fixnum (+ last length))
                    (text-overflow (the cost *cost*) last length)
+                   0
                    0)))
     (verbatim-document
      (let ((string (verbatim-document-text document))
@@ -572,7 +590,7 @@ call sites do not re-check child slots on every traversal."
            (when (null break)
              (return (%candidate document
                                  (the nonnegative-fixnum (+ column length))
-                                 overflow height)))
+                                 overflow 0 height)))
            (incf height)
            (setf column 0 start (1+ break))))))
     (choice-document
@@ -580,7 +598,8 @@ call sites do not re-check child slots on every traversal."
       (evaluate (choice-document-left document) last base)
       (evaluate (choice-document-right document) last base)))
     (character
-     (%candidate document base 0 1))
+     ;; Track the indentation of the line begun by this break.
+     (%candidate document base 0 base 1))
     (align-document
      (wrap-evaluation
       :align 0
@@ -634,6 +653,7 @@ call sites do not re-check child slots on every traversal."
      (:align (%align-document (candidate-layout candidate))))
    (candidate-last candidate)
    (candidate-overflow candidate)
+   (candidate-indentation candidate)
    (candidate-height candidate)))
 
 (defun wrap-evaluation (kind amount evaluation)
@@ -653,6 +673,8 @@ call sites do not re-check child slots on every traversal."
    (candidate-last right)
    (the nonnegative-fixnum
         (+ (candidate-overflow left) (candidate-overflow right)))
+   (the nonnegative-fixnum
+        (+ (candidate-indentation left) (candidate-indentation right)))
    (the nonnegative-fixnum
         (+ (candidate-height left) (candidate-height right)))))
 

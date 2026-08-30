@@ -324,15 +324,27 @@ their elements flow as a filled paragraph instead of code lines.")
     ("lambda" 1) ("let" 1) ("let*" 1)
     ("flet" 1 :functions) ("labels" 1 :functions) ("macrolet" 1 :functions)
     ("when" 1) ("unless" 1)
-    ("case" 1) ("ecase" 1) ("ccase" 1)
-    ("typecase" 1) ("etypecase" 1) ("ctypecase" 1)
+    ;; The fourth field is the number of leading forms in each body clause.
+    ;; Those forms stay on the clause head; the remaining forms are offered
+    ;; as a two-space-indented body instead of generic call arguments.
+    ("cond" 0 nil 1)
+    ("case" 1 nil 1) ("ecase" 1 nil 1) ("ccase" 1 nil 1)
+    ("typecase" 1 nil 1) ("etypecase" 1 nil 1) ("ctypecase" 1 nil 1)
     ("dolist" 1) ("dotimes" 1) ("block" 1) ("catch" 1)
     ("multiple-value-bind" 2) ("destructuring-bind" 2)
-    ("handler-case" 1) ("handler-bind" 1) ("restart-case" 1)
+    ("handler-case" 1 nil 2) ("handler-bind" 1)
+    ("restart-case" 1 nil 2)
     ("eval-when" 1) ("progn" 0) ("prog1" 1) ("unwind-protect" 1))
   "Body forms: distinguished argument count, and optionally :FUNCTIONS
 when the first distinguished argument is a list of local function
 definitions that should each format like a DEFUN.")
+
+(defparameter *hanging-only-heads*
+  '("function" "go" "if" "load-time-value" "locally"
+    "multiple-value-call" "multiple-value-prog1" "progv" "quote"
+    "return-from" "setq" "symbol-macrolet" "tagbody" "the" "throw")
+  "Special operators not already handled by body rules. Their conventional
+broken layout keeps the first operand beside the operator.")
 
 (defun bare-name (name)
   (let ((colon (position #\: name :from-end t)))
@@ -356,6 +368,39 @@ keyword-headed clauses, and LOOP."
          (or *data-context-p*
              (and (plusp (length name)) (char= (char name 0) #\:))
              (string-equal "loop" (bare-name name))))))
+
+(defparameter *loop-clause-heads*
+  '("named" "initially" "finally" "with" "for" "as" "repeat"
+    "while" "until" "always" "never" "thereis" "collect" "collecting"
+    "append" "appending" "nconc" "nconcing" "count" "counting" "sum"
+    "summing" "maximize" "maximizing" "minimize" "minimizing" "do"
+    "doing" "return" "if" "when" "unless" "else" "end" "and"))
+
+(defun loop-clause-head-p (item)
+  (and (raw-p item)
+       (member (bare-name (raw-text item)) *loop-clause-heads*
+               :test #'string-equal)))
+
+(defun loop-tail-doc (items)
+  "Group LOOP tokens into clauses so line choices occur before WHILE, DO,
+FOR, and similar clause heads, never between a clause head and its operand."
+  (let ((groups '()) (group '()) (after-and-p nil))
+    (dolist (item items)
+      (when (and group (loop-clause-head-p item) (not after-and-p))
+        (push (nreverse group) groups)
+        (setf group nil))
+      (push item group)
+      (setf after-and-p
+            (and (raw-p item)
+                 (string-equal "and" (bare-name (raw-text item))))))
+    (when group (push (nreverse group) groups))
+    (fill-join
+     (mapcar (lambda (items)
+               (reduce (lambda (left right)
+                         (cat left " " (values (node-docs right))))
+                       (rest items)
+                       :initial-value (values (node-docs (first items)))))
+             (nreverse groups)))))
 
 (defun join-flat (flats)
   (reduce (lambda (left right) (cat left " " right)) flats))
@@ -391,7 +436,7 @@ as :test #'eq keep keyword and value on one line."
                         (cat keyword (nest 2 (cat +newline+ value-doc))))
                 (when value-flat (cat keyword " " value-flat)))))))
 
-(defun stack-docs (items)
+(defun stack-docs (items &optional clause-head-count)
   "Lay ITEMS out vertically, honoring gaps and trailing remarks.
 Returns the vertical document, the one-line document or NIL, and
 whether the last line ends in a remark."
@@ -415,7 +460,10 @@ whether the last line ends in a remark."
          (setf ends-with-remark-p t))
         ((or raw wrap guard paren cons)
          (multiple-value-bind (document flat)
-             (if (consp item) (pair-docs item) (node-docs item))
+             (cond ((consp item) (pair-docs item))
+                   ((and clause-head-count (paren-p item))
+                    (clause-docs item clause-head-count))
+                   (t (node-docs item)))
            (push (cons document gap-pending-p) lines)
            (setf gap-pending-p nil ends-with-remark-p nil)
            (if flat (push flat flats) (setf flat-p nil))))))
@@ -435,6 +483,32 @@ whether the last line ends in a remark."
 
 (defun close-paren (ends-with-remark-p)
   (if ends-with-remark-p (cat +newline+ ")") ")"))
+
+(defun clause-docs (node head-count)
+  "A CASE-like clause: keep HEAD-COUNT leading forms on its head and
+offer the remaining forms as a body nested two spaces from the opening."
+  (let* ((items (paren-items node))
+         (split (min head-count (length items)))
+         (head-items (subseq items 0 split))
+         (body-items (nthcdr split items)))
+    (when (or (< (length head-items) head-count)
+              (some (lambda (item) (or (gap-p item) (remark-p item)))
+                    head-items))
+      (return-from clause-docs (paren-docs node)))
+    (multiple-value-bind (head-doc head-flat)
+        (stack-docs head-items)
+      (multiple-value-bind (body-doc body-flat ends-with-remark-p)
+          (stack-docs body-items)
+        (let* ((head (cat (paren-open node) (or head-flat head-doc)))
+               (broken (if body-doc
+                           (cat head (nest 2 (cat +newline+ body-doc))
+                                (close-paren ends-with-remark-p))
+                           (cat head ")")))
+               (flat (when (and head-flat body-flat)
+                       (cat (paren-open node) head-flat " " body-flat ")"))))
+          (if flat
+              (values (choice flat broken) flat)
+              (values broken nil)))))))
 
 (defun stack-list (docs)
   (reduce (lambda (left right) (cat left +newline+ right)) docs))
@@ -487,7 +561,7 @@ one line when they fit or aligned under the first otherwise."
 (defun rule-docs (node rule)
   "Body-form layout: distinguished arguments on the head line, body
 indented two below. Returns NIL when the shape does not apply."
-  (destructuring-bind (count &optional binding-style) rule
+  (destructuring-bind (count &optional binding-style clause-head-count) rule
     (let* ((items (paren-items node))
            (operator (raw-text (first items)))
            (specials (subseq items 1 (min (length items) (1+ count))))
@@ -498,7 +572,7 @@ indented two below. Returns NIL when the shape does not apply."
                            (or (remark-p item) (gap-p item)))
                          specials))
         (multiple-value-bind (body-doc body-flat ends-with-remark-p)
-            (stack-docs body)
+            (stack-docs body clause-head-count)
           (declare (ignore body-flat))
           (cat (specials-head (paren-open node) operator specials
                               binding-style)
@@ -506,7 +580,8 @@ indented two below. Returns NIL when the shape does not apply."
                (close-paren ends-with-remark-p)))))))
 
 (defun call-docs (node)
-  "Function-call layout: arguments aligned under the first."
+  "Function-call layouts: arguments either hang under the first or form a
+two-space-indented vertical body below the operator."
   (let* ((items (paren-items node))
          (head (first items)))
     (multiple-value-bind (head-doc head-flat) (node-docs head)
@@ -516,9 +591,18 @@ indented two below. Returns NIL when the shape does not apply."
           (stack-docs (rest items))
         (declare (ignore arguments-flat))
         (if arguments-doc
-            (cat (paren-open node) head-doc " "
-                 (align arguments-doc)
-                 (close-paren ends-with-remark-p))
+            (let ((close (close-paren ends-with-remark-p)))
+              (let ((hanging
+                      (cat (paren-open node) head-doc " "
+                           (align arguments-doc) close)))
+                (if (and (raw-p head)
+                         (not (member (bare-name (raw-text head))
+                                      *hanging-only-heads*
+                                      :test #'string-equal)))
+                    (choice hanging
+                            (cat (paren-open node) head-doc
+                                 (nest 2 (cat +newline+ arguments-doc)) close))
+                    hanging)))
             (cat (paren-open node) head-doc ")"))))))
 
 (defun fill-docs (node)
@@ -528,11 +612,23 @@ indented two below. Returns NIL when the shape does not apply."
                   items)
       (if (rest items)
           (multiple-value-bind (head-doc) (node-docs (first items))
-            (cat (paren-open node) head-doc " "
-                 (align (fill-join (mapcar (lambda (item)
-                                             (values (node-docs item)))
-                                           (rest items))))
-                 ")"))
+            (let* ((loop-p (and (raw-p (first items))
+                                (string-equal
+                                 "loop" (bare-name
+                                         (raw-text (first items))))))
+                   (tail (if loop-p
+                             (loop-tail-doc (rest items))
+                             (fill-join
+                              (mapcar (lambda (item)
+                                        (values (node-docs item)))
+                                      (rest items))))))
+              (let ((hanging (cat (paren-open node) head-doc " "
+                                  (align tail) ")")))
+                (if loop-p
+                    (choice hanging
+                            (cat (paren-open node) head-doc
+                                 (nest 2 (cat +newline+ tail)) ")"))
+                    hanging))))
           (cat (paren-open node)
                (values (node-docs (first items)))
                ")")))))
@@ -578,23 +674,27 @@ indented two below. Returns NIL when the shape does not apply."
     (wrap
      (let* ((prefix (wrap-prefix node))
             (*data-context-p*
-              (cond ((member prefix '("'" "`") :test #'string=) t)
+              (cond ((string= prefix "'") t)
+                    ((string= prefix "`") nil)
                     ((member prefix '("," ",@" ",.") :test #'string=) nil)
                     (t *data-context-p*))))
        (multiple-value-bind (document flat) (node-docs (wrap-child node))
-         (values (cat prefix document)
+         (values (if (string= prefix "`")
+                     (cat prefix (align document))
+                     (cat prefix document))
                  (when flat (cat prefix flat))))))
     (guard
      (multiple-value-bind (condition-doc condition-flat)
          (node-docs (guard-condition node))
        (multiple-value-bind (form-doc form-flat)
            (node-docs (guard-form node))
+         (declare (ignore form-flat))
          (let ((head (cat (guard-prefix node)
                           (or condition-flat condition-doc))))
-           (values (choice (cat head " " form-doc)
-                           (cat head +newline+ form-doc))
-                   (when (and condition-flat form-flat)
-                     (cat head " " form-flat)))))))
+           ;; Reader conditionals are visual boundaries, not ordinary
+           ;; prefixes: keep the condition and guarded form on separate lines
+           ;; even when their combined text would fit.
+           (values (cat head +newline+ form-doc) nil)))))
     (paren
      (let ((*data-context-p*
              (or *data-context-p*
