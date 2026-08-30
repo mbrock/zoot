@@ -24,12 +24,12 @@
   (check overflow (rank-overflow (candidate-rank candidate)) "overflow differs")
   (check height (rank-height (candidate-rank candidate)) "height differs"))
 
-;;; Document kinds are distinct structure types under the common base type.
+;;; Document kinds are plain data: strings, the newline character, conses,
+;;; and small structs for choice, indentation, and memo checkpoints.
 
-(check t (typep (text "x") 'zoot::text-document))
-(check t (typep +newline+ 'zoot::newline-document))
-(check t (typep (concatenate (text "a") (text "b"))
-                'zoot::concatenation-document))
+(check t (typep (text "x") 'string))
+(check t (typep +newline+ 'character))
+(check t (typep (concatenate (text "a") (text "b")) 'cons))
 (check t (typep (choice (text "a") (text "b")) 'zoot::choice-document))
 (check t (typep (nest 2 (cat +newline+ (text "x"))) 'zoot::nest-document))
 (check t (typep (align (cat +newline+ (text "x"))) 'zoot::align-document))
@@ -41,15 +41,15 @@
        (result (pick (choice inline multiline) (make-f1 10))))
   (check "foo bar" (render (result-candidate result))))
 
-;;; A document and its node-local memo state belong to exactly one PICK.
+;;; Memo state is PICK-scoped, so a document can be resolved repeatedly,
+;;; even under a different cost.
 
-(let ((document (text "once")))
-  (pick document (make-f1 10))
-  (check-true
-   (handler-case
-       (progn (pick document (make-f1 10)) nil)
-     (error () t))
-   "a second PICK should reject a consumed document"))
+(let ((document (cat (text "abcdefgh") +newline+ (text "tail"))))
+  (check (format-document document (make-f1 10))
+         (format-document document (make-f1 10))
+         "picking the same document twice should agree")
+  (check-true (stringp (format-document document (make-f2 6)))
+              "picking again under another cost should still resolve"))
 
 (let* ((cheap-long (text "12345"))
        (costly-short (cat +newline+ (text "x")))
@@ -141,7 +141,7 @@
 (let ((document (text "x")))
   (dolist (expected '(5 4 3 2 1 0 5))
     (setf document (concatenate document (text "x")))
-    (check expected (zoot::document-memo-weight document)
+    (check expected (zoot::memo-weight document)
            "memo weight differs")))
 
 ;;; Computation-width taint / Cope behavior, corresponding to the regression

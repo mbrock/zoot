@@ -20,89 +20,93 @@
   '(integer 0 #.most-positive-fixnum))
 
 ;;; Documents
+;;;
+;;; Documents are plain data, as in recursive.zig: a string is a text
+;;; terminal, the newline character is a hard line break, a cons is a
+;;; concatenation, and small structs cover choice, indentation, and memo
+;;; checkpoints.
 
 (defconstant +initial-memo-weight+ 6
-  "Number of structural levels between memo checkpoints, as in the OCaml
+  "Number of concatenation levels between memo checkpoints, as in the OCaml
 reference implementation (its PARAM_MEMO_LIMIT is 7, with initial weight 6).")
 
-(defstruct (document (:constructor nil))
-  (memo-weight +initial-memo-weight+
-               :type (integer 0 6)
-               :read-only t)
-  ;; Documents are single-use search spaces. Memoized candidates live in a
-  ;; PICK-scoped table keyed by this lazily assigned serial number and are
-  ;; reclaimed when that PICK's table is dropped.
-  (memo-id nil :type (or null nonnegative-fixnum))
-  (consumed-p nil :type boolean))
+(defstruct (choice-document (:constructor %choice-document (left right)))
+  (left nil :read-only t)
+  (right nil :read-only t))
 
-(defstruct (text-document
-            (:include document)
-            (:constructor %text-document (text)))
-  (text "" :type string :read-only t))
-
-(defstruct (newline-document
-            (:include document)
-            (:constructor %newline-document ())))
-
-(defstruct (concatenation-document
-            (:include document)
-            (:constructor %concatenation-document (left right memo-weight)))
-  (left nil :type document :read-only t)
-  (right nil :type document :read-only t))
-
-(defstruct (choice-document
-            (:include document)
-            (:constructor %choice-document (left right memo-weight)))
-  (left nil :type document :read-only t)
-  (right nil :type document :read-only t))
-
-(defstruct (nest-document
-            (:include document)
-            (:constructor %nest-document (amount child memo-weight)))
+(defstruct (nest-document (:constructor %nest-document (amount child)))
   (amount 0 :type nonnegative-fixnum :read-only t)
-  (child nil :type document :read-only t))
+  (child nil :read-only t))
 
-(defstruct (align-document
-            (:include document)
-            (:constructor %align-document (child memo-weight)))
-  (child nil :type document :read-only t))
+(defstruct (align-document (:constructor %align-document (child)))
+  (child nil :read-only t))
+
+(defstruct (memo-document (:constructor %memo-document (child)))
+  ;; Memoized candidates live in a PICK-scoped table keyed by this lazily
+  ;; assigned serial number and are reclaimed when that PICK's table is
+  ;; dropped.
+  (id nil :type (or null nonnegative-fixnum))
+  (child nil :read-only t))
+
+(deftype document ()
+  '(or string character cons
+       choice-document nest-document align-document memo-document))
+
+(defun memo-weight (document)
+  "Structural levels below DOCUMENT until a memo checkpoint. Zero marks a
+checkpoint. The countdown flows through every composite node, choices
+included, so that documents sharing subtrees through choice chains still
+hit checkpoints; leaves reset it. The public constructors wrap any node
+whose countdown runs out, which also bounds this recursion."
+  (typecase document
+    (memo-document 0)
+    (cons (min (next-memo-weight (car document))
+               (next-memo-weight (cdr document))))
+    (choice-document
+     (min (next-memo-weight (choice-document-left document))
+          (next-memo-weight (choice-document-right document))))
+    (nest-document (next-memo-weight (nest-document-child document)))
+    (align-document (next-memo-weight (align-document-child document)))
+    (t +initial-memo-weight+)))
 
 (defun next-memo-weight (document)
-  (let ((weight (document-memo-weight document)))
+  (let ((weight (memo-weight document)))
     (if (zerop weight) +initial-memo-weight+ (1- weight))))
+
+(defun checkpointed (node)
+  "Wrap NODE in a memo checkpoint when its countdown has run out."
+  (if (zerop (memo-weight node))
+      (%memo-document node)
+      node))
 
 (defun text (string)
   "A terminal document. STRING must not contain a newline."
   (check-type string string)
   (when (find #\Newline string)
     (error "TEXT terminals cannot contain newlines: ~S" string))
-  (%text-document string))
+  string)
 
-(defparameter +newline+ (%newline-document)
+(defconstant +newline+ #\Newline
   "A hard newline. Its following indentation is determined by NEST and ALIGN.")
 
 (defun concatenate (left right)
   "Unaligned concatenation: place RIGHT immediately after LEFT."
-  (%concatenation-document
-   left right
-   (min (next-memo-weight left) (next-memo-weight right))))
+  (checkpointed (cons left right)))
 
 (defun choice (left right)
   "An arbitrary choice between two documents."
-  (%choice-document
-   left right
-   (min (next-memo-weight left) (next-memo-weight right))))
+  (checkpointed (%choice-document left right)))
 
 (defun nest (amount document)
   "Indent lines after the first by AMOUNT columns."
   (check-type amount nonnegative-fixnum)
   (if (zerop amount)
       document
-      (%nest-document amount document (next-memo-weight document))))
+      (checkpointed (%nest-document amount document))))
 
 (defun align (document)
   "Use the current column as DOCUMENT's indentation base."
-  (%align-document document (next-memo-weight document)))
+  (checkpointed (%align-document document)))
 
 (defun cat (&rest documents)
   (reduce #'concatenate documents :initial-value (text "")))
@@ -115,22 +119,21 @@ reference implementation (its PARAM_MEMO_LIMIT is 7, with initial weight 6).")
               (rest documents)
               :initial-value (first documents))))
 
-(defgeneric flatten (document)
-  (:documentation
-   "Replace newlines with spaces and recursively flatten both choice branches."))
-
-(defmethod flatten ((document text-document)) document)
-(defmethod flatten ((document newline-document)) (text " "))
-(defmethod flatten ((document concatenation-document))
-  (concatenate (flatten (concatenation-document-left document))
-               (flatten (concatenation-document-right document))))
-(defmethod flatten ((document choice-document))
-  (choice (flatten (choice-document-left document))
-          (flatten (choice-document-right document))))
-(defmethod flatten ((document nest-document))
-  (flatten (nest-document-child document)))
-(defmethod flatten ((document align-document))
-  (align (flatten (align-document-child document))))
+(defun flatten (document)
+  "Replace newlines with spaces and recursively flatten both choice
+branches. Memo checkpoints are preserved in place, so the flattened
+document needs no reweighting."
+  (etypecase document
+    (string document)
+    (character " ")
+    (cons (cons (flatten (car document)) (flatten (cdr document))))
+    (memo-document (%memo-document (flatten (memo-document-child document))))
+    (choice-document
+     (%choice-document (flatten (choice-document-left document))
+                       (flatten (choice-document-right document))))
+    (nest-document (flatten (nest-document-child document)))
+    (align-document
+     (%align-document (flatten (align-document-child document))))))
 
 (defun group (document)
   "Choose between DOCUMENT and its flattened form."
@@ -295,7 +298,7 @@ serial on a subtree shared across documents cannot collide with a fresh one.")
 (defstruct (tainted-left-context
             (:include tainted-context)
             (:constructor %tainted-left-context (document base evaluation)))
-  (document nil :type concatenation-document :read-only t)
+  (document nil :type cons :read-only t)
   (base 0 :type nonnegative-fixnum :read-only t)
   (evaluation nil :type t :read-only t))
 
@@ -542,8 +545,9 @@ region. If both sides are tainted, retain the left promise."
 
 (declaim (inline document-memo-serial memo-context-key))
 (defun document-memo-serial (document)
-  (or (document-memo-id document)
-      (setf (document-memo-id document)
+  (declare (type memo-document document))
+  (or (memo-document-id document)
+      (setf (memo-document-id document)
             (let ((serial *memo-serial*))
               (setf *memo-serial* (the nonnegative-fixnum (1+ serial)))
               serial))))
@@ -564,52 +568,13 @@ region. If both sides are tainted, retain the left promise."
                  (* (document-memo-serial document)
                     (the nonnegative-fixnum (* span span))))))))
 
-(defmacro memoized ((document last base) &body body)
-  "Evaluate BODY directly for ordinary nodes and cache it at memo checkpoints
-whose context lies inside the computation limit."
-  (let ((document-var (gensym "DOCUMENT"))
-        (last-var (gensym "LAST"))
-        (base-var (gensym "BASE"))
-        (limit-var (gensym "LIMIT"))
-        (contexts-var (gensym "CONTEXTS"))
-        (key-var (gensym "KEY"))
-        (value-var (gensym "VALUE"))
-        (present-var (gensym "PRESENT"))
-        (compute-name (gensym "COMPUTE")))
-    `(let ((,document-var ,document))
-       (labels ((,compute-name () ,@body))
-         (if (zerop (document-memo-weight ,document-var))
-             (let ((,last-var ,last)
-                   (,base-var ,base)
-                   (,limit-var (cost-limit *cost*)))
-               (if (and (<= ,last-var ,limit-var)
-                        (<= ,base-var ,limit-var))
-                   (let* ((,contexts-var *memo-table*)
-                          (,key-var (memo-context-key
-                                     ,document-var
-                                     ,last-var ,base-var ,limit-var)))
-                     (multiple-value-bind (,value-var ,present-var)
-                         (gethash ,key-var ,contexts-var)
-                       (if ,present-var
-                           (progn
-                             (note-statistic
-                              (statistics-memo-hits *statistics*))
-                             ,value-var)
-                           (let ((,value-var (,compute-name)))
-                             (setf (gethash ,key-var ,contexts-var) ,value-var)
-                             (note-statistic
-                              (statistics-memo-entries *statistics*))
-                             ,value-var))))
-                   (,compute-name)))
-             (,compute-name))))))
-
 (declaim (inline exceeds-computation-limit-p))
 (defun exceeds-computation-limit-p (document last base)
   (declare (type nonnegative-fixnum last base))
   (let ((limit (cost-limit (the cost *cost*))))
     (or (> base limit)
-        (> (if (text-document-p document)
-               (+ last (length (text-document-text document)))
+        (> (if (stringp document)
+               (+ last (length document))
                last)
            limit))))
 
@@ -618,11 +583,10 @@ whose context lies inside the computation limit."
   (declare (type document document)
            (type nonnegative-fixnum last base))
   (etypecase document
-    (concatenation-document
+    (cons
      (evaluate-concatenation document last base))
-    (text-document
-     (let* ((string (text-document-text document))
-            (length (length string)))
+    (string
+     (let ((length (length document)))
        (%candidate document
                    (the nonnegative-fixnum (+ last length))
                    (text-overflow (the cost *cost*) last length)
@@ -631,7 +595,7 @@ whose context lies inside the computation limit."
      (merge-evaluations
       (evaluate (choice-document-left document) last base)
       (evaluate (choice-document-right document) last base)))
-    (newline-document
+    (character
      (%candidate document base 0 1))
     (align-document
      (wrap-evaluation
@@ -642,33 +606,49 @@ whose context lies inside the computation limit."
        (wrap-evaluation
         :nest amount
         (evaluate (nest-document-child document) last
-                  (the nonnegative-fixnum (+ base amount))))))))
+                  (the nonnegative-fixnum (+ base amount))))))
+    (memo-document
+     (evaluate (memo-document-child document) last base))))
 
 (defun evaluate (document last base)
   (declare (type document document)
            (type nonnegative-fixnum last base))
-  (memoized (document last base)
-    (note-statistic
-     (statistics-evaluations (the statistics *statistics*)))
-    (labels ((core ()
-               (note-evaluation (evaluate-document document last base))))
-      (if (exceeds-computation-limit-p document last base)
-          (tainted-evaluation
-           (%tainted-document-context document last base))
-          (core)))))
+  (if (memo-document-p document)
+      (let ((limit (cost-limit *cost*)))
+        (if (and (<= last limit) (<= base limit))
+            (let ((contexts *memo-table*)
+                  (key (memo-context-key document last base limit)))
+              (multiple-value-bind (value present)
+                  (gethash key contexts)
+                (if present
+                    (progn
+                      (note-statistic
+                       (statistics-memo-hits *statistics*))
+                      value)
+                    (let ((value (evaluate (memo-document-child document)
+                                           last base)))
+                      (setf (gethash key contexts) value)
+                      (note-statistic
+                       (statistics-memo-entries *statistics*))
+                      value))))
+            (evaluate (memo-document-child document) last base)))
+      (progn
+        (note-statistic
+         (statistics-evaluations (the statistics *statistics*)))
+        (if (exceeds-computation-limit-p document last base)
+            (tainted-evaluation
+             (%tainted-document-context document last base))
+            (note-evaluation (evaluate-document document last base))))))
 
-;;; Layout reconstruction. Chosen layouts are choice-free and are only
-;;; rendered, so the memo-weight bookkeeping the public constructors
-;;; maintain is never load-bearing for them; build them with a constant
-;;; weight instead.
+;;; Layout reconstruction. Chosen layouts are choice-free trees of conses,
+;;; strings, newline characters, and wrap structs, built without memo
+;;; checkpoints since they are only rendered.
 
 (defun wrap-candidate (kind amount candidate)
   (%candidate
    (ecase kind
-     (:nest (%nest-document
-             amount (candidate-layout candidate) +initial-memo-weight+))
-     (:align (%align-document
-              (candidate-layout candidate) +initial-memo-weight+)))
+     (:nest (%nest-document amount (candidate-layout candidate)))
+     (:align (%align-document (candidate-layout candidate))))
    (candidate-last candidate)
    (candidate-overflow candidate)
    (candidate-height candidate)))
@@ -693,8 +673,7 @@ whose context lies inside the computation limit."
 (defun concatenate-candidates (left right)
   (declare (type candidate left right))
   (%candidate
-   (%concatenation-document (candidate-layout left) (candidate-layout right)
-                            +initial-memo-weight+)
+   (cons (candidate-layout left) (candidate-layout right))
    (candidate-last right)
    (the nonnegative-fixnum
         (+ (candidate-overflow left) (candidate-overflow right)))
@@ -718,13 +697,13 @@ whose context lies inside the computation limit."
       (%tainted-right-context left right)))))
 
 (defun concatenate-right (document left base)
+  (declare (type cons document))
   (concatenate-right-evaluation
    left
-   (evaluate (concatenation-document-right document)
-             (candidate-last left) base)))
+   (evaluate (cdr document) (candidate-last left) base)))
 
 (defun concatenate-left-evaluation (document base left)
-  (declare (type concatenation-document document)
+  (declare (type cons document)
            (type nonnegative-fixnum base))
   (etypecase left
     (null left)
@@ -746,11 +725,11 @@ whose context lies inside the computation limit."
       (%tainted-left-context document base left)))))
 
 (defun evaluate-concatenation (document last base)
-  (declare (type concatenation-document document)
+  (declare (type cons document)
            (type nonnegative-fixnum last base))
   (concatenate-left-evaluation
    document base
-   (evaluate (concatenation-document-left document) last base)))
+   (evaluate (car document) last base)))
 
 (defstruct (result (:constructor %result
                        (candidate frontier statistics tainted-p)))
@@ -760,13 +739,11 @@ whose context lies inside the computation limit."
   (tainted-p nil :type boolean :read-only t))
 
 (defun pick (document cost)
-  "Consume and resolve DOCUMENT with computation-width taint. Documents are
-single-use search spaces. Ordinary Pareto frontiers are exact and unrestricted;
+  "Resolve DOCUMENT with computation-width taint. Memoized candidates live
+in a PICK-scoped table, so documents may be picked again, even under a
+different cost. Ordinary Pareto frontiers are exact and unrestricted;
 forced tainted regions deliberately recover one candidate, as in Pretty
 Expressive and recursive.zig."
-  (when (document-consumed-p document)
-    (error "PICK cannot reuse an already consumed document"))
-  (setf (document-consumed-p document) t)
   (let ((*cost* cost)
         (*memo-table* (make-hash-table :test #'eql :size 1024))
         #+zoot-statistics
@@ -795,41 +772,30 @@ Expressive and recursive.zig."
 
 ;;; Rendering
 
-(defgeneric render-layout (document stream last base))
-
-(defmethod render-layout ((document text-document) stream last base)
-  (declare (ignore base) (type nonnegative-fixnum last))
-  (write-string (text-document-text document) stream)
-  (the nonnegative-fixnum
-       (+ last (length (text-document-text document)))))
-
-(defmethod render-layout ((document newline-document) stream last base)
-  (declare (ignore last) (type nonnegative-fixnum base))
-  (terpri stream)
-  (loop repeat base do (write-char #\Space stream))
-  base)
-
-(defmethod render-layout
-    ((document concatenation-document) stream last base)
+(defun render-layout (document stream last base)
   (declare (type nonnegative-fixnum last base))
-  (render-layout
-   (concatenation-document-right document) stream
-   (render-layout (concatenation-document-left document) stream last base)
-   base))
-
-(defmethod render-layout ((document nest-document) stream last base)
-  (declare (type nonnegative-fixnum last base))
-  (render-layout (nest-document-child document) stream last
-                 (the nonnegative-fixnum
-                      (+ base (nest-document-amount document)))))
-
-(defmethod render-layout ((document align-document) stream last base)
-  (declare (ignore base) (type nonnegative-fixnum last))
-  (render-layout (align-document-child document) stream last last))
-
-(defmethod render-layout ((document choice-document) stream last base)
-  (declare (ignore stream last base))
-  (error "Cannot render an unresolved choice"))
+  (etypecase document
+    (string
+     (write-string document stream)
+     (the nonnegative-fixnum (+ last (length document))))
+    (character
+     (terpri stream)
+     (loop repeat base do (write-char #\Space stream))
+     base)
+    (cons
+     (render-layout (cdr document) stream
+                    (render-layout (car document) stream last base)
+                    base))
+    (nest-document
+     (render-layout (nest-document-child document) stream last
+                    (the nonnegative-fixnum
+                         (+ base (nest-document-amount document)))))
+    (align-document
+     (render-layout (align-document-child document) stream last last))
+    (memo-document
+     (render-layout (memo-document-child document) stream last base))
+    (choice-document
+     (error "Cannot render an unresolved choice"))))
 
 (defun render (candidate &optional stream)
   "Render CANDIDATE. Return a string when STREAM is omitted."
