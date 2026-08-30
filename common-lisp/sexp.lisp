@@ -11,6 +11,8 @@
   (:use #:cl)
   (:import-from #:zoot
                 #:verbatim #:+newline+ #:cat #:choice #:nest #:align
+                #:span #:span-document #:span-document-meta
+                #:render-layout
                 #:pick #:render #:result-candidate #:make-f2)
   (:export #:format-source #:format-file #:source-tokens))
 
@@ -99,6 +101,11 @@ region is re-read after the enclosing read completes."
     ((client client) input-stream package-indicator symbol-name internp)
   (declare (ignore input-stream package-indicator internp))
   symbol-name)
+
+(defmethod eclector.reader:find-character ((client client) name)
+  ;; Accept this implementation's extended character names, such as
+  ;; #\Escape, beyond Eclector's portable table.
+  (or (call-next-method) (name-char name)))
 
 (defmethod eclector.reader:wrap-in-quote ((client client) material)
   (list :prefix "'" material))
@@ -431,7 +438,7 @@ as :test #'eq keep keyword and value on one line."
 (defun pair-docs (pair)
   (destructuring-bind (key value) (rest pair)
     (multiple-value-bind (value-doc value-flat) (node-docs value)
-      (let ((keyword (raw-text key)))
+      (let ((keyword (values (node-docs key))))
         (values (choice (cat keyword " " value-doc)
                         (cat keyword (nest 2 (cat +newline+ value-doc))))
                 (when value-flat (cat keyword " " value-flat)))))))
@@ -452,9 +459,11 @@ whether the last line ends in a remark."
          (setf flat-p nil)
          (if (and (remark-trailing-p item) lines (not gap-pending-p))
              (setf (car (first lines))
-                   (cat (car (first lines)) " " (remark-text item)))
+                   (cat (car (first lines)) " "
+                        (span :comment (remark-text item))))
              (progn
-               (push (cons (verbatim (remark-text item)) gap-pending-p)
+               (push (cons (span :comment (verbatim (remark-text item)))
+                           gap-pending-p)
                      lines)
                (setf gap-pending-p nil)))
          (setf ends-with-remark-p t))
@@ -527,7 +536,7 @@ one line when they fit or aligned under the first otherwise."
         (push document docs)
         (if flat (push flat flats) (setf flat-p nil))))
     (setf docs (nreverse docs) flats (nreverse flats))
-    (let ((head (cat open operator)))
+    (let ((head (cat open (span :special operator))))
       (cond ((null specials) head)
             (flat-p
              (choice (cat head " " (join-flat flats))
@@ -665,12 +674,16 @@ two-space-indented vertical body below the operator."
 (defun node-docs (node)
   (etypecase node
     (raw
-     (let ((source (raw-text node)))
+     (let* ((source (raw-text node))
+            (meta (cond ((char= (char source 0) #\") :string)
+                        ((char= (char source 0) #\:) :keyword)))
+            (document (verbatim source))
+            (document (if meta (span meta document) document)))
        (if (find #\Newline source)
-           (values (verbatim source) nil)
-           (values source source))))
+           (values document nil)
+           (values document document))))
     (remark
-     (values (verbatim (remark-text node)) nil))
+     (values (span :comment (verbatim (remark-text node))) nil))
     (wrap
      (let* ((prefix (wrap-prefix node))
             (*data-context-p*
@@ -701,29 +714,82 @@ two-space-indented vertical body below the operator."
                  (string= (paren-open node) "#("))))
        (paren-docs node)))))
 
+;;; ANSI terminal styling
+;;;
+;;; The formatter wraps strings, keywords, comments, and body-form
+;;; operators in spans; rendering into an ANSI-STREAM interprets them
+;;; as SGR codes, while plain streams ignore them.
+
+(defclass ansi-stream (sb-gray:fundamental-character-output-stream)
+  ((target :initarg :target :reader ansi-target)
+   (stack :initform '() :accessor ansi-stack)))
+
+(defmethod sb-gray:stream-write-char ((stream ansi-stream) char)
+  (write-char char (ansi-target stream)))
+
+(defmethod sb-gray:stream-write-string ((stream ansi-stream) string
+                                        &optional (start 0) end)
+  (write-string string (ansi-target stream)
+                :start start :end (or end (length string)))
+  string)
+
+(defmethod sb-gray:stream-line-column ((stream ansi-stream))
+  nil)
+
+(defun span-code (meta)
+  (case meta
+    (:special "1")
+    (:comment "2")
+    (:string "32")
+    (:keyword "36")))
+
+(defun write-span-code (stream code)
+  (format (ansi-target stream) "~C[~Am" #\Escape code))
+
+(defmethod render-layout ((document span-document) (stream ansi-stream)
+                          last base)
+  (let ((code (span-code (span-document-meta document))))
+    (if code
+        (progn
+          (push (span-document-meta document) (ansi-stack stream))
+          (write-span-code stream code)
+          (prog1 (call-next-method)
+            (pop (ansi-stack stream))
+            (write-span-code stream "0")
+            (dolist (outer (reverse (ansi-stack stream)))
+              (write-span-code stream (span-code outer)))))
+        (call-next-method))))
+
 ;;; Driving
 
-(defun format-source (source &key (width 80))
-  "Format Lisp SOURCE text optimally within WIDTH columns."
+(defun format-source (source &key (width 80) style)
+  "Format Lisp SOURCE text optimally within WIDTH columns. STYLE :ANSI
+renders span annotations as terminal colors."
   (let ((cost (make-f2 width))
         (chunks '()))
-    (dolist (item (parse source))
-      (etypecase item
-        (gap (when chunks
-               (setf (first chunks)
-                     (cons (car (first chunks)) t))))
-        (remark
-         (if (and (remark-trailing-p item) chunks)
-             (setf (first chunks)
-                   (cons (concatenate 'string (car (first chunks))
-                                      " " (remark-text item))
-                         (cdr (first chunks))))
-             (push (cons (remark-text item) nil) chunks)))
-        ((or raw wrap guard paren)
-         (push (cons (render (result-candidate
-                              (pick (values (node-docs item)) cost)))
-                     nil)
-               chunks))))
+    (flet ((emit (document)
+             (with-output-to-string (plain)
+               (render (result-candidate (pick document cost))
+                       (ecase style
+                         ((nil) plain)
+                         (:ansi (make-instance 'ansi-stream
+                                               :target plain)))))))
+      (dolist (item (parse source))
+        (etypecase item
+          (gap (when chunks
+                 (setf (first chunks)
+                       (cons (car (first chunks)) t))))
+          (remark
+           (let ((text (emit (span :comment
+                                   (verbatim (remark-text item))))))
+             (if (and (remark-trailing-p item) chunks)
+                 (setf (first chunks)
+                       (cons (concatenate 'string (car (first chunks))
+                                          " " text)
+                             (cdr (first chunks))))
+                 (push (cons text nil) chunks))))
+          ((or raw wrap guard paren)
+           (push (cons (emit (values (node-docs item))) nil) chunks)))))
     (setf chunks (nreverse chunks))
     (with-output-to-string (output)
       (loop for (chunk . gap-after-p) in chunks
@@ -731,10 +797,10 @@ two-space-indented vertical body below the operator."
                (terpri output)
                (when gap-after-p (terpri output))))))
 
-(defun format-file (path &key (width 80))
+(defun format-file (path &key (width 80) style)
   "Format the file at PATH, returning the result as a string."
   (format-source
    (with-open-file (stream path :direction :input)
      (let ((source (make-string (file-length stream))))
        (subseq source 0 (read-sequence source stream))))
-   :width width))
+   :width width :style style))

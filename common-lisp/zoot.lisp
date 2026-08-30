@@ -4,8 +4,9 @@
   (:export
    #:text #:verbatim #:+newline+ #:concatenate #:cat #:vcat #:choice
    #:nest #:align
+   #:span #:span-document #:span-document-meta #:span-document-child
    #:flatten #:group
-   #:make-f1 #:make-f2 #:pick #:render #:format-document
+   #:make-f1 #:make-f2 #:pick #:render #:render-layout #:format-document
    #:*cost-measure* #:linear-overflow-cost #:squared-overflow-cost
    #:result-candidate #:result-frontier #:result-statistics #:result-tainted-p
    #:candidate-last #:candidate-rank
@@ -52,10 +53,16 @@ reference implementation (its PARAM_MEMO_LIMIT is 7, with initial weight 6).")
 (defstruct (verbatim-document (:constructor %verbatim-document (text)))
   (text "" :type string :read-only t))
 
+(defstruct (span-document (:constructor %span-document (meta child)))
+  "An annotation carrying opaque META through layout to rendering. Spans
+are invisible to measurement, so styling never influences the search."
+  (meta nil :read-only t)
+  (child nil :read-only t))
+
 (deftype document ()
   '(or string character cons
        choice-document nest-document align-document memo-document
-       verbatim-document))
+       verbatim-document span-document))
 
 (defun verbatim (string)
   "A text block whose newlines are part of its content. Lines after the
@@ -81,6 +88,7 @@ whose countdown runs out, which also bounds this recursion."
           (next-memo-weight (choice-document-right document))))
     (nest-document (next-memo-weight (nest-document-child document)))
     (align-document (next-memo-weight (align-document-child document)))
+    (span-document (next-memo-weight (span-document-child document)))
     (t +initial-memo-weight+)))
 
 (defun next-memo-weight (document)
@@ -122,6 +130,13 @@ whose countdown runs out, which also bounds this recursion."
   "Use the current column as DOCUMENT's indentation base."
   (checkpointed (%align-document document)))
 
+(defun span (meta document)
+  "Annotate DOCUMENT with opaque META, interpreted by RENDER-LAYOUT
+methods specialized on the output stream and transparent otherwise.
+Spans take no columns and cost nothing, so they cannot influence
+layout choice."
+  (checkpointed (%span-document meta document)))
+
 (defun cat (&rest documents)
   (reduce #'concatenate documents :initial-value (text "")))
 
@@ -148,7 +163,10 @@ document needs no reweighting."
                        (flatten (choice-document-right document))))
     (nest-document (flatten (nest-document-child document)))
     (align-document
-     (%align-document (flatten (align-document-child document))))))
+     (%align-document (flatten (align-document-child document))))
+    (span-document
+     (%span-document (span-document-meta document)
+                     (flatten (span-document-child document))))))
 
 (defun group (document)
   "Choose between DOCUMENT and its flattened form."
@@ -303,8 +321,9 @@ nonnegative integer. Newline count remains the secondary rank component.")
 (defstruct (tainted-wrap-context
             (:include tainted-context)
             (:constructor %tainted-wrap-context (kind amount evaluation)))
-  (kind :nest :type (member :nest :align) :read-only t)
-  (amount 0 :type nonnegative-fixnum :read-only t)
+  (kind :nest :type (member :nest :align :span) :read-only t)
+  ;; The nest amount, or a span's meta.
+  (amount 0 :read-only t)
   (evaluation nil :type t :read-only t))
 
 (defstruct (tainted-right-context
@@ -610,6 +629,10 @@ call sites do not re-check child slots on every traversal."
         :nest amount
         (evaluate (nest-document-child document) last
                   (the nonnegative-fixnum (+ base amount))))))
+    (span-document
+     (wrap-evaluation
+      :span (span-document-meta document)
+      (evaluate (span-document-child document) last base)))
     (memo-document
      (evaluate (memo-document-child document) last base))))
 
@@ -650,7 +673,8 @@ call sites do not re-check child slots on every traversal."
   (%candidate
    (ecase kind
      (:nest (%nest-document amount (candidate-layout candidate)))
-     (:align (%align-document (candidate-layout candidate))))
+     (:align (%align-document (candidate-layout candidate)))
+     (:span (%span-document amount (candidate-layout candidate))))
    (candidate-last candidate)
    (candidate-overflow candidate)
    (candidate-indentation candidate)
@@ -761,38 +785,61 @@ one candidate, as in Pretty Expressive and recursive.zig."
 
 ;;; Rendering
 
-(defun render-layout (document stream last base)
+(defgeneric render-layout (document stream last base)
+  (:documentation
+   "Write DOCUMENT at column LAST with indentation base BASE, returning
+the column after it. Rendering is the open part of the evaluator:
+methods on new document kinds extend output without touching layout
+search."))
+
+(defmethod render-layout ((document string) stream last base)
+  (declare (ignore base) (type nonnegative-fixnum last))
+  (write-string document stream)
+  (the nonnegative-fixnum (+ last (length document))))
+
+(defmethod render-layout ((document verbatim-document) stream last base)
+  (declare (ignore base) (type nonnegative-fixnum last))
+  (let* ((string (verbatim-document-text document))
+         (break (position #\Newline string :from-end t)))
+    (write-string string stream)
+    (the nonnegative-fixnum
+         (if break
+             (- (length string) break 1)
+             (+ last (length string))))))
+
+(defmethod render-layout ((document character) stream last base)
+  (declare (ignore last) (type nonnegative-fixnum base))
+  (terpri stream)
+  (loop repeat base do (write-char #\Space stream))
+  base)
+
+(defmethod render-layout ((document cons) stream last base)
   (declare (type nonnegative-fixnum last base))
-  (etypecase document
-    (string
-     (write-string document stream)
-     (the nonnegative-fixnum (+ last (length document))))
-    (verbatim-document
-     (let* ((string (verbatim-document-text document))
-            (break (position #\Newline string :from-end t)))
-       (write-string string stream)
-       (the nonnegative-fixnum
-            (if break
-                (- (length string) break 1)
-                (+ last (length string))))))
-    (character
-     (terpri stream)
-     (loop repeat base do (write-char #\Space stream))
-     base)
-    (cons
-     (render-layout (cdr document) stream
-                    (render-layout (car document) stream last base)
-                    base))
-    (nest-document
-     (render-layout (nest-document-child document) stream last
-                    (the nonnegative-fixnum
-                         (+ base (nest-document-amount document)))))
-    (align-document
-     (render-layout (align-document-child document) stream last last))
-    (memo-document
-     (render-layout (memo-document-child document) stream last base))
-    (choice-document
-     (error "Cannot render an unresolved choice"))))
+  (render-layout (cdr document) stream
+                 (render-layout (car document) stream last base)
+                 base))
+
+(defmethod render-layout ((document nest-document) stream last base)
+  (declare (type nonnegative-fixnum last base))
+  (render-layout (nest-document-child document) stream last
+                 (the nonnegative-fixnum
+                      (+ base (nest-document-amount document)))))
+
+(defmethod render-layout ((document align-document) stream last base)
+  (declare (ignore base) (type nonnegative-fixnum last))
+  (render-layout (align-document-child document) stream last last))
+
+(defmethod render-layout ((document memo-document) stream last base)
+  (render-layout (memo-document-child document) stream last base))
+
+;; Spans are transparent by default. A stream that interprets
+;; annotations specializes this method and wraps CALL-NEXT-METHOD.
+(defmethod render-layout ((document span-document) stream last base)
+  (render-layout (span-document-child document) stream last base))
+
+(defmethod render-layout ((document choice-document) stream last base)
+  (declare (ignore stream last base))
+  (error "Cannot render an unresolved choice"))
 
 (defun render (candidate &optional stream)
   "Render CANDIDATE. Return a string when STREAM is omitted."

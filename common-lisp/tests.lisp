@@ -56,6 +56,38 @@
        (result (pick document (make-f1 20))))
   (check (format nil "ab~%  x~%y z") (render (result-candidate result))))
 
+;;; Spans carry annotations through layout, flattening included, without
+;;; affecting cost. A RENDER-LAYOUT method specialized on both the span
+;;; and the output stream interprets them; other streams see through.
+
+(defclass recording-stream (sb-gray:fundamental-character-output-stream)
+  ((target :initarg :target :reader recording-target)
+   (events :initform '() :accessor recorded-events)))
+
+(defmethod sb-gray:stream-write-char ((stream recording-stream) char)
+  (write-char char (recording-target stream)))
+
+(defmethod render-layout ((document span-document)
+                          (stream recording-stream) last base)
+  (push (list :open (span-document-meta document))
+        (recorded-events stream))
+  (prog1 (call-next-method)
+    (push (list :close (span-document-meta document))
+          (recorded-events stream))))
+
+(let* ((body (group (cat (text "b") +newline+ (text "c"))))
+       (document (cat (text "a") (span :hot body) (text "d")))
+       (candidate (result-candidate (pick document (make-f1 10)))))
+  (check "ab cd" (render candidate))
+  (let ((events
+          (with-output-to-string (target)
+            (let ((stream (make-instance 'recording-stream
+                                         :target target)))
+              (render candidate stream)
+              (check '((:open :hot) (:close :hot))
+                     (reverse (recorded-events stream)))))))
+    (check "ab cd" events "spans should not disturb plain content")))
+
 ;;; Memo checkpoints cache per document, so a document can be resolved
 ;;; repeatedly under the cost configuration it was first picked with.
 

@@ -13,11 +13,13 @@
 (asdf:load-system "zoot/sexp")
 
 (let* ((arguments (rest sb-ext:*posix-argv*))
+       (style (when (member "--ansi" arguments :test #'string=) :ansi))
+       (arguments (remove "--ansi" arguments :test #'string=))
        (path (first arguments))
        (width (if (second arguments)
                   (parse-integer (second arguments))
                   80)))
   (unless path
-    (format *error-output* "usage: format-file.lisp FILE [WIDTH]~%")
+    (format *error-output* "usage: format-file.lisp FILE [WIDTH] [--ansi]~%")
     (sb-ext:exit :code 1))
-  (write-string (zoot-sexp:format-file path :width width)))
+  (write-string (zoot-sexp:format-file path :width width :style style)))

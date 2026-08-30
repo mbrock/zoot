@@ -60,4 +60,25 @@
  "(let ((*cost* cost) #+zoot-statistics (*statistics* (make-statistics))) evaluation)"
  80)
 
+;;; ANSI styling wraps special operators, strings, keywords, and
+;;; comments in SGR codes; stripping the codes recovers the plain layout
+;;; exactly, since spans are invisible to measurement.
+
+(incf *tests*)
+(let* ((source (format nil "(defun greet (name) ; say hi~%  \"doc\" (list :name name))"))
+       (plain (zoot-sexp:format-source source))
+       (styled (zoot-sexp:format-source source :style :ansi))
+       (stripped
+         (with-output-to-string (out)
+           (let ((index 0))
+             (loop while (< index (length styled))
+                   do (let ((char (char styled index)))
+                        (cond ((char= char #\Escape)
+                               (setf index
+                                     (1+ (position #\m styled :start index))))
+                              (t (write-char char out)
+                                 (incf index)))))))))
+  (unless (and (find #\Escape styled) (string= plain stripped))
+    (error "ANSI styling should decorate without changing layout")))
+
 (format t "Common Lisp S-expression printer: ~D checks passed.~%" *tests*)
