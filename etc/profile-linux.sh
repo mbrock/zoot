@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
-# Build and profile zoot with Linux perf hardware counters.
-# Requires: perf (Linux perf_events), zig.
+# Build and profile both zoot evaluators with Linux perf hardware counters.
 
 set -euo pipefail
 
@@ -11,7 +10,6 @@ fi
 
 if ! command -v perf >/dev/null 2>&1; then
   echo "error: perf not found in PATH." >&2
-  echo "hint: install linux-tools/ perf for your distribution." >&2
   exit 1
 fi
 
@@ -21,45 +19,71 @@ cd "$root_dir"
 runs="${RUNS:-100}"
 stat_runs="${STAT_RUNS:-5}"
 profile_dir="${PROFILE_DIR:-${root_dir}/.profiles}"
-perf_data="${profile_dir}/zoot.data"
-text_report="${profile_dir}/zoot-report.txt"
 binary="${root_dir}/zig-out/bin/zoot"
 mkdir -p "$profile_dir"
 
-echo "[1/4] building ReleaseFast zoot"
-zig build -Doptimize=ReleaseFast # -Dprofile-outline=true
+echo "profile: building ReleaseFast"
+zig build -Doptimize=ReleaseFast >/dev/null
 
-echo "[2/4] measuring hardware counters (${stat_runs} runs)"
-perf stat \
-  --repeat "$stat_runs" \
-  --event cycles:u,instructions:u,branches:u,branch-misses:u,cache-references:u,cache-misses:u \
-  -- "$binary" >/dev/null
+summarize_stat() {
+  awk -F, '
+    $3 == "cycles:u"           { cycles = $1 }
+    $3 == "instructions:u"     { instructions = $1 }
+    $3 == "branches:u"         { branches = $1 }
+    $3 == "branch-misses:u"    { misses = $1 }
+    $3 == "cache-references:u" { refs = $1 }
+    $3 == "cache-misses:u"     { cache_misses = $1 }
+    END {
+      miss_pct = branches ? 100 * misses / branches : 0
+      cache_pct = refs ? 100 * cache_misses / refs : 0
+      printf "cycles=%s  instructions=%s  branches=%s  branch-misses=%s (%.2f%%)  cache-misses=%s (%.2f%%)\n", \
+        cycles, instructions, branches, misses, miss_pct, cache_misses, cache_pct
+    }
+  ' "$1"
+}
 
-echo "[3/4] recording ${runs} runs -> ${perf_data}"
-export binary runs
-perf record \
-  --event cycles:u \
-  --freq 999 \
-  --output "${perf_data}" -- \
-  bash -c 'for ((i = 0; i < runs; i++)); do "$binary" >/dev/null; done'
+profile_one() {
+  local name="$1"
+  shift
+  local perf_data="${profile_dir}/zoot-${name}.data"
+  local stat_data="${profile_dir}/zoot-${name}-stat.csv"
+  local text_report="${profile_dir}/zoot-${name}-report.txt"
 
-echo "[4/4] writing readable summary -> ${text_report}"
-perf report \
-  --stdio \
-  --input "$perf_data" \
-  --no-children \
-  --call-graph none \
-  --sort symbol,dso \
-  --percent-limit 1 \
-  >"$text_report"
-sed -n '1,80p' "$text_report"
+  perf stat \
+    --no-big-num \
+    --field-separator , \
+    --repeat "$stat_runs" \
+    --output "$stat_data" \
+    --event cycles:u,instructions:u,branches:u,branch-misses:u,cache-references:u,cache-misses:u \
+    -- "$binary" "$@" >/dev/null
+
+  export binary runs
+  perf record \
+    --quiet \
+    --event cycles:u \
+    --freq 999 \
+    --output "$perf_data" -- \
+    bash -c 'for ((i = 0; i < runs; i++)); do "$binary" "$@" >/dev/null; done' bash "$@"
+
+  perf report \
+    --stdio \
+    --input "$perf_data" \
+    --no-children \
+    --call-graph none \
+    --sort symbol,dso \
+    --percent-limit 1 \
+    >"$text_report"
+
+  printf "  %-11s " "$name:"
+  summarize_stat "$stat_data"
+}
+
+echo "profile: counters (${stat_runs} runs), samples (${runs} runs)"
+profile_one cek
+profile_one recursive recursive
+
+echo "profile: reports in ${profile_dir}/zoot-{cek,recursive}-report.txt"
 
 if [[ "${TUI:-0}" == 1 ]]; then
-  perf report --input "$perf_data"
+  perf report --input "${profile_dir}/zoot-recursive.data"
 fi
-
-echo "done:"
-echo "  raw profile: ${perf_data}"
-echo "  text report: ${text_report}"
-echo "  TUI:         perf report --input ${perf_data}"
-echo "  TUI next run: TUI=1 $0"
