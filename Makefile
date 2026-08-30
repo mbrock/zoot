@@ -26,7 +26,7 @@ lisp-benchmark:
 	XDG_CACHE_HOME=/tmp/zoot-asdf-statistics sbcl --script common-lisp/benchmark.lisp $(RUNS)
 
 lisp-format:
-	XDG_CACHE_HOME=/tmp/zoot-asdf-statistics sbcl --script common-lisp/format-file.lisp $(FILE) $(WIDTH)
+	XDG_CACHE_HOME=/tmp/zoot-asdf-statistics sbcl --script common-lisp/format-file.lisp $(FILE) $(WIDTH) $(FLAGS)
 
 lisp-profile:
 	XDG_CACHE_HOME=/tmp/zoot-asdf-statistics-$(LISP_PROFILE_STATISTICS) ZOOT_STATISTICS=$(LISP_PROFILE_STATISTICS) sbcl --script common-lisp/profile.lisp $(LISP_PROFILE_SAMPLES) $(LISP_PROFILE_DEPTH)
