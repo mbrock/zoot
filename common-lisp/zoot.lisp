@@ -223,7 +223,10 @@ last column and rank. Frontiers are unrestricted adjustable vectors."
             do (frontier-add result candidate)))
     (sort result #'> :key #'candidate-last)))
 
-(deftype evaluation () '(or vector function))
+(defun canonicalize-frontier (frontier)
+  (if (= 1 (length frontier)) (aref frontier 0) frontier))
+
+(deftype evaluation () '(or candidate vector function))
 
 (defun tainted-evaluation (evaluator thunk)
   (incf (statistics-taints-deferred (evaluator-statistics evaluator)))
@@ -239,6 +242,8 @@ last column and rank. Frontiers are unrestricted adjustable vectors."
 (defmethod force-evaluation ((evaluation function))
   (funcall evaluation))
 
+(defmethod force-evaluation ((evaluation candidate)) evaluation)
+
 (defmethod force-evaluation ((evaluation vector))
   (when (zerop (length evaluation))
     (error "Cannot choose from an empty frontier"))
@@ -253,13 +258,40 @@ region. If both sides are tainted, retain the left promise."))
 (defmethod merge-evaluations ((left vector) (right vector))
   (cond ((evaluation-empty-p left) right)
         ((evaluation-empty-p right) left)
-        (t (frontier-union left right))))
+        (t (canonicalize-frontier (frontier-union left right)))))
+
+(defmethod merge-evaluations ((left candidate) (right candidate))
+  (cond ((dominates-p left right) left)
+        ((dominates-p right left) right)
+        (t (let ((frontier (empty-frontier)))
+             (frontier-add frontier left)
+             (frontier-add frontier right)
+             (sort frontier #'> :key #'candidate-last)))))
+
+(defmethod merge-evaluations ((left candidate) (right vector))
+  (if (evaluation-empty-p right)
+      left
+      (let ((frontier (empty-frontier)))
+        (frontier-add frontier left)
+        (loop for candidate across right do (frontier-add frontier candidate))
+        (canonicalize-frontier (sort frontier #'> :key #'candidate-last)))))
+
+(defmethod merge-evaluations ((left vector) (right candidate))
+  (merge-evaluations right left))
 
 (defmethod merge-evaluations ((left vector) (right function))
   (if (evaluation-empty-p left) right left))
 
+(defmethod merge-evaluations ((left candidate) (right function))
+  (declare (ignore right))
+  left)
+
 (defmethod merge-evaluations ((left function) (right vector))
   (if (evaluation-empty-p right) left right))
+
+(defmethod merge-evaluations ((left function) (right candidate))
+  (declare (ignore left))
+  right)
 
 (defmethod merge-evaluations ((left function) (right function))
   (declare (ignore right))
@@ -296,6 +328,14 @@ region. If both sides are tainted, retain the left promise."))
 
 (defmethod note-evaluation (evaluator (evaluation vector))
   (note-frontier evaluator evaluation))
+
+(defmethod note-evaluation (evaluator (evaluation candidate))
+  (let* ((statistics (evaluator-statistics evaluator))
+         (histogram (statistics-frontier-histogram statistics)))
+    (setf (statistics-frontier-maximum statistics)
+          (max 1 (statistics-frontier-maximum statistics)))
+    (incf (gethash 1 histogram 0)))
+  evaluation)
 
 (defmethod note-evaluation (evaluator (evaluation function))
   (declare (ignore evaluator))
@@ -363,14 +403,13 @@ region. If both sides are tainted, retain the left promise."))
   (declare (ignore base))
   (let* ((string (text-document-text document))
          (length (length string)))
-    (vector
-     (%candidate document (+ last length)
-                 (text-rank (evaluator-cost evaluator) last length)))))
+    (%candidate document (+ last length)
+                (text-rank (evaluator-cost evaluator) last length))))
 
 (defmethod evaluate-document
     (evaluator (document newline-document) last base)
   (declare (ignore evaluator last))
-  (vector (%candidate document base (%rank 0 1))))
+  (%candidate document base (%rank 0 1)))
 
 (defmethod evaluate-document
     (evaluator (document choice-document) last base)
@@ -435,6 +474,10 @@ region. If both sides are tainted, retain the left promise."))
   (declare (ignore evaluator))
   (wrap-frontier kind amount evaluation))
 
+(defmethod wrap-evaluation (evaluator kind amount (evaluation candidate))
+  (declare (ignore evaluator))
+  (wrap-candidate kind amount evaluation))
+
 (defmethod wrap-evaluation (evaluator kind amount (evaluation function))
   (tainted-evaluation
    evaluator
@@ -455,7 +498,12 @@ region. If both sides are tainted, retain the left promise."))
   (let ((result (empty-frontier)))
     (loop for candidate across right
           do (frontier-add result (concatenate-candidates left candidate)))
-    (sort result #'> :key #'candidate-last)))
+    (canonicalize-frontier (sort result #'> :key #'candidate-last))))
+
+(defmethod concatenate-right-evaluation
+    (evaluator left (right candidate))
+  (declare (ignore evaluator))
+  (concatenate-candidates left right))
 
 (defmethod concatenate-right-evaluation
     (evaluator left (right function))
@@ -492,6 +540,10 @@ region. If both sides are tainted, retain the left promise."))
                     (concatenate-right evaluator document candidate base))))
     result))
 
+(defmethod concatenate-left-evaluation
+    (evaluator document base (left candidate))
+  (concatenate-right evaluator document left base))
+
 (defun evaluate-concatenation (evaluator document last base)
   (concatenate-left-evaluation
    evaluator document base
@@ -514,9 +566,10 @@ candidate, as in Pretty Expressive and recursive.zig."
          (let* ((evaluation (evaluate evaluator document 0 0))
                 (tainted-p (functionp evaluation))
                 (frontier
-                  (if tainted-p
-                      (vector (force-evaluation evaluation))
-                      evaluation))
+                  (etypecase evaluation
+                    (function (vector (force-evaluation evaluation)))
+                    (candidate (vector evaluation))
+                    (vector evaluation)))
                 (statistics (evaluator-statistics evaluator)))
            (when (zerop (length frontier))
              (error "Document has no layouts"))
@@ -540,9 +593,7 @@ candidate, as in Pretty Expressive and recursive.zig."
 (defmethod render-layout ((document newline-document) stream last base)
   (declare (ignore last))
   (terpri stream)
-  (dotimes (index base)
-    (declare (ignore index))
-    (write-char #\Space stream))
+  (loop repeat base do (write-char #\Space stream))
   base)
 
 (defmethod render-layout
