@@ -10,10 +10,12 @@ Zig's compact representation:
 
 - each document kind has its own structure type, sharing memo state through a
   base structure; evaluator and renderer semantics use generic dispatch;
-- Pareto frontiers are unrestricted adjustable vectors;
-- evaluator results use bare candidates for singleton frontiers, vectors for
-  empty or multi-candidate frontiers, and functions for tainted promises, with
-  generic methods handling their combinations;
+- Pareto frontiers remain unrestricted, but the common cardinalities avoid
+  adjustable vectors: singleton frontiers are bare candidates and two-point
+  frontiers are immutable `duel` structures; vectors represent empty and
+  larger frontiers;
+- tainted promises are explicit small continuation-context structures rather
+  than closures;
 - dominance compares final column and lexicographic `(overflow, height)` cost;
 - both linear-overflow F1 and squared-overflow F2 costs are available;
 - text cost is an actual function value and may be dynamically overridden by
@@ -26,7 +28,7 @@ Zig's compact representation:
 - the OCaml six-level structural weight policy enables those tables only at
   periodic memo checkpoints, without adding Zig-style wrapper nodes;
 - evaluation uses the paper's computation-width taint: work outside the bounded
-  region becomes a thunk for one candidate, ordinary choice branches beat
+  region becomes a deferred context for one candidate, ordinary choices beat
   tainted branches, and unavoidable taint is forced at the root;
 - ordinary Pareto evaluation remains exact and frontiers remain unrestricted.
 

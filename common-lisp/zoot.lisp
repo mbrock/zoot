@@ -210,6 +210,17 @@ nonnegative integer. Newline count remains the secondary rank component.")
   (last 0 :type nonnegative-fixnum :read-only t)
   (rank (%rank) :type rank :read-only t))
 
+(defstruct (duel (:constructor %duel (first second)))
+  "The common two-point Pareto frontier, ordered by decreasing final column."
+  (first nil :type candidate :read-only t)
+  (second nil :type candidate :read-only t))
+
+(defun make-duel (left right)
+  (declare (type candidate left right))
+  (if (> (candidate-last left) (candidate-last right))
+      (%duel left right)
+      (%duel right left)))
+
 (defstruct statistics
   (evaluations 0 :type nonnegative-fixnum)
   (memo-hits 0 :type nonnegative-fixnum)
@@ -274,7 +285,10 @@ last column and rank. Frontiers are unrestricted adjustable vectors."
 
 (defun canonicalize-frontier (frontier)
   (declare (type (vector t) frontier))
-  (if (= 1 (length frontier)) (aref frontier 0) frontier))
+  (case (length frontier)
+    (1 (aref frontier 0))
+    (2 (%duel (aref frontier 0) (aref frontier 1)))
+    (otherwise frontier)))
 
 (defstruct (tainted-context (:constructor nil)))
 
@@ -305,7 +319,7 @@ last column and rank. Frontiers are unrestricted adjustable vectors."
   (base 0 :type nonnegative-fixnum :read-only t)
   (evaluation nil :type t :read-only t))
 
-(deftype evaluation () '(or candidate vector tainted-context))
+(deftype evaluation () '(or candidate duel vector tainted-context))
 
 (defun tainted-evaluation (context)
   (declare (type tainted-context context))
@@ -348,6 +362,9 @@ last column and rank. Frontiers are unrestricted adjustable vectors."
 
 (defmethod force-evaluation ((evaluation candidate)) evaluation)
 
+(defmethod force-evaluation ((evaluation duel))
+  (duel-first evaluation))
+
 (defmethod force-evaluation ((evaluation vector))
   (declare (type (vector t) evaluation))
   (when (zerop (length evaluation))
@@ -363,10 +380,27 @@ region. If both sides are tainted, retain the left promise."
              (declare (type candidate left right))
              (cond ((dominates-p left right) left)
                    ((dominates-p right left) right)
-                   (t (let ((frontier (empty-frontier)))
-                        (frontier-add frontier left)
-                        (frontier-add frontier right)
-                        (sort frontier #'> :key #'candidate-last)))))
+                   (t (make-duel left right))))
+           (merge-candidate-duel (candidate duel)
+             (declare (type candidate candidate) (type duel duel))
+             (let ((first (duel-first duel))
+                   (second (duel-second duel)))
+               (cond ((or (dominates-p first candidate)
+                          (dominates-p second candidate))
+                      duel)
+                     ((and (dominates-p candidate first)
+                           (dominates-p candidate second))
+                      candidate)
+                     ((dominates-p candidate first)
+                      (make-duel candidate second))
+                     ((dominates-p candidate second)
+                      (make-duel candidate first))
+                     (t
+                      (let ((frontier (empty-frontier)))
+                        (frontier-add frontier candidate)
+                        (frontier-add frontier first)
+                        (frontier-add frontier second)
+                        (sort frontier #'> :key #'candidate-last))))))
            (merge-candidate-frontier (candidate frontier)
              (declare (type candidate candidate) (type (vector t) frontier))
              (if (evaluation-empty-p frontier)
@@ -376,7 +410,12 @@ region. If both sides are tainted, retain the left promise."
                    (loop for item across frontier
                          do (frontier-add result item))
                    (canonicalize-frontier
-                    (sort result #'> :key #'candidate-last))))))
+                    (sort result #'> :key #'candidate-last)))))
+           (merge-candidate-normal (candidate evaluation)
+             (typecase evaluation
+               (candidate (merge-candidates candidate evaluation))
+               (duel (merge-candidate-duel candidate evaluation))
+               (vector (merge-candidate-frontier candidate evaluation)))))
     (typecase left
       (vector
        (typecase right
@@ -385,16 +424,34 @@ region. If both sides are tainted, retain the left promise."
                 ((evaluation-empty-p right) left)
                 (t (canonicalize-frontier (frontier-union left right)))))
          (candidate (merge-candidate-frontier right left))
+         (duel
+          (merge-candidate-normal
+           (duel-second right)
+           (merge-candidate-frontier (duel-first right) left)))
          (tainted-context (if (evaluation-empty-p left) right left))))
       (candidate
        (typecase right
          (vector (merge-candidate-frontier left right))
          (candidate (merge-candidates left right))
+         (duel (merge-candidate-duel left right))
+         (tainted-context left)))
+      (duel
+       (typecase right
+         (vector
+          (merge-candidate-normal
+           (duel-second left)
+           (merge-candidate-frontier (duel-first left) right)))
+         (candidate (merge-candidate-duel right left))
+         (duel
+          (merge-candidate-normal
+           (duel-second right)
+           (merge-candidate-normal (duel-first right) left)))
          (tainted-context left)))
       (tainted-context
        (typecase right
          (vector (if (evaluation-empty-p right) left right))
          (candidate right)
+         (duel right)
          (tainted-context left))))))
 
 ;;; Recursive evaluator
@@ -429,6 +486,17 @@ region. If both sides are tainted, retain the left promise."
     (setf (gethash 1 histogram)
           (the nonnegative-fixnum
                (1+ (the nonnegative-fixnum (gethash 1 histogram 0))))))
+  evaluation)
+
+#+zoot-statistics
+(defmethod note-evaluation ((evaluation duel))
+  (let* ((statistics (the statistics *statistics*))
+         (histogram (statistics-frontier-histogram statistics)))
+    (setf (statistics-frontier-maximum statistics)
+          (max 2 (statistics-frontier-maximum statistics)))
+    (setf (gethash 2 histogram)
+          (the nonnegative-fixnum
+               (1+ (the nonnegative-fixnum (gethash 2 histogram 0))))))
   evaluation)
 
 #+zoot-statistics
@@ -593,6 +661,10 @@ whose context lies inside the computation limit."
 (defmethod wrap-evaluation (kind amount (evaluation candidate))
   (wrap-candidate kind amount evaluation))
 
+(defmethod wrap-evaluation (kind amount (evaluation duel))
+  (%duel (wrap-candidate kind amount (duel-first evaluation))
+         (wrap-candidate kind amount (duel-second evaluation))))
+
 (defmethod wrap-evaluation (kind amount (evaluation tainted-context))
   (tainted-evaluation
    (%tainted-wrap-context kind amount evaluation)))
@@ -616,6 +688,11 @@ whose context lies inside the computation limit."
 (defmethod concatenate-right-evaluation
     (left (right candidate))
   (concatenate-candidates left right))
+
+(defmethod concatenate-right-evaluation
+    (left (right duel))
+  (%duel (concatenate-candidates left (duel-first right))
+         (concatenate-candidates left (duel-second right))))
 
 (defmethod concatenate-right-evaluation
     (left (right tainted-context))
@@ -647,6 +724,12 @@ whose context lies inside the computation limit."
                     result
                     (concatenate-right document candidate base))))
     result))
+
+(defmethod concatenate-left-evaluation
+    (document base (left duel))
+  (merge-evaluations
+   (concatenate-right document (duel-first left) base)
+   (concatenate-right document (duel-second left) base)))
 
 (defmethod concatenate-left-evaluation
     (document base (left candidate))
@@ -686,6 +769,8 @@ Expressive and recursive.zig."
                     (tainted-context
                      (vector (force-evaluation evaluation)))
                     (candidate (vector evaluation))
+                    (duel (vector (duel-first evaluation)
+                                  (duel-second evaluation)))
                     (vector (the (vector t) evaluation)))))
            (statistics *statistics*))
       (when (zerop (length frontier))
