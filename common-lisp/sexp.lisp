@@ -14,7 +14,8 @@
                 #:span #:span-document #:span-document-meta
                 #:render-layout
                 #:pick #:render #:result-candidate #:make-f2)
-  (:export #:format-source #:format-file #:source-tokens))
+  (:export #:format-source #:format-file #:source-tokens
+           #:ansi-stream #:make-ansi-stream))
 
 (in-package #:zoot-sexp)
 
@@ -789,6 +790,9 @@ two-space-indented vertical body below the operator."
   ((target :initarg :target :reader ansi-target)
    (stack :initform '() :accessor ansi-stack)))
 
+(defun make-ansi-stream (target)
+  (make-instance 'ansi-stream :target target))
+
 (defmethod sb-gray:stream-write-char ((stream ansi-stream) char)
   (write-char char (ansi-target stream)))
 
@@ -802,11 +806,15 @@ two-space-indented vertical body below the operator."
   nil)
 
 (defun span-code (meta)
-  (case meta
-    (:special "1")
-    (:comment "2")
-    (:string "32")
-    (:keyword "36")))
+  "The SGR parameters for a span meta. A string meta is itself a raw
+SGR parameter list, so any client can style through spans directly."
+  (typecase meta
+    (string meta)
+    (t (case meta
+         (:special "1")
+         (:comment "2")
+         (:string "32")
+         (:keyword "36")))))
 
 (defun write-span-code (stream code)
   (format (ansi-target stream) "~C[~Am" #\Escape code))
