@@ -120,8 +120,7 @@
     (setf frontier
           (zoot::merge-evaluations
            frontier
-           (zoot::%candidate layout (first point)
-                             (zoot::%rank (second point) 0)))))
+           (zoot::%candidate layout (first point) (second point) 0))))
   (check-true (typep frontier 'simple-vector)
               "three-point frontier should be a simple vector")
   (check nil (array-has-fill-pointer-p frontier)

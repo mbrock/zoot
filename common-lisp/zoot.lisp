@@ -182,33 +182,31 @@ nonnegative integer. Newline count remains the secondary rank component.")
   (overflow 0 :type nonnegative-fixnum :read-only t)
   (height 0 :type nonnegative-fixnum :read-only t))
 
-(defun rank+ (left right)
-  (%rank (the nonnegative-fixnum
-              (+ (rank-overflow left) (rank-overflow right)))
-         (the nonnegative-fixnum
-              (+ (rank-height left) (rank-height right)))))
-
-(defun rank<= (left right)
-  (or (< (rank-overflow left) (rank-overflow right))
-      (and (= (rank-overflow left) (rank-overflow right))
-           (<= (rank-height left) (rank-height right)))))
-
-(defun rank< (left right)
-  (and (rank<= left right)
-       (not (and (= (rank-overflow left) (rank-overflow right))
-                 (= (rank-height left) (rank-height right))))))
-
-(defun text-rank (cost column length)
+(defun text-overflow (cost column length)
   (declare (type nonnegative-fixnum column length))
-  (%rank (the nonnegative-fixnum
-              (funcall (the function *cost-measure*)
-                       (cost-width cost) column length))
-         0))
+  (the nonnegative-fixnum
+       (funcall (the function *cost-measure*)
+                (cost-width cost) column length)))
 
-(defstruct (candidate (:constructor %candidate (layout last rank)))
+;;; Candidates carry their rank components as raw slots so that combining
+;;; and comparing candidates never allocates intermediate RANK objects.
+(defstruct (candidate (:constructor %candidate (layout last overflow height)))
   (layout nil :type document :read-only t)
   (last 0 :type nonnegative-fixnum :read-only t)
-  (rank (%rank) :type rank :read-only t))
+  (overflow 0 :type nonnegative-fixnum :read-only t)
+  (height 0 :type nonnegative-fixnum :read-only t))
+
+(defun candidate-rank (candidate)
+  "The candidate's (overflow, height) rank as a fresh RANK object."
+  (%rank (candidate-overflow candidate) (candidate-height candidate)))
+
+(declaim (inline better-rank-p))
+(defun better-rank-p (left right)
+  "Strict lexicographic (overflow, height) order between candidates."
+  (declare (type candidate left right))
+  (or (< (candidate-overflow left) (candidate-overflow right))
+      (and (= (candidate-overflow left) (candidate-overflow right))
+           (< (candidate-height left) (candidate-height right)))))
 
 (defstruct (duel (:constructor %duel (first second)))
   "The common two-point Pareto frontier, ordered by decreasing final column."
@@ -249,9 +247,13 @@ nonnegative integer. Newline count remains the secondary rank component.")
 (defmacro note-evaluation (evaluation)
   evaluation)
 
+(declaim (inline dominates-p))
 (defun dominates-p (left right)
+  (declare (type candidate left right))
   (and (<= (candidate-last left) (candidate-last right))
-       (rank<= (candidate-rank left) (candidate-rank right))))
+       (or (< (candidate-overflow left) (candidate-overflow right))
+           (and (= (candidate-overflow left) (candidate-overflow right))
+                (<= (candidate-height left) (candidate-height right))))))
 
 (defstruct (tainted-context (:constructor nil)))
 
@@ -290,47 +292,39 @@ nonnegative integer. Newline count remains the secondary rank component.")
    (statistics-taints-deferred (the statistics *statistics*)))
   context)
 
-(defgeneric force-evaluation (evaluation))
-
-(defmethod force-evaluation ((evaluation null))
-  (error "Cannot choose from an empty frontier"))
-
-(defmethod force-evaluation ((evaluation tainted-context))
-  (note-statistic
-   (statistics-taints-forced (the statistics *statistics*)))
-  (typecase evaluation
-    (tainted-document-context
-     (force-evaluation
-      (note-evaluation
-       (evaluate-document
-        (tainted-document-context-document evaluation)
-        (tainted-document-context-last evaluation)
-        (tainted-document-context-base evaluation)))))
-    (tainted-wrap-context
-     (wrap-candidate
-      (tainted-wrap-context-kind evaluation)
-      (tainted-wrap-context-amount evaluation)
-      (force-evaluation (tainted-wrap-context-evaluation evaluation))))
-    (tainted-right-context
-     (concatenate-candidates
-      (tainted-right-context-left evaluation)
-      (force-evaluation (tainted-right-context-evaluation evaluation))))
-    (tainted-left-context
-     (let* ((left (force-evaluation
-                   (tainted-left-context-evaluation evaluation)))
-            (right (concatenate-right
-                    (tainted-left-context-document evaluation) left
-                    (tainted-left-context-base evaluation))))
-       (force-evaluation right)))))
-
-(defmethod force-evaluation ((evaluation candidate)) evaluation)
-
-(defmethod force-evaluation ((evaluation duel))
-  (duel-first evaluation))
-
-(defmethod force-evaluation ((evaluation vector))
-  (declare (type (vector t) evaluation))
-  (aref evaluation 0))
+(defun force-evaluation (evaluation)
+  (etypecase evaluation
+    (candidate evaluation)
+    (duel (duel-first evaluation))
+    (vector (aref evaluation 0))
+    (null (error "Cannot choose from an empty frontier"))
+    (tainted-context
+     (note-statistic
+      (statistics-taints-forced (the statistics *statistics*)))
+     (etypecase evaluation
+       (tainted-document-context
+        (force-evaluation
+         (note-evaluation
+          (evaluate-document
+           (tainted-document-context-document evaluation)
+           (tainted-document-context-last evaluation)
+           (tainted-document-context-base evaluation)))))
+       (tainted-wrap-context
+        (wrap-candidate
+         (tainted-wrap-context-kind evaluation)
+         (tainted-wrap-context-amount evaluation)
+         (force-evaluation (tainted-wrap-context-evaluation evaluation))))
+       (tainted-right-context
+        (concatenate-candidates
+         (tainted-right-context-left evaluation)
+         (force-evaluation (tainted-right-context-evaluation evaluation))))
+       (tainted-left-context
+        (let* ((left (force-evaluation
+                      (tainted-left-context-evaluation evaluation)))
+               (right (concatenate-right
+                       (tainted-left-context-document evaluation) left
+                       (tainted-left-context-base evaluation))))
+          (force-evaluation right)))))))
 
 (defun merge-evaluations (left right)
   "Merge like Pretty Expressive's measure sets: a normal frontier always
@@ -534,7 +528,7 @@ region. If both sides are tainted, retain the left promise."
 (defun document-context-table (document)
   (or (document-memo-table document)
       (setf (document-memo-table document)
-            (make-hash-table :test #'eql))))
+            (make-hash-table :test #'eql :size 64))))
 
 (defun memo-context-key (last base limit)
   ;; LAST and BASE are both at most LIMIT here, so this is a collision-free
@@ -589,64 +583,46 @@ whose context lies inside the computation limit."
                    (,compute-name)))
              (,compute-name))))))
 
-(defgeneric exceeds-computation-limit-p (document last base))
-
-(defmethod exceeds-computation-limit-p
-    ((document document) last base)
-  (declare (type nonnegative-fixnum last base))
-  (let ((limit (cost-limit (the cost *cost*))))
-    (or (> base limit) (> last limit))))
-
-(defmethod exceeds-computation-limit-p
-    ((document text-document) last base)
+(declaim (inline exceeds-computation-limit-p))
+(defun exceeds-computation-limit-p (document last base)
   (declare (type nonnegative-fixnum last base))
   (let ((limit (cost-limit (the cost *cost*))))
     (or (> base limit)
-        (> (+ last (length (text-document-text document))) limit))))
+        (> (if (text-document-p document)
+               (+ last (length (text-document-text document)))
+               last)
+           limit))))
 
-(defgeneric evaluate-document (document last base)
-  (:documentation "Evaluate one document node after memo and taint checks."))
-
-(defmethod evaluate-document
-    ((document text-document) last base)
-  (declare (ignore base) (type nonnegative-fixnum last))
-  (let* ((string (text-document-text document))
-         (length (length string)))
-    (%candidate document (+ last length)
-                (text-rank (the cost *cost*) last length))))
-
-(defmethod evaluate-document
-    ((document newline-document) last base)
-  (declare (ignore last) (type nonnegative-fixnum base))
-  (%candidate document base (%rank 0 1)))
-
-(defmethod evaluate-document
-    ((document choice-document) last base)
-  (declare (type nonnegative-fixnum last base))
-  (merge-evaluations
-   (evaluate (choice-document-left document) last base)
-   (evaluate (choice-document-right document) last base)))
-
-(defmethod evaluate-document
-    ((document nest-document) last base)
-  (declare (type nonnegative-fixnum last base))
-  (let ((amount (nest-document-amount document)))
-    (wrap-evaluation
-     :nest amount
-     (evaluate (nest-document-child document) last
-               (the nonnegative-fixnum (+ base amount))))))
-
-(defmethod evaluate-document
-    ((document align-document) last base)
-  (declare (ignore base) (type nonnegative-fixnum last))
-  (wrap-evaluation
-   :align 0
-   (evaluate (align-document-child document) last last)))
-
-(defmethod evaluate-document
-    ((document concatenation-document) last base)
-  (declare (type nonnegative-fixnum last base))
-  (evaluate-concatenation document last base))
+(defun evaluate-document (document last base)
+  "Evaluate one document node after memo and taint checks."
+  (declare (type document document)
+           (type nonnegative-fixnum last base))
+  (etypecase document
+    (concatenation-document
+     (evaluate-concatenation document last base))
+    (text-document
+     (let* ((string (text-document-text document))
+            (length (length string)))
+       (%candidate document
+                   (the nonnegative-fixnum (+ last length))
+                   (text-overflow (the cost *cost*) last length)
+                   0)))
+    (choice-document
+     (merge-evaluations
+      (evaluate (choice-document-left document) last base)
+      (evaluate (choice-document-right document) last base)))
+    (newline-document
+     (%candidate document base 0 1))
+    (align-document
+     (wrap-evaluation
+      :align 0
+      (evaluate (align-document-child document) last last)))
+    (nest-document
+     (let ((amount (nest-document-amount document)))
+       (wrap-evaluation
+        :nest amount
+        (evaluate (nest-document-child document) last
+                  (the nonnegative-fixnum (+ base amount))))))))
 
 (defun evaluate (document last base)
   (declare (type document document)
@@ -661,79 +637,65 @@ whose context lies inside the computation limit."
            (%tainted-document-context document last base))
           (core)))))
 
-(defun wrap-frontier (kind amount frontier)
-  (declare (type nonnegative-fixnum amount) (type (vector t) frontier))
-  (map 'vector
-       (lambda (candidate)
-         (%candidate
-          (ecase kind
-            (:nest (nest amount (candidate-layout candidate)))
-            (:align (align (candidate-layout candidate))))
-          (candidate-last candidate)
-          (candidate-rank candidate)))
-       frontier))
+;;; Layout reconstruction. Chosen layouts are choice-free and are only
+;;; rendered, so the memo-weight bookkeeping the public constructors
+;;; maintain is never load-bearing for them; build them with a constant
+;;; weight instead.
 
 (defun wrap-candidate (kind amount candidate)
   (%candidate
    (ecase kind
-     (:nest (nest amount (candidate-layout candidate)))
-     (:align (align (candidate-layout candidate))))
+     (:nest (%nest-document
+             amount (candidate-layout candidate) +initial-memo-weight+))
+     (:align (%align-document
+              (candidate-layout candidate) +initial-memo-weight+)))
    (candidate-last candidate)
-   (candidate-rank candidate)))
+   (candidate-overflow candidate)
+   (candidate-height candidate)))
 
-(defgeneric wrap-evaluation (kind amount evaluation))
+(defun wrap-frontier (kind amount frontier)
+  (declare (type nonnegative-fixnum amount) (type (vector t) frontier))
+  (map 'vector
+       (lambda (candidate) (wrap-candidate kind amount candidate))
+       frontier))
 
-(defmethod wrap-evaluation (kind amount (evaluation null))
-  (declare (ignore kind amount))
-  evaluation)
-
-(defmethod wrap-evaluation (kind amount (evaluation vector))
-  (wrap-frontier kind amount evaluation))
-
-(defmethod wrap-evaluation (kind amount (evaluation candidate))
-  (wrap-candidate kind amount evaluation))
-
-(defmethod wrap-evaluation (kind amount (evaluation duel))
-  (%duel (wrap-candidate kind amount (duel-first evaluation))
-         (wrap-candidate kind amount (duel-second evaluation))))
-
-(defmethod wrap-evaluation (kind amount (evaluation tainted-context))
-  (tainted-evaluation
-   (%tainted-wrap-context kind amount evaluation)))
+(defun wrap-evaluation (kind amount evaluation)
+  (etypecase evaluation
+    (null evaluation)
+    (candidate (wrap-candidate kind amount evaluation))
+    (duel (%duel (wrap-candidate kind amount (duel-first evaluation))
+                 (wrap-candidate kind amount (duel-second evaluation))))
+    (vector (wrap-frontier kind amount evaluation))
+    (tainted-context
+     (tainted-evaluation
+      (%tainted-wrap-context kind amount evaluation)))))
 
 (defun concatenate-candidates (left right)
+  (declare (type candidate left right))
   (%candidate
-   (concatenate (candidate-layout left) (candidate-layout right))
+   (%concatenation-document (candidate-layout left) (candidate-layout right)
+                            +initial-memo-weight+)
    (candidate-last right)
-   (rank+ (candidate-rank left) (candidate-rank right))))
+   (the nonnegative-fixnum
+        (+ (candidate-overflow left) (candidate-overflow right)))
+   (the nonnegative-fixnum
+        (+ (candidate-height left) (candidate-height right)))))
 
-(defgeneric concatenate-right-evaluation (left right))
-
-(defmethod concatenate-right-evaluation (left (right null))
-  (declare (ignore left))
-  right)
-
-(defmethod concatenate-right-evaluation
-    (left (right vector))
-  (declare (type candidate left) (type (vector t) right))
-  ;; Adding the same left rank preserves right-side dominance and ordering.
-  (map 'simple-vector
-       (lambda (candidate) (concatenate-candidates left candidate))
-       right))
-
-(defmethod concatenate-right-evaluation
-    (left (right candidate))
-  (concatenate-candidates left right))
-
-(defmethod concatenate-right-evaluation
-    (left (right duel))
-  (%duel (concatenate-candidates left (duel-first right))
-         (concatenate-candidates left (duel-second right))))
-
-(defmethod concatenate-right-evaluation
-    (left (right tainted-context))
-  (tainted-evaluation
-   (%tainted-right-context left right)))
+(defun concatenate-right-evaluation (left right)
+  (declare (type candidate left))
+  (etypecase right
+    (null right)
+    (candidate (concatenate-candidates left right))
+    (duel (%duel (concatenate-candidates left (duel-first right))
+                 (concatenate-candidates left (duel-second right))))
+    ;; Adding the same left rank preserves right-side dominance and ordering.
+    (vector
+     (map 'simple-vector
+          (lambda (candidate) (concatenate-candidates left candidate))
+          right))
+    (tainted-context
+     (tainted-evaluation
+      (%tainted-right-context left right)))))
 
 (defun concatenate-right (document left base)
   (concatenate-right-evaluation
@@ -741,40 +703,27 @@ whose context lies inside the computation limit."
    (evaluate (concatenation-document-right document)
              (candidate-last left) base)))
 
-(defgeneric concatenate-left-evaluation
-    (document base left))
-
-(defmethod concatenate-left-evaluation
-    (document base (left null))
-  (declare (ignore document base))
-  left)
-
-(defmethod concatenate-left-evaluation
-    (document base (left tainted-context))
-  (tainted-evaluation
-   (%tainted-left-context document base left)))
-
-(defmethod concatenate-left-evaluation
-    (document base (left vector))
+(defun concatenate-left-evaluation (document base left)
   (declare (type concatenation-document document)
-           (type nonnegative-fixnum base) (type (vector t) left))
-  (let ((result nil))
-    (loop for candidate across left
-          do (setf result
-                   (merge-evaluations
-                    result
-                    (concatenate-right document candidate base))))
-    result))
-
-(defmethod concatenate-left-evaluation
-    (document base (left duel))
-  (merge-evaluations
-   (concatenate-right document (duel-first left) base)
-   (concatenate-right document (duel-second left) base)))
-
-(defmethod concatenate-left-evaluation
-    (document base (left candidate))
-  (concatenate-right document left base))
+           (type nonnegative-fixnum base))
+  (etypecase left
+    (null left)
+    (candidate (concatenate-right document left base))
+    (duel
+     (merge-evaluations
+      (concatenate-right document (duel-first left) base)
+      (concatenate-right document (duel-second left) base)))
+    (vector
+     (let ((result nil))
+       (loop for candidate across left
+             do (setf result
+                      (merge-evaluations
+                       result
+                       (concatenate-right document candidate base))))
+       result))
+    (tainted-context
+     (tainted-evaluation
+      (%tainted-left-context document base left)))))
 
 (defun evaluate-concatenation (document last base)
   (declare (type concatenation-document document)
@@ -819,8 +768,7 @@ Expressive and recursive.zig."
         (error "Document has no layouts"))
       (let ((best (aref frontier 0)))
         (loop for candidate across frontier
-              when (rank< (candidate-rank candidate)
-                          (candidate-rank best))
+              when (better-rank-p candidate best)
                 do (setf best candidate))
         (%result best frontier statistics tainted-p)))))
 
