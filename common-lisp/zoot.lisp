@@ -393,28 +393,17 @@ region. If both sides are tainted, retain the left promise."))
                   (the nonnegative-fixnum
                        (1+ limit)))))))
 
-(defun %memoized (document last base limit thunk)
-  (declare (type document document)
-           (type nonnegative-fixnum last base limit)
-           (type function thunk))
-  (let* ((contexts (document-context-table document))
-         (key (memo-context-key last base limit)))
-    (multiple-value-bind (frontier present-p) (gethash key contexts)
-      (if present-p
-          (progn
-            (incf (statistics-memo-hits (the statistics *statistics*)))
-            frontier)
-          (prog1 (setf (gethash key contexts) (funcall thunk))
-            (incf (statistics-memo-entries
-                   (the statistics *statistics*))))))))
-
 (defmacro memoized ((document last base) &body body)
-  "Evaluate BODY directly for ordinary nodes. Allocate a thunk only at memo
-checkpoints whose context lies inside the computation limit."
+  "Evaluate BODY directly for ordinary nodes and cache it at memo checkpoints
+whose context lies inside the computation limit."
   (let ((document-var (gensym "DOCUMENT"))
         (last-var (gensym "LAST"))
         (base-var (gensym "BASE"))
-        (limit-var (gensym "LIMIT")))
+        (limit-var (gensym "LIMIT"))
+        (contexts-var (gensym "CONTEXTS"))
+        (key-var (gensym "KEY"))
+        (value-var (gensym "VALUE"))
+        (present-var (gensym "PRESENT")))
     `(let* ((,document-var ,document)
             (,last-var ,last)
             (,base-var ,base)
@@ -422,8 +411,19 @@ checkpoints whose context lies inside the computation limit."
        (if (and (zerop (document-memo-weight ,document-var))
                 (<= ,last-var ,limit-var)
                 (<= ,base-var ,limit-var))
-           (%memoized ,document-var ,last-var ,base-var ,limit-var
-                      (lambda () ,@body))
+           (let* ((,contexts-var (document-context-table ,document-var))
+                  (,key-var (memo-context-key
+                             ,last-var ,base-var ,limit-var)))
+             (multiple-value-bind (,value-var ,present-var)
+                 (gethash ,key-var ,contexts-var)
+               (if ,present-var
+                   (progn
+                     (incf (statistics-memo-hits *statistics*))
+                     ,value-var)
+                   (let ((,value-var (progn ,@body)))
+                     (setf (gethash ,key-var ,contexts-var) ,value-var)
+                     (incf (statistics-memo-entries *statistics*))
+                     ,value-var))))
            (progn ,@body)))))
 
 (defgeneric exceeds-computation-limit-p (document last base))
