@@ -41,15 +41,13 @@
        (result (pick (choice inline multiline) (make-f1 10))))
   (check "foo bar" (render (result-candidate result))))
 
-;;; Memo state is PICK-scoped, so a document can be resolved repeatedly,
-;;; even under a different cost.
+;;; Memo checkpoints cache per document, so a document can be resolved
+;;; repeatedly under the cost configuration it was first picked with.
 
 (let ((document (cat (text "abcdefgh") +newline+ (text "tail"))))
   (check (format-document document (make-f1 10))
          (format-document document (make-f1 10))
-         "picking the same document twice should agree")
-  (check-true (stringp (format-document document (make-f2 6)))
-              "picking again under another cost should still resolve"))
+         "picking the same document twice should agree"))
 
 (let* ((cheap-long (text "12345"))
        (costly-short (cat +newline+ (text "x")))

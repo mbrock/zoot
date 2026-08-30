@@ -42,10 +42,11 @@ reference implementation (its PARAM_MEMO_LIMIT is 7, with initial weight 6).")
   (child nil :read-only t))
 
 (defstruct (memo-document (:constructor %memo-document (child)))
-  ;; Memoized candidates live in a PICK-scoped table keyed by this lazily
-  ;; assigned serial number and are reclaimed when that PICK's table is
-  ;; dropped.
-  (id nil :type (or null nonnegative-fixnum))
+  ;; Each checkpoint owns its context table, created on first use and
+  ;; living as long as the document. Entries are keyed by evaluation
+  ;; context under one cost configuration, so a document belongs to the
+  ;; configuration it is first picked with.
+  (contexts nil :type (or null hash-table))
   (child nil :read-only t))
 
 (deftype document ()
@@ -241,21 +242,12 @@ nonnegative integer. Newline count remains the secondary rank component.")
 (defvar *cost* (make-f2 80) "Cost configuration dynamically bound by PICK.")
 (defvar *statistics* (make-statistics)
   "Statistics dynamically accumulated by PICK.")
-(defvar *memo-table* (make-hash-table :test #'eql)
-  "Single memo table dynamically bound by PICK, keyed by document serial
-number and evaluation context.")
-(defvar *memo-serial* 0
-  "Global source of document memo serial numbers. Never reset, so a stale
-serial on a subtree shared across documents cannot collide with a fresh one.")
 
 (declaim (type cost *cost*)
-         (type statistics *statistics*)
-         (type hash-table *memo-table*)
-         (type nonnegative-fixnum *memo-serial*))
+         (type statistics *statistics*))
 
 #+sbcl
-(declaim (sb-ext:always-bound
-          *cost* *cost-measure* *statistics* *memo-table* *memo-serial*))
+(declaim (sb-ext:always-bound *cost* *cost-measure* *statistics*))
 
 (defmacro note-statistic (place)
   #+zoot-statistics `(incf ,place)
@@ -544,30 +536,21 @@ region. If both sides are tainted, retain the left promise."
 (defmethod note-evaluation ((evaluation tainted-context))
   evaluation)
 
-(declaim (inline document-memo-serial memo-context-key))
-(defun document-memo-serial (document)
-  (declare (type memo-document document))
-  (or (memo-document-id document)
-      (setf (memo-document-id document)
-            (let ((serial *memo-serial*))
-              (setf *memo-serial* (the nonnegative-fixnum (1+ serial)))
-              serial))))
-
-(defun memo-context-key (document last base limit)
-  ;; LAST and BASE are both at most LIMIT here, so document serial plus the
-  ;; row-major (BASE, LAST) pair is a collision-free encoding, as in the
-  ;; OCaml implementation.
+(declaim (inline memo-context-key document-contexts))
+(defun memo-context-key (last base limit)
+  ;; LAST and BASE are both at most LIMIT here, so this is a collision-free
+  ;; row-major encoding of the pair, as in the OCaml implementation.
   (declare (type nonnegative-fixnum last base limit))
-  ;; Contexts are deliberately a fixnum domain. As with ranks, callers that
-  ;; construct impractically large layouts are outside this implementation's
-  ;; numeric contract.
-  (let ((span (the nonnegative-fixnum (1+ limit))))
-    (the nonnegative-fixnum
-         (+ last
-            (the nonnegative-fixnum (* base span))
-            (the nonnegative-fixnum
-                 (* (document-memo-serial document)
-                    (the nonnegative-fixnum (* span span))))))))
+  (the nonnegative-fixnum
+       (+ last
+          (the nonnegative-fixnum
+               (* base (the nonnegative-fixnum (1+ limit)))))))
+
+(defun document-contexts (document)
+  (declare (type memo-document document))
+  (or (memo-document-contexts document)
+      (setf (memo-document-contexts document)
+            (make-hash-table :test #'eql))))
 
 (declaim (inline exceeds-computation-limit-p))
 (defun exceeds-computation-limit-p (document last base)
@@ -617,8 +600,8 @@ call sites do not re-check child slots on every traversal."
   (if (memo-document-p document)
       (let ((limit (cost-limit *cost*)))
         (if (and (<= last limit) (<= base limit))
-            (let ((contexts *memo-table*)
-                  (key (memo-context-key document last base limit)))
+            (let ((contexts (document-contexts document))
+                  (key (memo-context-key last base limit)))
               (multiple-value-bind (value present)
                   (gethash key contexts)
                 (if present
@@ -740,13 +723,12 @@ call sites do not re-check child slots on every traversal."
   (tainted-p nil :type boolean :read-only t))
 
 (defun pick (document cost)
-  "Resolve DOCUMENT with computation-width taint. Memoized candidates live
-in a PICK-scoped table, so documents may be picked again, even under a
-different cost. Ordinary Pareto frontiers are exact and unrestricted;
-forced tainted regions deliberately recover one candidate, as in Pretty
-Expressive and recursive.zig."
+  "Resolve DOCUMENT with computation-width taint. Memo checkpoints cache
+candidates as long as the document lives, so a document belongs to the
+cost configuration it is first picked with. Ordinary Pareto frontiers
+are exact and unrestricted; forced tainted regions deliberately recover
+one candidate, as in Pretty Expressive and recursive.zig."
   (let ((*cost* cost)
-        (*memo-table* (make-hash-table :test #'eql :size 1024))
         #+zoot-statistics
         (*statistics* (make-statistics))
         (*cost-measure* (or *cost-measure* (cost-measure cost))))
