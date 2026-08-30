@@ -39,6 +39,53 @@ pub fn build(b: *std.Build) void {
     const zootexec = b.addRunArtifact(zootprog);
     const testexec = b.addRunArtifact(testmod);
 
+    const wasm_target = b.resolveTargetQuery(.{
+        .cpu_arch = .wasm32,
+        .os_tag = .freestanding,
+    });
+    const wasm_rootpack = b.addModule("zoot-wasm-lib", .{
+        .root_source_file = b.path("src/root.zig"),
+        .target = wasm_target,
+    });
+    wasm_rootpack.addOptions("build_options", build_options);
+    const wasmpack = b.createModule(.{
+        .root_source_file = b.path("src/wasm.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zoot", .module = wasm_rootpack }},
+    });
+    const wasm = b.addExecutable(.{
+        .name = "zoot-cbor",
+        .root_module = wasmpack,
+        .use_llvm = true,
+    });
+    wasm.entry = .disabled;
+    wasm.rdynamic = true;
+    wasm.export_memory = true;
+    const install_wasm = b.addInstallArtifact(wasm, .{});
+    b.getInstallStep().dependOn(&install_wasm.step);
+    const wasm_step = b.step("wasm", "Build the CBOR-to-JSON WebAssembly module");
+    wasm_step.dependOn(&install_wasm.step);
+
+    const typstpack = b.createModule(.{
+        .root_source_file = b.path("src/typst_wasm.zig"),
+        .target = wasm_target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "zoot", .module = wasm_rootpack }},
+    });
+    const typst_plugin = b.addExecutable(.{
+        .name = "zoot-typst",
+        .root_module = typstpack,
+        .use_llvm = true,
+    });
+    typst_plugin.entry = .disabled;
+    typst_plugin.rdynamic = true;
+    typst_plugin.export_memory = true;
+    const install_typst_plugin = b.addInstallArtifact(typst_plugin, .{});
+    b.getInstallStep().dependOn(&install_typst_plugin.step);
+    const typst_step = b.step("typst-plugin", "Build the Typst WebAssembly plugin");
+    typst_step.dependOn(&install_typst_plugin.step);
+
     zootstep.dependOn(&zootexec.step);
     zootexec.step.dependOn(b.getInstallStep());
     teststep.dependOn(&testexec.step);

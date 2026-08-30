@@ -23,6 +23,7 @@
             packages = with pkgs; [
               zig_0_16
               zls
+              typst
               ocaml
               dune_3
               git

@@ -1,4 +1,4 @@
-.PHONY: all build test profile
+.PHONY: all build test profile typst-example
 .NOTPARALLEL:
 
 RUNS ?= 200
@@ -14,3 +14,7 @@ test:
 
 profile:
 	RUNS=$(RUNS) STAT_RUNS=$(STAT_RUNS) ./etc/profile-linux.sh
+
+typst-example:
+	zig build typst-plugin -Doptimize=ReleaseSmall
+	typst compile --root . examples/typst-plugin.typ zig-out/typst-plugin.pdf
