@@ -5,6 +5,7 @@
    #:text #:+newline+ #:concatenate #:cat #:vcat #:choice #:nest #:align
    #:flatten #:group
    #:make-f1 #:make-f2 #:pick #:render #:format-document
+   #:*cost-measure* #:linear-overflow-cost #:squared-overflow-cost
    #:result-candidate #:result-frontier #:result-statistics #:result-tainted-p
    #:candidate-last #:candidate-rank
    #:rank-overflow #:rank-height
@@ -117,8 +118,24 @@ reference implementation (its PARAM_MEMO_LIMIT is 7, with initial weight 6).")
 
 ;;; Costs and Pareto measures
 
-(defstruct (cost (:constructor %cost (kind width limit)))
-  (kind :f2 :type (member :f1 :f2) :read-only t)
+(defvar *cost-measure* nil
+  "When non-NIL, dynamically override a cost factory's text measure function.
+The function receives PAGE-WIDTH, COLUMN, and TEXT-LENGTH and returns a
+nonnegative integer. Newline count remains the secondary rank component.")
+
+(defun linear-overflow-cost (page-width column length)
+  "Additional linear overflow caused by placing LENGTH characters at COLUMN."
+  (max 0 (- (+ column length) (max page-width column))))
+
+(defun squared-overflow-cost (page-width column length)
+  "Increase in squared line overflow caused by a text placement."
+  (let* ((old-overflow (max 0 (- column page-width)))
+         (new-text-overflow
+           (max 0 (- (+ column length) (max page-width column)))))
+    (* new-text-overflow (+ (* 2 old-overflow) new-text-overflow))))
+
+(defstruct (cost (:constructor %cost (measure width limit)))
+  (measure #'squared-overflow-cost :type function :read-only t)
   (width 80 :type (integer 0) :read-only t)
   (limit 96 :type (integer 0) :read-only t))
 
@@ -127,12 +144,12 @@ reference implementation (its PARAM_MEMO_LIMIT is 7, with initial weight 6).")
 
 (defun make-f1 (page-width &key computation-width)
   "Minimize linear overflow, then newline count (paper Example 3.4)."
-  (%cost :f1 page-width
+  (%cost #'linear-overflow-cost page-width
          (or computation-width (default-computation-width page-width))))
 
 (defun make-f2 (page-width &key computation-width)
   "Minimize squared overflow, then newline count (paper Example 3.5)."
-  (%cost :f2 page-width
+  (%cost #'squared-overflow-cost page-width
          (or computation-width (default-computation-width page-width))))
 
 (defstruct (rank (:constructor %rank (&optional (overflow 0) (height 0))))
@@ -154,15 +171,7 @@ reference implementation (its PARAM_MEMO_LIMIT is 7, with initial weight 6).")
                  (= (rank-height left) (rank-height right))))))
 
 (defun text-rank (cost column length)
-  (let* ((width (cost-width cost))
-         (maximum (max width column))
-         (new-overflow (max 0 (- (+ column length) maximum))))
-    (%rank
-     (ecase (cost-kind cost)
-       (:f1 new-overflow)
-       (:f2 (let ((old-overflow (max 0 (- column width))))
-              (* new-overflow (+ (* 2 old-overflow) new-overflow)))))
-     0)))
+  (%rank (funcall *cost-measure* (cost-width cost) column length) 0))
 
 (defstruct (candidate (:constructor %candidate (layout last rank)))
   (layout nil :type document :read-only t)
@@ -448,7 +457,8 @@ region. If both sides are tainted, retain the left promise."
   "Resolve DOCUMENT with computation-width taint. Ordinary Pareto frontiers
 are exact and unrestricted; forced tainted regions deliberately recover one
 candidate, as in Pretty Expressive and recursive.zig."
-  (let ((evaluator (%evaluator cost memoize)))
+  (let ((evaluator (%evaluator cost memoize))
+        (*cost-measure* (or *cost-measure* (cost-measure cost))))
     (unwind-protect
          (let* ((evaluation (evaluate evaluator document 0 0))
                 (tainted-p (eq :tainted (evaluation-kind evaluation)))

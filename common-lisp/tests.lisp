@@ -69,6 +69,18 @@
          (render many-lines))
   (check-rank 26 3 many-lines))
 
+;;; Cost measurement is a dynamically bindable function value. This objective
+;;; assigns one point to every nonempty text placement, independent of width.
+
+(let ((*cost-measure*
+        (lambda (page-width column length)
+          (declare (ignore page-width column))
+          (if (plusp length) 1 0))))
+  (let ((candidate
+          (result-candidate
+           (pick (cat (text "one") (text "two")) (make-f2 80)))))
+    (check-rank 2 0 candidate)))
+
 ;;; The unrestricted vector representation intentionally accepts a frontier
 ;;; that recursive.zig's current two-Duel representation rejects.
 

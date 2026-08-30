@@ -12,6 +12,8 @@ Zig's compact representation:
 - Pareto frontiers are unrestricted adjustable vectors;
 - dominance compares final column and lexicographic `(overflow, height)` cost;
 - both linear-overflow F1 and squared-overflow F2 costs are available;
+- text cost is an actual function value and may be dynamically overridden by
+  binding `*cost-measure*` around `pick`;
 - each document node owns a reusable `EQL` context table, keyed by a packed
   integer containing the current column and indentation base;
 - the OCaml six-level structural weight policy enables those tables only at
