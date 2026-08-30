@@ -16,6 +16,9 @@
 
 (in-package #:zoot)
 
+(deftype nonnegative-fixnum ()
+  '(integer 0 #.most-positive-fixnum))
+
 ;;; Documents
 
 (defconstant +initial-memo-weight+ 6
@@ -55,7 +58,7 @@ reference implementation (its PARAM_MEMO_LIMIT is 7, with initial weight 6).")
 (defstruct (nest-document
             (:include document)
             (:constructor %nest-document (amount child memo-weight)))
-  (amount 0 :type (integer 0) :read-only t)
+  (amount 0 :type nonnegative-fixnum :read-only t)
   (child nil :type document :read-only t))
 
 (defstruct (align-document
@@ -91,7 +94,7 @@ reference implementation (its PARAM_MEMO_LIMIT is 7, with initial weight 6).")
 
 (defun nest (amount document)
   "Indent lines after the first by AMOUNT columns."
-  (check-type amount (integer 0))
+  (check-type amount nonnegative-fixnum)
   (if (zerop amount)
       document
       (%nest-document amount document (next-memo-weight document))))
@@ -139,24 +142,31 @@ reference implementation (its PARAM_MEMO_LIMIT is 7, with initial weight 6).")
 The function receives PAGE-WIDTH, COLUMN, and TEXT-LENGTH and returns a
 nonnegative integer. Newline count remains the secondary rank component.")
 
+(declaim (type (or null function) *cost-measure*))
+
 (defun linear-overflow-cost (page-width column length)
   "Additional linear overflow caused by placing LENGTH characters at COLUMN."
-  (max 0 (- (+ column length) (max page-width column))))
+  (declare (type nonnegative-fixnum page-width column length))
+  (the nonnegative-fixnum
+       (max 0 (- (+ column length) (max page-width column)))))
 
 (defun squared-overflow-cost (page-width column length)
   "Increase in squared line overflow caused by a text placement."
+  (declare (type nonnegative-fixnum page-width column length))
   (let* ((old-overflow (max 0 (- column page-width)))
          (new-text-overflow
            (max 0 (- (+ column length) (max page-width column)))))
-    (* new-text-overflow (+ (* 2 old-overflow) new-text-overflow))))
+    (the nonnegative-fixnum
+         (* new-text-overflow (+ (* 2 old-overflow) new-text-overflow)))))
 
 (defstruct (cost (:constructor %cost (measure width limit)))
   (measure #'squared-overflow-cost :type function :read-only t)
-  (width 80 :type (integer 0) :read-only t)
-  (limit 96 :type (integer 0) :read-only t))
+  (width 80 :type nonnegative-fixnum :read-only t)
+  (limit 96 :type nonnegative-fixnum :read-only t))
 
 (defun default-computation-width (page-width)
-  (+ page-width (floor page-width 5)))
+  (declare (type nonnegative-fixnum page-width))
+  (the nonnegative-fixnum (+ page-width (floor page-width 5))))
 
 (defun make-f1 (page-width &key computation-width)
   "Minimize linear overflow, then newline count (paper Example 3.4)."
@@ -169,12 +179,14 @@ nonnegative integer. Newline count remains the secondary rank component.")
          (or computation-width (default-computation-width page-width))))
 
 (defstruct (rank (:constructor %rank (&optional (overflow 0) (height 0))))
-  (overflow 0 :type (integer 0) :read-only t)
-  (height 0 :type (integer 0) :read-only t))
+  (overflow 0 :type nonnegative-fixnum :read-only t)
+  (height 0 :type nonnegative-fixnum :read-only t))
 
 (defun rank+ (left right)
-  (%rank (+ (rank-overflow left) (rank-overflow right))
-         (+ (rank-height left) (rank-height right))))
+  (%rank (the nonnegative-fixnum
+              (+ (rank-overflow left) (rank-overflow right)))
+         (the nonnegative-fixnum
+              (+ (rank-height left) (rank-height right)))))
 
 (defun rank<= (left right)
   (or (< (rank-overflow left) (rank-overflow right))
@@ -187,12 +199,32 @@ nonnegative integer. Newline count remains the secondary rank component.")
                  (= (rank-height left) (rank-height right))))))
 
 (defun text-rank (cost column length)
-  (%rank (funcall *cost-measure* (cost-width cost) column length) 0))
+  (declare (type nonnegative-fixnum column length))
+  (%rank (the nonnegative-fixnum
+              (funcall (the function *cost-measure*)
+                       (cost-width cost) column length))
+         0))
 
 (defstruct (candidate (:constructor %candidate (layout last rank)))
   (layout nil :type document :read-only t)
-  (last 0 :type (integer 0) :read-only t)
+  (last 0 :type nonnegative-fixnum :read-only t)
   (rank (%rank) :type rank :read-only t))
+
+(defstruct statistics
+  (evaluations 0 :type nonnegative-fixnum)
+  (memo-hits 0 :type nonnegative-fixnum)
+  (memo-entries 0 :type nonnegative-fixnum)
+  (taints-deferred 0 :type nonnegative-fixnum)
+  (taints-forced 0 :type nonnegative-fixnum)
+  (frontier-maximum 0 :type nonnegative-fixnum)
+  (frontier-histogram (make-hash-table) :type hash-table))
+
+(defstruct (evaluator (:constructor %evaluator (cost memoize)))
+  (cost (make-f2 80) :type cost :read-only t)
+  (memoize t :type boolean :read-only t)
+  (memo-token (list nil) :read-only t)
+  (memoized-documents nil :type list)
+  (statistics (make-statistics) :type statistics))
 
 (defun dominates-p (left right)
   (and (<= (candidate-last left) (candidate-last right))
@@ -204,6 +236,7 @@ nonnegative integer. Newline count remains the secondary rank component.")
 (defun frontier-add (frontier candidate)
   "Add CANDIDATE destructively, discarding candidates dominated in both
 last column and rank. Frontiers are unrestricted adjustable vectors."
+  (declare (type (vector t) frontier) (type candidate candidate))
   (when (loop for existing across frontier
               thereis (dominates-p existing candidate))
     (return-from frontier-add frontier))
@@ -219,16 +252,19 @@ last column and rank. Frontiers are unrestricted adjustable vectors."
 (defun frontier-union (&rest frontiers)
   (let ((result (empty-frontier)))
     (dolist (frontier frontiers)
+      (declare (type (vector t) frontier))
       (loop for candidate across frontier
             do (frontier-add result candidate)))
     (sort result #'> :key #'candidate-last)))
 
 (defun canonicalize-frontier (frontier)
+  (declare (type (vector t) frontier))
   (if (= 1 (length frontier)) (aref frontier 0) frontier))
 
 (deftype evaluation () '(or candidate vector function))
 
 (defun tainted-evaluation (evaluator thunk)
+  (declare (type evaluator evaluator) (type function thunk))
   (incf (statistics-taints-deferred (evaluator-statistics evaluator)))
   (lambda ()
     (incf (statistics-taints-forced (evaluator-statistics evaluator)))
@@ -245,6 +281,7 @@ last column and rank. Frontiers are unrestricted adjustable vectors."
 (defmethod force-evaluation ((evaluation candidate)) evaluation)
 
 (defmethod force-evaluation ((evaluation vector))
+  (declare (type (vector t) evaluation))
   (when (zerop (length evaluation))
     (error "Cannot choose from an empty frontier"))
   (aref evaluation 0))
@@ -269,6 +306,7 @@ region. If both sides are tainted, retain the left promise."))
              (sort frontier #'> :key #'candidate-last)))))
 
 (defmethod merge-evaluations ((left candidate) (right vector))
+  (declare (type (vector t) right))
   (if (evaluation-empty-p right)
       left
       (let ((frontier (empty-frontier)))
@@ -299,29 +337,17 @@ region. If both sides are tainted, retain the left promise."))
 
 ;;; Recursive evaluator
 
-(defstruct statistics
-  (evaluations 0 :type (integer 0))
-  (memo-hits 0 :type (integer 0))
-  (memo-entries 0 :type (integer 0))
-  (taints-deferred 0 :type (integer 0))
-  (taints-forced 0 :type (integer 0))
-  (frontier-maximum 0 :type (integer 0))
-  (frontier-histogram (make-hash-table) :type hash-table))
-
-(defstruct (evaluator (:constructor %evaluator (cost memoize)))
-  (cost (make-f2 80) :type cost :read-only t)
-  (memoize t :type boolean :read-only t)
-  (memo-token (list nil) :read-only t)
-  (memoized-documents nil :type list)
-  (statistics (make-statistics) :type statistics))
-
 (defun note-frontier (evaluator frontier)
+  (declare (type evaluator evaluator) (type (vector t) frontier))
   (let* ((statistics (evaluator-statistics evaluator))
          (length (length frontier))
          (histogram (statistics-frontier-histogram statistics)))
     (setf (statistics-frontier-maximum statistics)
           (max length (statistics-frontier-maximum statistics)))
-    (incf (gethash length histogram 0)))
+    (setf (gethash length histogram)
+          (the nonnegative-fixnum
+               (1+ (the nonnegative-fixnum
+                         (gethash length histogram 0))))))
   frontier)
 
 (defgeneric note-evaluation (evaluator evaluation))
@@ -334,7 +360,9 @@ region. If both sides are tainted, retain the left promise."))
          (histogram (statistics-frontier-histogram statistics)))
     (setf (statistics-frontier-maximum statistics)
           (max 1 (statistics-frontier-maximum statistics)))
-    (incf (gethash 1 histogram 0)))
+    (setf (gethash 1 histogram)
+          (the nonnegative-fixnum
+               (1+ (the nonnegative-fixnum (gethash 1 histogram 0))))))
   evaluation)
 
 (defmethod note-evaluation (evaluator (evaluation function))
@@ -363,9 +391,21 @@ region. If both sides are tainted, retain the left promise."))
 (defun memo-context-key (evaluator last base)
   ;; LAST and BASE are both at most LIMIT here, so this is a collision-free
   ;; row-major encoding of the pair, as in the OCaml implementation.
-  (+ last (* base (1+ (cost-limit (evaluator-cost evaluator))))))
+  (declare (type evaluator evaluator)
+           (type nonnegative-fixnum last base))
+  ;; Contexts are deliberately a fixnum domain. As with ranks, callers that
+  ;; construct impractically large layouts are outside this implementation's
+  ;; numeric contract.
+  (the nonnegative-fixnum
+       (+ last
+          (the nonnegative-fixnum
+               (* base
+                  (the nonnegative-fixnum
+                       (1+ (cost-limit (evaluator-cost evaluator)))))))))
 
 (defun memoized (evaluator document last base thunk)
+  (declare (type evaluator evaluator) (type document document)
+           (type nonnegative-fixnum last base) (type function thunk))
   (unless (and (evaluator-memoize evaluator)
                (zerop (document-memo-weight document))
                (<= last (cost-limit (evaluator-cost evaluator)))
@@ -386,11 +426,15 @@ region. If both sides are tainted, retain the left promise."))
 
 (defmethod exceeds-computation-limit-p
     (evaluator (document document) last base)
+  (declare (type evaluator evaluator)
+           (type nonnegative-fixnum last base))
   (let ((limit (cost-limit (evaluator-cost evaluator))))
     (or (> base limit) (> last limit))))
 
 (defmethod exceeds-computation-limit-p
     (evaluator (document text-document) last base)
+  (declare (type evaluator evaluator)
+           (type nonnegative-fixnum last base))
   (let ((limit (cost-limit (evaluator-cost evaluator))))
     (or (> base limit)
         (> (+ last (length (text-document-text document))) limit))))
@@ -400,7 +444,8 @@ region. If both sides are tainted, retain the left promise."))
 
 (defmethod evaluate-document
     (evaluator (document text-document) last base)
-  (declare (ignore base))
+  (declare (ignore base) (type evaluator evaluator)
+           (type nonnegative-fixnum last))
   (let* ((string (text-document-text document))
          (length (length string)))
     (%candidate document (+ last length)
@@ -408,34 +453,44 @@ region. If both sides are tainted, retain the left promise."))
 
 (defmethod evaluate-document
     (evaluator (document newline-document) last base)
-  (declare (ignore evaluator last))
+  (declare (ignore evaluator last) (type nonnegative-fixnum base))
   (%candidate document base (%rank 0 1)))
 
 (defmethod evaluate-document
     (evaluator (document choice-document) last base)
+  (declare (type evaluator evaluator)
+           (type nonnegative-fixnum last base))
   (merge-evaluations
    (evaluate evaluator (choice-document-left document) last base)
    (evaluate evaluator (choice-document-right document) last base)))
 
 (defmethod evaluate-document
     (evaluator (document nest-document) last base)
+  (declare (type evaluator evaluator)
+           (type nonnegative-fixnum last base))
   (let ((amount (nest-document-amount document)))
     (wrap-evaluation
      evaluator :nest amount
-     (evaluate evaluator (nest-document-child document) last (+ base amount)))))
+     (evaluate evaluator (nest-document-child document) last
+               (the nonnegative-fixnum (+ base amount))))))
 
 (defmethod evaluate-document
     (evaluator (document align-document) last base)
-  (declare (ignore base))
+  (declare (ignore base) (type evaluator evaluator)
+           (type nonnegative-fixnum last))
   (wrap-evaluation
    evaluator :align 0
    (evaluate evaluator (align-document-child document) last last)))
 
 (defmethod evaluate-document
     (evaluator (document concatenation-document) last base)
+  (declare (type evaluator evaluator)
+           (type nonnegative-fixnum last base))
   (evaluate-concatenation evaluator document last base))
 
 (defun evaluate (evaluator document last base)
+  (declare (type evaluator evaluator) (type document document)
+           (type nonnegative-fixnum last base))
   (memoized
    evaluator document last base
    (lambda ()
@@ -450,6 +505,7 @@ region. If both sides are tainted, retain the left promise."))
            (core))))))
 
 (defun wrap-frontier (kind amount frontier)
+  (declare (type nonnegative-fixnum amount) (type (vector t) frontier))
   (map 'vector
        (lambda (candidate)
          (%candidate
@@ -494,7 +550,7 @@ region. If both sides are tainted, retain the left promise."))
 
 (defmethod concatenate-right-evaluation
     (evaluator left (right vector))
-  (declare (ignore evaluator))
+  (declare (ignore evaluator) (type candidate left) (type (vector t) right))
   (let ((result (empty-frontier)))
     (loop for candidate across right
           do (frontier-add result (concatenate-candidates left candidate)))
@@ -532,6 +588,9 @@ region. If both sides are tainted, retain the left promise."))
 
 (defmethod concatenate-left-evaluation
     (evaluator document base (left vector))
+  (declare (type evaluator evaluator)
+           (type concatenation-document document)
+           (type nonnegative-fixnum base) (type (vector t) left))
   (let ((result (empty-frontier)))
     (loop for candidate across left
           do (setf result
@@ -545,6 +604,9 @@ region. If both sides are tainted, retain the left promise."))
   (concatenate-right evaluator document left base))
 
 (defun evaluate-concatenation (evaluator document last base)
+  (declare (type evaluator evaluator)
+           (type concatenation-document document)
+           (type nonnegative-fixnum last base))
   (concatenate-left-evaluation
    evaluator document base
    (evaluate evaluator (concatenation-document-left document) last base)))
@@ -566,10 +628,11 @@ candidate, as in Pretty Expressive and recursive.zig."
          (let* ((evaluation (evaluate evaluator document 0 0))
                 (tainted-p (functionp evaluation))
                 (frontier
-                  (etypecase evaluation
-                    (function (vector (force-evaluation evaluation)))
-                    (candidate (vector evaluation))
-                    (vector evaluation)))
+                  (the (vector t)
+                       (etypecase evaluation
+                         (function (vector (force-evaluation evaluation)))
+                         (candidate (vector evaluation))
+                         (vector (the (vector t) evaluation)))))
                 (statistics (evaluator-statistics evaluator)))
            (when (zerop (length frontier))
              (error "Document has no layouts"))
@@ -586,29 +649,33 @@ candidate, as in Pretty Expressive and recursive.zig."
 (defgeneric render-layout (document stream last base))
 
 (defmethod render-layout ((document text-document) stream last base)
-  (declare (ignore base))
+  (declare (ignore base) (type nonnegative-fixnum last))
   (write-string (text-document-text document) stream)
-  (+ last (length (text-document-text document))))
+  (the nonnegative-fixnum
+       (+ last (length (text-document-text document)))))
 
 (defmethod render-layout ((document newline-document) stream last base)
-  (declare (ignore last))
+  (declare (ignore last) (type nonnegative-fixnum base))
   (terpri stream)
   (loop repeat base do (write-char #\Space stream))
   base)
 
 (defmethod render-layout
     ((document concatenation-document) stream last base)
+  (declare (type nonnegative-fixnum last base))
   (render-layout
    (concatenation-document-right document) stream
    (render-layout (concatenation-document-left document) stream last base)
    base))
 
 (defmethod render-layout ((document nest-document) stream last base)
+  (declare (type nonnegative-fixnum last base))
   (render-layout (nest-document-child document) stream last
-                 (+ base (nest-document-amount document))))
+                 (the nonnegative-fixnum
+                      (+ base (nest-document-amount document)))))
 
 (defmethod render-layout ((document align-document) stream last base)
-  (declare (ignore base))
+  (declare (ignore base) (type nonnegative-fixnum last))
   (render-layout (align-document-child document) stream last last))
 
 (defmethod render-layout ((document choice-document) stream last base)
