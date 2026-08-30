@@ -36,6 +36,7 @@ fi
 EOF
 
 # Migrate the inline hook written by the previous setup implementation.
+touch "$HOME/.bash_profile"
 sed -i '/^# zoot Nix development shell$/,/^fi$/d' "$HOME/.bash_profile"
 
 profile_marker="# zoot Nix development shell hook"
@@ -48,6 +49,6 @@ EOF
 fi
 
 printf '[orb setup] Building and testing in the flake environment\n'
-nix develop "$repo_root" --command make test
+"$nix_profile/bin/nix" develop "$repo_root" --command make test
 
 printf '[orb setup] Complete in %ss\n' "$((SECONDS - started_at))"

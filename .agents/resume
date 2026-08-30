@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+repo_root="$(cd "$(dirname "$0")/.." && pwd)"
 nix_profile="/nix/var/nix/profiles/default"
 
 if [[ ! -x "$nix_profile/bin/nix" ]]; then
@@ -11,6 +12,10 @@ fi
 if ! systemctl is-active --quiet nix-daemon.socket; then
   sudo systemctl start nix-daemon.socket
 fi
+
+cd "$repo_root"
+# shellcheck disable=SC1091
+source "$HOME/.config/zoot/nix-profile.sh"
 
 for tool in nix zig sbcl dune; do
   if ! command -v "$tool" >/dev/null 2>&1; then
