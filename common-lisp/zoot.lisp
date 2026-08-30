@@ -299,54 +299,48 @@ last column and rank. Frontiers are unrestricted adjustable vectors."
     (error "Cannot choose from an empty frontier"))
   (aref evaluation 0))
 
-(defgeneric merge-evaluations (left right)
-  (:documentation
-   "Merge like Pretty Expressive's measure sets: a normal frontier always
+(defun merge-evaluations (left right)
+  "Merge like Pretty Expressive's measure sets: a normal frontier always
 wins over taint, since taint means that computation has left the bounded
-region. If both sides are tainted, retain the left promise."))
-
-(defmethod merge-evaluations ((left vector) (right vector))
-  (cond ((evaluation-empty-p left) right)
-        ((evaluation-empty-p right) left)
-        (t (canonicalize-frontier (frontier-union left right)))))
-
-(defmethod merge-evaluations ((left candidate) (right candidate))
-  (cond ((dominates-p left right) left)
-        ((dominates-p right left) right)
-        (t (let ((frontier (empty-frontier)))
-             (frontier-add frontier left)
-             (frontier-add frontier right)
-             (sort frontier #'> :key #'candidate-last)))))
-
-(defmethod merge-evaluations ((left candidate) (right vector))
-  (declare (type (vector t) right))
-  (if (evaluation-empty-p right)
-      left
-      (let ((frontier (empty-frontier)))
-        (frontier-add frontier left)
-        (loop for candidate across right do (frontier-add frontier candidate))
-        (canonicalize-frontier (sort frontier #'> :key #'candidate-last)))))
-
-(defmethod merge-evaluations ((left vector) (right candidate))
-  (merge-evaluations right left))
-
-(defmethod merge-evaluations ((left vector) (right function))
-  (if (evaluation-empty-p left) right left))
-
-(defmethod merge-evaluations ((left candidate) (right function))
-  (declare (ignore right))
-  left)
-
-(defmethod merge-evaluations ((left function) (right vector))
-  (if (evaluation-empty-p right) left right))
-
-(defmethod merge-evaluations ((left function) (right candidate))
-  (declare (ignore left))
-  right)
-
-(defmethod merge-evaluations ((left function) (right function))
-  (declare (ignore right))
-  left)
+region. If both sides are tainted, retain the left promise."
+  (declare (type evaluation left right))
+  (labels ((merge-candidates (left right)
+             (declare (type candidate left right))
+             (cond ((dominates-p left right) left)
+                   ((dominates-p right left) right)
+                   (t (let ((frontier (empty-frontier)))
+                        (frontier-add frontier left)
+                        (frontier-add frontier right)
+                        (sort frontier #'> :key #'candidate-last)))))
+           (merge-candidate-frontier (candidate frontier)
+             (declare (type candidate candidate) (type (vector t) frontier))
+             (if (evaluation-empty-p frontier)
+                 candidate
+                 (let ((result (empty-frontier)))
+                   (frontier-add result candidate)
+                   (loop for item across frontier
+                         do (frontier-add result item))
+                   (canonicalize-frontier
+                    (sort result #'> :key #'candidate-last))))))
+    (typecase left
+      (vector
+       (typecase right
+         (vector
+          (cond ((evaluation-empty-p left) right)
+                ((evaluation-empty-p right) left)
+                (t (canonicalize-frontier (frontier-union left right)))))
+         (candidate (merge-candidate-frontier right left))
+         (function (if (evaluation-empty-p left) right left))))
+      (candidate
+       (typecase right
+         (vector (merge-candidate-frontier left right))
+         (candidate (merge-candidates left right))
+         (function left)))
+      (function
+       (typecase right
+         (vector (if (evaluation-empty-p right) left right))
+         (candidate right)
+         (function left))))))
 
 ;;; Recursive evaluator
 
