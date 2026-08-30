@@ -29,9 +29,10 @@ reference implementation (its PARAM_MEMO_LIMIT is 7, with initial weight 6).")
   (memo-weight +initial-memo-weight+
                :type (integer 0 6)
                :read-only t)
-  ;; Documents are single-use search spaces. Memoized candidates live as long
-  ;; as the document and are reclaimed with it after its one PICK.
-  (memo-table nil :type (or null hash-table))
+  ;; Documents are single-use search spaces. Memoized candidates live in a
+  ;; PICK-scoped table keyed by this lazily assigned serial number and are
+  ;; reclaimed when that PICK's table is dropped.
+  (memo-id nil :type (or null nonnegative-fixnum))
   (consumed-p nil :type boolean))
 
 (defstruct (text-document
@@ -231,9 +232,17 @@ nonnegative integer. Newline count remains the secondary rank component.")
 (defvar *cost* (make-f2 80) "Cost configuration dynamically bound by PICK.")
 (defvar *statistics* (make-statistics)
   "Statistics dynamically accumulated by PICK.")
+(defvar *memo-table* (make-hash-table :test #'eql)
+  "Single memo table dynamically bound by PICK, keyed by document serial
+number and evaluation context.")
+(defvar *memo-serial* 0
+  "Global source of document memo serial numbers. Never reset, so a stale
+serial on a subtree shared across documents cannot collide with a fresh one.")
 
 (declaim (type cost *cost*)
-         (type statistics *statistics*))
+         (type statistics *statistics*)
+         (type hash-table *memo-table*)
+         (type nonnegative-fixnum *memo-serial*))
 
 #+sbcl
 (declaim (sb-ext:always-bound *cost* *cost-measure* *statistics*))
@@ -525,24 +534,28 @@ region. If both sides are tainted, retain the left promise."
 (defmethod note-evaluation ((evaluation tainted-context))
   evaluation)
 
-(defun document-context-table (document)
-  (or (document-memo-table document)
-      (setf (document-memo-table document)
-            (make-hash-table :test #'eql :size 64))))
+(defun document-memo-serial (document)
+  (or (document-memo-id document)
+      (setf (document-memo-id document)
+            (let ((serial *memo-serial*))
+              (setf *memo-serial* (the nonnegative-fixnum (1+ serial)))
+              serial))))
 
-(defun memo-context-key (last base limit)
-  ;; LAST and BASE are both at most LIMIT here, so this is a collision-free
-  ;; row-major encoding of the pair, as in the OCaml implementation.
+(defun memo-context-key (document last base limit)
+  ;; LAST and BASE are both at most LIMIT here, so document serial plus the
+  ;; row-major (BASE, LAST) pair is a collision-free encoding, as in the
+  ;; OCaml implementation.
   (declare (type nonnegative-fixnum last base limit))
   ;; Contexts are deliberately a fixnum domain. As with ranks, callers that
   ;; construct impractically large layouts are outside this implementation's
   ;; numeric contract.
-  (the nonnegative-fixnum
-       (+ last
-          (the nonnegative-fixnum
-               (* base
-                  (the nonnegative-fixnum
-                       (1+ limit)))))))
+  (let ((span (the nonnegative-fixnum (1+ limit))))
+    (the nonnegative-fixnum
+         (+ last
+            (the nonnegative-fixnum (* base span))
+            (the nonnegative-fixnum
+                 (* (document-memo-serial document)
+                    (the nonnegative-fixnum (* span span))))))))
 
 (defmacro memoized ((document last base) &body body)
   "Evaluate BODY directly for ordinary nodes and cache it at memo checkpoints
@@ -564,9 +577,9 @@ whose context lies inside the computation limit."
                    (,limit-var (cost-limit *cost*)))
                (if (and (<= ,last-var ,limit-var)
                         (<= ,base-var ,limit-var))
-                   (let* ((,contexts-var
-                            (document-context-table ,document-var))
+                   (let* ((,contexts-var *memo-table*)
                           (,key-var (memo-context-key
+                                     ,document-var
                                      ,last-var ,base-var ,limit-var)))
                      (multiple-value-bind (,value-var ,present-var)
                          (gethash ,key-var ,contexts-var)
@@ -748,6 +761,7 @@ Expressive and recursive.zig."
     (error "PICK cannot reuse an already consumed document"))
   (setf (document-consumed-p document) t)
   (let ((*cost* cost)
+        (*memo-table* (make-hash-table :test #'eql :size 1024))
         #+zoot-statistics
         (*statistics* (make-statistics))
         (*cost-measure* (or *cost-measure* (cost-measure cost))))
