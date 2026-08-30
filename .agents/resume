@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-zig_version="0.15.1"
-zig_binary="$HOME/.local/share/zig/${zig_version}/zig"
+nix_profile="/nix/var/nix/profiles/default"
 
-if [[ ! -x "$zig_binary" ]] || [[ "$($zig_binary version)" != "$zig_version" ]]; then
-  echo "Zig $zig_version is missing; rerun .agents/setup" >&2
+if [[ ! -x "$nix_profile/bin/nix" ]]; then
+  echo "Nix is missing; rerun .agents/setup" >&2
   exit 1
 fi
 
-mkdir -p "$HOME/.local/bin"
-ln -sfn "$zig_binary" "$HOME/.local/bin/zig"
+if ! systemctl is-active --quiet nix-daemon.socket; then
+  sudo systemctl start nix-daemon.socket
+fi
+
+for tool in nix zig sbcl dune; do
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    echo "$tool is missing from the flake environment; rerun .agents/setup" >&2
+    exit 1
+  fi
+done
