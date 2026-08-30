@@ -40,6 +40,16 @@
        (result (pick (choice inline multiline) (make-f1 10))))
   (check "foo bar" (render (result-candidate result))))
 
+;;; A document and its node-local memo state belong to exactly one PICK.
+
+(let ((document (text "once")))
+  (pick document (make-f1 10))
+  (check-true
+   (handler-case
+       (progn (pick document (make-f1 10)) nil)
+     (error () t))
+   "a second PICK should reject a consumed document"))
+
 (let* ((cheap-long (text "12345"))
        (costly-short (cat +newline+ (text "x")))
        (tradeoff (choice cheap-long costly-short))
@@ -104,11 +114,12 @@
 
 ;;; Group and alignment smoke tests.
 
-(let* ((body (cat (text "a") +newline+ (text "b")))
-       (document (cat (text "xx") (align (group body)))))
-  (check "xxa b" (format-document document (make-f1 20)))
+(flet ((make-document ()
+         (let ((body (cat (text "a") +newline+ (text "b"))))
+           (cat (text "xx") (align (group body))))))
+  (check "xxa b" (format-document (make-document) (make-f1 20)))
   (check (format nil "xxa~%  b")
-         (format-document document (make-f1 3))))
+         (format-document (make-document) (make-f1 3))))
 
 ;;; OCaml's structural memo weight reaches zero after six constructors, then
 ;;; resets at the next parent without inserting a wrapper document.

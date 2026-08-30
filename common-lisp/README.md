@@ -18,8 +18,9 @@ Zig's compact representation:
 - both linear-overflow F1 and squared-overflow F2 costs are available;
 - text cost is an actual function value and may be dynamically overridden by
   binding `*cost-measure*` around `pick`;
-- each document node owns a reusable `EQL` context table, keyed by a packed
-  integer containing the current column and indentation base;
+- documents are single-use search spaces; each memo checkpoint lazily owns an
+  `EQL` context table keyed by a packed current-column/indentation integer, and
+  the whole search graph is reclaimed together after planning;
 - the OCaml six-level structural weight policy enables those tables only at
   periodic memo checkpoints, without adding Zig-style wrapper nodes;
 - evaluation uses the paper's computation-width taint: work outside the bounded
@@ -39,8 +40,9 @@ Run the small benchmark suite with:
 make lisp-benchmark RUNS=20
 ```
 
-It reports total and mean planning time along with output size, selected rank,
-root and maximum frontier sizes, evaluator/memo counts, taint activity, and a
+Each iteration constructs and plans a fresh document. The suite reports mean
+build, plan, and end-to-end times along with output size, selected rank, root
+and maximum frontier sizes, evaluator/memo counts, taint activity, and a
 frontier-size histogram. Its workloads cover token-preserving ternary Lisp
 layout, a shared document DAG, and repeatedly forced computation-width taint.
 

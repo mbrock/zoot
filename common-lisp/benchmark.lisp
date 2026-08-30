@@ -66,7 +66,7 @@ layout. Both branches contain exactly the same non-whitespace tokens."
 
 (defstruct benchmark
   name
-  document
+  builder
   cost)
 
 (defun histogram-string (histogram)
@@ -85,8 +85,9 @@ layout. Both branches contain exactly the same non-whitespace tokens."
 (defstruct sample
   name
   runs
-  elapsed
-  average
+  total-average
+  build-average
+  plan-average
   bytes
   rank
   frontier-size
@@ -94,23 +95,31 @@ layout. Both branches contain exactly the same non-whitespace tokens."
   tainted-p)
 
 (defun time-benchmark (benchmark runs)
-  ;; Warm memoized code and the compiler before taking samples. Each PICK still
-  ;; owns a fresh evaluator and memo table.
-  (pick (benchmark-document benchmark) (benchmark-cost benchmark))
-  (let ((start (get-internal-real-time))
+  ;; Warm compiled paths with a disposable document. Measured iterations then
+  ;; build and consume one fresh document apiece.
+  (pick (funcall (benchmark-builder benchmark)) (benchmark-cost benchmark))
+  (let ((total-start (get-internal-real-time))
+        (build-ticks 0)
+        (plan-ticks 0)
         (last-result nil))
     (dotimes (run runs)
-      (setf last-result
-            (pick (benchmark-document benchmark) (benchmark-cost benchmark))))
-    (let* ((elapsed (milliseconds (- (get-internal-real-time) start)))
+      (declare (ignore run))
+      (let* ((build-start (get-internal-real-time))
+             (document (funcall (benchmark-builder benchmark)))
+             (plan-start (get-internal-real-time)))
+        (incf build-ticks (- plan-start build-start))
+        (setf last-result (pick document (benchmark-cost benchmark)))
+        (incf plan-ticks (- (get-internal-real-time) plan-start))))
+    (let* ((total-ticks (- (get-internal-real-time) total-start))
            (candidate (result-candidate last-result))
            (rank (candidate-rank candidate))
            (statistics (result-statistics last-result)))
       (make-sample
        :name (benchmark-name benchmark)
        :runs runs
-       :elapsed elapsed
-       :average (/ elapsed runs)
+       :total-average (/ (milliseconds total-ticks) runs)
+       :build-average (/ (milliseconds build-ticks) runs)
+       :plan-average (/ (milliseconds plan-ticks) runs)
        :bytes (length (render candidate))
        :rank rank
        :frontier-size (length (result-frontier last-result))
@@ -122,20 +131,21 @@ layout. Both branches contain exactly the same non-whitespace tokens."
           (lisp-implementation-type) (lisp-implementation-version)))
 
 (defun print-performance-table (samples)
-  (format t "~%Performance and selected layout~%")
-  (format t "~18A  ~5A  ~10A  ~9A  ~8A  ~10A  ~8A  ~7A~%"
-          "case" "runs" "total ms" "mean ms" "chars" "overflow" "newlines"
-          "tainted")
-  (format t "~18A  ~5A  ~10A  ~9A  ~8A  ~10A  ~8A  ~7A~%"
-          "------------------" "-----" "----------" "---------" "--------"
-          "----------" "--------" "-------")
+  (format t "~%Performance per fresh document~%")
+  (format t "~18A  ~5A  ~9A  ~9A  ~9A  ~8A  ~10A  ~8A  ~7A~%"
+          "case" "runs" "total ms" "build ms" "plan ms" "chars" "overflow"
+          "newlines" "tainted")
+  (format t "~18A  ~5A  ~9A  ~9A  ~9A  ~8A  ~10A  ~8A  ~7A~%"
+          "------------------" "-----" "---------" "---------" "---------"
+          "--------" "----------" "--------" "-------")
   (dolist (sample samples)
     (let ((rank (sample-rank sample)))
-      (format t "~18A  ~5D  ~10,2F  ~9,3F  ~8D  ~10D  ~8D  ~7A~%"
+      (format t "~18A  ~5D  ~9,3F  ~9,3F  ~9,3F  ~8D  ~10D  ~8D  ~7A~%"
               (sample-name sample)
               (sample-runs sample)
-              (sample-elapsed sample)
-              (sample-average sample)
+              (sample-total-average sample)
+              (sample-build-average sample)
+              (sample-plan-average sample)
               (sample-bytes sample)
               (rank-overflow rank)
               (rank-height rank)
@@ -191,16 +201,16 @@ layout. Both branches contain exactly the same non-whitespace tokens."
        (benchmarks
          (list
           (make-benchmark :name "ternary-depth-3"
-                          :document (ternary-document 3)
+                          :builder (lambda () (ternary-document 3))
                           :cost (make-f2 80))
           (make-benchmark :name "ternary-depth-4"
-                          :document (ternary-document 4)
+                          :builder (lambda () (ternary-document 4))
                           :cost (make-f2 80))
           (make-benchmark :name "shared-depth-9"
-                          :document (shared-document 9)
+                          :builder (lambda () (shared-document 9))
                           :cost (make-f2 60))
           (make-benchmark :name "tainted-lines-512"
-                          :document (tainted-document 512)
+                          :builder (lambda () (tainted-document 512))
                           :cost (make-f2 12 :computation-width 14)))))
   (unless (plusp runs)
     (error "RUNS must be a positive integer, got ~S" runs))

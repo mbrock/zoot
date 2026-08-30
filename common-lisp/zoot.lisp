@@ -29,10 +29,10 @@ reference implementation (its PARAM_MEMO_LIMIT is 7, with initial weight 6).")
   (memo-weight +initial-memo-weight+
                :type (integer 0 6)
                :read-only t)
-  ;; Transient evaluator-owned state. The table itself is retained between
-  ;; picks to reuse its allocation, but its entries never cross a pick.
-  (memo-owner nil)
-  (memo-table nil :type (or null hash-table)))
+  ;; Documents are single-use search spaces. Memoized candidates live as long
+  ;; as the document and are reclaimed with it after its one PICK.
+  (memo-table nil :type (or null hash-table))
+  (consumed-p nil :type boolean))
 
 (defstruct (text-document
             (:include document)
@@ -222,8 +222,6 @@ nonnegative integer. Newline count remains the secondary rank component.")
 (defstruct (evaluator (:constructor %evaluator (cost memoize)))
   (cost (make-f2 80) :type cost :read-only t)
   (memoize t :type boolean :read-only t)
-  (memo-token (list nil) :read-only t)
-  (memoized-documents nil :type list)
   (statistics (make-statistics) :type statistics))
 
 (defun dominates-p (left right)
@@ -369,24 +367,10 @@ region. If both sides are tainted, retain the left promise."))
   (declare (ignore evaluator))
   evaluation)
 
-(defun document-context-table (evaluator document)
-  (let ((token (evaluator-memo-token evaluator)))
-    (unless (eq token (document-memo-owner document))
-      (when (document-memo-owner document)
-        (error "Concurrent PICK calls cannot share document nodes yet"))
-      (let ((table (or (document-memo-table document)
-                       (setf (document-memo-table document)
-                             (make-hash-table :test #'eql)))))
-        (clrhash table)
-        (setf (document-memo-owner document) token)
-        (push document (evaluator-memoized-documents evaluator))))
-    (document-memo-table document)))
-
-(defun release-context-tables (evaluator)
-  (dolist (document (evaluator-memoized-documents evaluator))
-    (clrhash (document-memo-table document))
-    (setf (document-memo-owner document) nil))
-  (setf (evaluator-memoized-documents evaluator) nil))
+(defun document-context-table (document)
+  (or (document-memo-table document)
+      (setf (document-memo-table document)
+            (make-hash-table :test #'eql))))
 
 (defun memo-context-key (evaluator last base)
   ;; LAST and BASE are both at most LIMIT here, so this is a collision-free
@@ -411,7 +395,7 @@ region. If both sides are tainted, retain the left promise."))
                (<= last (cost-limit (evaluator-cost evaluator)))
                (<= base (cost-limit (evaluator-cost evaluator))))
     (return-from memoized (funcall thunk)))
-  (let* ((contexts (document-context-table evaluator document))
+  (let* ((contexts (document-context-table document))
          (key (memo-context-key evaluator last base)))
     (multiple-value-bind (frontier present-p) (gethash key contexts)
       (if present-p
@@ -619,30 +603,32 @@ region. If both sides are tainted, retain the left promise."))
   (tainted-p nil :type boolean :read-only t))
 
 (defun pick (document cost &key (memoize t))
-  "Resolve DOCUMENT with computation-width taint. Ordinary Pareto frontiers
-are exact and unrestricted; forced tainted regions deliberately recover one
-candidate, as in Pretty Expressive and recursive.zig."
+  "Consume and resolve DOCUMENT with computation-width taint. Documents are
+single-use search spaces. Ordinary Pareto frontiers are exact and unrestricted;
+forced tainted regions deliberately recover one candidate, as in Pretty
+Expressive and recursive.zig."
+  (when (document-consumed-p document)
+    (error "PICK cannot reuse an already consumed document"))
+  (setf (document-consumed-p document) t)
   (let ((evaluator (%evaluator cost memoize))
         (*cost-measure* (or *cost-measure* (cost-measure cost))))
-    (unwind-protect
-         (let* ((evaluation (evaluate evaluator document 0 0))
-                (tainted-p (functionp evaluation))
-                (frontier
-                  (the (vector t)
-                       (etypecase evaluation
-                         (function (vector (force-evaluation evaluation)))
-                         (candidate (vector evaluation))
-                         (vector (the (vector t) evaluation)))))
-                (statistics (evaluator-statistics evaluator)))
-           (when (zerop (length frontier))
-             (error "Document has no layouts"))
-           (let ((best (aref frontier 0)))
-             (loop for candidate across frontier
-                   when (rank< (candidate-rank candidate)
-                               (candidate-rank best))
-                     do (setf best candidate))
-             (%result best frontier statistics tainted-p)))
-      (release-context-tables evaluator))))
+    (let* ((evaluation (evaluate evaluator document 0 0))
+           (tainted-p (functionp evaluation))
+           (frontier
+             (the (vector t)
+                  (etypecase evaluation
+                    (function (vector (force-evaluation evaluation)))
+                    (candidate (vector evaluation))
+                    (vector (the (vector t) evaluation)))))
+           (statistics (evaluator-statistics evaluator)))
+      (when (zerop (length frontier))
+        (error "Document has no layouts"))
+      (let ((best (aref frontier 0)))
+        (loop for candidate across frontier
+              when (rank< (candidate-rank candidate)
+                          (candidate-rank best))
+                do (setf best candidate))
+        (%result best frontier statistics tainted-p)))))
 
 ;;; Rendering
 
