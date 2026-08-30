@@ -42,11 +42,10 @@ reference implementation (its PARAM_MEMO_LIMIT is 7, with initial weight 6).")
   (child nil :read-only t))
 
 (defstruct (memo-document (:constructor %memo-document (child)))
-  ;; Each checkpoint owns its context table, created on first use and
-  ;; living as long as the document. Entries are keyed by evaluation
-  ;; context under one cost configuration, so a document belongs to the
-  ;; configuration it is first picked with.
-  (contexts nil :type (or null hash-table))
+  ;; Each checkpoint owns its context table for the document's lifetime.
+  ;; Entries are keyed by evaluation context under one cost configuration,
+  ;; so a document belongs to the configuration it is first picked with.
+  (contexts (make-hash-table :test #'eql) :type hash-table :read-only t)
   (child nil :read-only t))
 
 (deftype document ()
@@ -536,7 +535,7 @@ region. If both sides are tainted, retain the left promise."
 (defmethod note-evaluation ((evaluation tainted-context))
   evaluation)
 
-(declaim (inline memo-context-key document-contexts))
+(declaim (inline memo-context-key))
 (defun memo-context-key (last base limit)
   ;; LAST and BASE are both at most LIMIT here, so this is a collision-free
   ;; row-major encoding of the pair, as in the OCaml implementation.
@@ -545,12 +544,6 @@ region. If both sides are tainted, retain the left promise."
        (+ last
           (the nonnegative-fixnum
                (* base (the nonnegative-fixnum (1+ limit)))))))
-
-(defun document-contexts (document)
-  (declare (type memo-document document))
-  (or (memo-document-contexts document)
-      (setf (memo-document-contexts document)
-            (make-hash-table :test #'eql))))
 
 (declaim (inline exceeds-computation-limit-p))
 (defun exceeds-computation-limit-p (document last base)
@@ -600,7 +593,7 @@ call sites do not re-check child slots on every traversal."
   (if (memo-document-p document)
       (let ((limit (cost-limit *cost*)))
         (if (and (<= last limit) (<= base limit))
-            (let ((contexts (document-contexts document))
+            (let ((contexts (memo-document-contexts document))
                   (key (memo-context-key last base limit)))
               (multiple-value-bind (value present)
                   (gethash key contexts)
