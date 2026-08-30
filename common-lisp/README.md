@@ -18,6 +18,8 @@ Zig's compact representation:
 - both linear-overflow F1 and squared-overflow F2 costs are available;
 - text cost is an actual function value and may be dynamically overridden by
   binding `*cost-measure*` around `pick`;
+- per-pick cost, memoization policy, and statistics are dynamically scoped, so
+  recursive evaluator methods carry only the document context they transform;
 - documents are single-use search spaces; each memo checkpoint lazily owns an
   `EQL` context table keyed by a packed current-column/indentation integer, and
   the whole search graph is reclaimed together after planning;

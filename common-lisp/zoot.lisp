@@ -219,10 +219,13 @@ nonnegative integer. Newline count remains the secondary rank component.")
   (frontier-maximum 0 :type nonnegative-fixnum)
   (frontier-histogram (make-hash-table) :type hash-table))
 
-(defstruct (evaluator (:constructor %evaluator (cost memoize)))
-  (cost (make-f2 80) :type cost :read-only t)
-  (memoize t :type boolean :read-only t)
-  (statistics (make-statistics) :type statistics))
+(defvar *cost* nil "Cost configuration dynamically bound by PICK.")
+(defvar *memoize* t "Whether the current PICK uses node-local memo tables.")
+(defvar *statistics* nil "Statistics dynamically accumulated by PICK.")
+
+(declaim (type (or null cost) *cost*)
+         (type boolean *memoize*)
+         (type (or null statistics) *statistics*))
 
 (defun dominates-p (left right)
   (and (<= (candidate-last left) (candidate-last right))
@@ -261,11 +264,11 @@ last column and rank. Frontiers are unrestricted adjustable vectors."
 
 (deftype evaluation () '(or candidate vector function))
 
-(defun tainted-evaluation (evaluator thunk)
-  (declare (type evaluator evaluator) (type function thunk))
-  (incf (statistics-taints-deferred (evaluator-statistics evaluator)))
+(defun tainted-evaluation (thunk)
+  (declare (type function thunk))
+  (incf (statistics-taints-deferred (the statistics *statistics*)))
   (lambda ()
-    (incf (statistics-taints-forced (evaluator-statistics evaluator)))
+    (incf (statistics-taints-forced (the statistics *statistics*)))
     (funcall thunk)))
 
 (defun evaluation-empty-p (evaluation)
@@ -335,9 +338,9 @@ region. If both sides are tainted, retain the left promise."))
 
 ;;; Recursive evaluator
 
-(defun note-frontier (evaluator frontier)
-  (declare (type evaluator evaluator) (type (vector t) frontier))
-  (let* ((statistics (evaluator-statistics evaluator))
+(defun note-frontier (frontier)
+  (declare (type (vector t) frontier))
+  (let* ((statistics (the statistics *statistics*))
          (length (length frontier))
          (histogram (statistics-frontier-histogram statistics)))
     (setf (statistics-frontier-maximum statistics)
@@ -348,13 +351,13 @@ region. If both sides are tainted, retain the left promise."))
                          (gethash length histogram 0))))))
   frontier)
 
-(defgeneric note-evaluation (evaluator evaluation))
+(defgeneric note-evaluation (evaluation))
 
-(defmethod note-evaluation (evaluator (evaluation vector))
-  (note-frontier evaluator evaluation))
+(defmethod note-evaluation ((evaluation vector))
+  (note-frontier evaluation))
 
-(defmethod note-evaluation (evaluator (evaluation candidate))
-  (let* ((statistics (evaluator-statistics evaluator))
+(defmethod note-evaluation ((evaluation candidate))
+  (let* ((statistics (the statistics *statistics*))
          (histogram (statistics-frontier-histogram statistics)))
     (setf (statistics-frontier-maximum statistics)
           (max 1 (statistics-frontier-maximum statistics)))
@@ -363,8 +366,7 @@ region. If both sides are tainted, retain the left promise."))
                (1+ (the nonnegative-fixnum (gethash 1 histogram 0))))))
   evaluation)
 
-(defmethod note-evaluation (evaluator (evaluation function))
-  (declare (ignore evaluator))
+(defmethod note-evaluation ((evaluation function))
   evaluation)
 
 (defun document-context-table (document)
@@ -372,11 +374,10 @@ region. If both sides are tainted, retain the left promise."))
       (setf (document-memo-table document)
             (make-hash-table :test #'eql))))
 
-(defun memo-context-key (evaluator last base)
+(defun memo-context-key (last base)
   ;; LAST and BASE are both at most LIMIT here, so this is a collision-free
   ;; row-major encoding of the pair, as in the OCaml implementation.
-  (declare (type evaluator evaluator)
-           (type nonnegative-fixnum last base))
+  (declare (type nonnegative-fixnum last base))
   ;; Contexts are deliberately a fixnum domain. As with ranks, callers that
   ;; construct impractically large layouts are outside this implementation's
   ;; numeric contract.
@@ -385,107 +386,97 @@ region. If both sides are tainted, retain the left promise."))
           (the nonnegative-fixnum
                (* base
                   (the nonnegative-fixnum
-                       (1+ (cost-limit (evaluator-cost evaluator)))))))))
+                       (1+ (cost-limit (the cost *cost*)))))))))
 
-(defun memoized (evaluator document last base thunk)
-  (declare (type evaluator evaluator) (type document document)
+(defun memoized (document last base thunk)
+  (declare (type document document)
            (type nonnegative-fixnum last base) (type function thunk))
-  (unless (and (evaluator-memoize evaluator)
+  (unless (and *memoize*
                (zerop (document-memo-weight document))
-               (<= last (cost-limit (evaluator-cost evaluator)))
-               (<= base (cost-limit (evaluator-cost evaluator))))
+               (<= last (cost-limit (the cost *cost*)))
+               (<= base (cost-limit (the cost *cost*))))
     (return-from memoized (funcall thunk)))
   (let* ((contexts (document-context-table document))
-         (key (memo-context-key evaluator last base)))
+         (key (memo-context-key last base)))
     (multiple-value-bind (frontier present-p) (gethash key contexts)
       (if present-p
           (progn
-            (incf (statistics-memo-hits (evaluator-statistics evaluator)))
+            (incf (statistics-memo-hits (the statistics *statistics*)))
             frontier)
           (prog1 (setf (gethash key contexts) (funcall thunk))
             (incf (statistics-memo-entries
-                   (evaluator-statistics evaluator))))))))
+                   (the statistics *statistics*))))))))
 
-(defgeneric exceeds-computation-limit-p (evaluator document last base))
+(defgeneric exceeds-computation-limit-p (document last base))
 
 (defmethod exceeds-computation-limit-p
-    (evaluator (document document) last base)
-  (declare (type evaluator evaluator)
-           (type nonnegative-fixnum last base))
-  (let ((limit (cost-limit (evaluator-cost evaluator))))
+    ((document document) last base)
+  (declare (type nonnegative-fixnum last base))
+  (let ((limit (cost-limit (the cost *cost*))))
     (or (> base limit) (> last limit))))
 
 (defmethod exceeds-computation-limit-p
-    (evaluator (document text-document) last base)
-  (declare (type evaluator evaluator)
-           (type nonnegative-fixnum last base))
-  (let ((limit (cost-limit (evaluator-cost evaluator))))
+    ((document text-document) last base)
+  (declare (type nonnegative-fixnum last base))
+  (let ((limit (cost-limit (the cost *cost*))))
     (or (> base limit)
         (> (+ last (length (text-document-text document))) limit))))
 
-(defgeneric evaluate-document (evaluator document last base)
+(defgeneric evaluate-document (document last base)
   (:documentation "Evaluate one document node after memo and taint checks."))
 
 (defmethod evaluate-document
-    (evaluator (document text-document) last base)
-  (declare (ignore base) (type evaluator evaluator)
-           (type nonnegative-fixnum last))
+    ((document text-document) last base)
+  (declare (ignore base) (type nonnegative-fixnum last))
   (let* ((string (text-document-text document))
          (length (length string)))
     (%candidate document (+ last length)
-                (text-rank (evaluator-cost evaluator) last length))))
+                (text-rank (the cost *cost*) last length))))
 
 (defmethod evaluate-document
-    (evaluator (document newline-document) last base)
-  (declare (ignore evaluator last) (type nonnegative-fixnum base))
+    ((document newline-document) last base)
+  (declare (ignore last) (type nonnegative-fixnum base))
   (%candidate document base (%rank 0 1)))
 
 (defmethod evaluate-document
-    (evaluator (document choice-document) last base)
-  (declare (type evaluator evaluator)
-           (type nonnegative-fixnum last base))
+    ((document choice-document) last base)
+  (declare (type nonnegative-fixnum last base))
   (merge-evaluations
-   (evaluate evaluator (choice-document-left document) last base)
-   (evaluate evaluator (choice-document-right document) last base)))
+   (evaluate (choice-document-left document) last base)
+   (evaluate (choice-document-right document) last base)))
 
 (defmethod evaluate-document
-    (evaluator (document nest-document) last base)
-  (declare (type evaluator evaluator)
-           (type nonnegative-fixnum last base))
+    ((document nest-document) last base)
+  (declare (type nonnegative-fixnum last base))
   (let ((amount (nest-document-amount document)))
     (wrap-evaluation
-     evaluator :nest amount
-     (evaluate evaluator (nest-document-child document) last
+     :nest amount
+     (evaluate (nest-document-child document) last
                (the nonnegative-fixnum (+ base amount))))))
 
 (defmethod evaluate-document
-    (evaluator (document align-document) last base)
-  (declare (ignore base) (type evaluator evaluator)
-           (type nonnegative-fixnum last))
+    ((document align-document) last base)
+  (declare (ignore base) (type nonnegative-fixnum last))
   (wrap-evaluation
-   evaluator :align 0
-   (evaluate evaluator (align-document-child document) last last)))
+   :align 0
+   (evaluate (align-document-child document) last last)))
 
 (defmethod evaluate-document
-    (evaluator (document concatenation-document) last base)
-  (declare (type evaluator evaluator)
-           (type nonnegative-fixnum last base))
-  (evaluate-concatenation evaluator document last base))
+    ((document concatenation-document) last base)
+  (declare (type nonnegative-fixnum last base))
+  (evaluate-concatenation document last base))
 
-(defun evaluate (evaluator document last base)
-  (declare (type evaluator evaluator) (type document document)
+(defun evaluate (document last base)
+  (declare (type document document)
            (type nonnegative-fixnum last base))
   (memoized
-   evaluator document last base
+   document last base
    (lambda ()
-     (incf (statistics-evaluations (evaluator-statistics evaluator)))
+     (incf (statistics-evaluations (the statistics *statistics*)))
      (labels ((core ()
-                (note-evaluation
-                 evaluator
-                 (evaluate-document evaluator document last base))))
-       (if (exceeds-computation-limit-p evaluator document last base)
-           (tainted-evaluation evaluator
-                               (lambda () (force-evaluation (core))))
+                (note-evaluation (evaluate-document document last base))))
+       (if (exceeds-computation-limit-p document last base)
+           (tainted-evaluation (lambda () (force-evaluation (core))))
            (core))))))
 
 (defun wrap-frontier (kind amount frontier)
@@ -508,19 +499,16 @@ region. If both sides are tainted, retain the left promise."))
    (candidate-last candidate)
    (candidate-rank candidate)))
 
-(defgeneric wrap-evaluation (evaluator kind amount evaluation))
+(defgeneric wrap-evaluation (kind amount evaluation))
 
-(defmethod wrap-evaluation (evaluator kind amount (evaluation vector))
-  (declare (ignore evaluator))
+(defmethod wrap-evaluation (kind amount (evaluation vector))
   (wrap-frontier kind amount evaluation))
 
-(defmethod wrap-evaluation (evaluator kind amount (evaluation candidate))
-  (declare (ignore evaluator))
+(defmethod wrap-evaluation (kind amount (evaluation candidate))
   (wrap-candidate kind amount evaluation))
 
-(defmethod wrap-evaluation (evaluator kind amount (evaluation function))
+(defmethod wrap-evaluation (kind amount (evaluation function))
   (tainted-evaluation
-   evaluator
    (lambda ()
      (wrap-candidate kind amount (force-evaluation evaluation)))))
 
@@ -530,70 +518,65 @@ region. If both sides are tainted, retain the left promise."))
    (candidate-last right)
    (rank+ (candidate-rank left) (candidate-rank right))))
 
-(defgeneric concatenate-right-evaluation (evaluator left right))
+(defgeneric concatenate-right-evaluation (left right))
 
 (defmethod concatenate-right-evaluation
-    (evaluator left (right vector))
-  (declare (ignore evaluator) (type candidate left) (type (vector t) right))
+    (left (right vector))
+  (declare (type candidate left) (type (vector t) right))
   (let ((result (empty-frontier)))
     (loop for candidate across right
           do (frontier-add result (concatenate-candidates left candidate)))
     (canonicalize-frontier (sort result #'> :key #'candidate-last))))
 
 (defmethod concatenate-right-evaluation
-    (evaluator left (right candidate))
-  (declare (ignore evaluator))
+    (left (right candidate))
   (concatenate-candidates left right))
 
 (defmethod concatenate-right-evaluation
-    (evaluator left (right function))
+    (left (right function))
   (tainted-evaluation
-   evaluator
    (lambda ()
      (concatenate-candidates left (force-evaluation right)))))
 
-(defun concatenate-right (evaluator document left base)
+(defun concatenate-right (document left base)
   (concatenate-right-evaluation
-   evaluator left
-   (evaluate evaluator (concatenation-document-right document)
+   left
+   (evaluate (concatenation-document-right document)
              (candidate-last left) base)))
 
 (defgeneric concatenate-left-evaluation
-    (evaluator document base left))
+    (document base left))
 
 (defmethod concatenate-left-evaluation
-    (evaluator document base (left function))
+    (document base (left function))
   (tainted-evaluation
-   evaluator
    (lambda ()
      (let* ((left-candidate (force-evaluation left))
-            (right (concatenate-right evaluator document left-candidate base)))
+            (right (concatenate-right document left-candidate base)))
        (force-evaluation right)))))
 
 (defmethod concatenate-left-evaluation
-    (evaluator document base (left vector))
-  (declare (type evaluator evaluator)
-           (type concatenation-document document)
+    (document base (left vector))
+  (declare (type concatenation-document document)
            (type nonnegative-fixnum base) (type (vector t) left))
   (let ((result (empty-frontier)))
     (loop for candidate across left
           do (setf result
                    (merge-evaluations
                     result
-                    (concatenate-right evaluator document candidate base))))
+                    (concatenate-right document candidate base))))
     result))
 
 (defmethod concatenate-left-evaluation
-    (evaluator document base (left candidate))
-  (concatenate-right evaluator document left base))
+    (document base (left candidate))
+  (concatenate-right document left base))
 
-(defun evaluate-concatenation (evaluator document last base)
-  (declare (type evaluator evaluator)
-           (type concatenation-document document)
+(defun evaluate-concatenation (document last base)
+  (declare (type concatenation-document document)
            (type nonnegative-fixnum last base))
   (concatenate-left-evaluation
-   evaluator document base
-   (evaluate evaluator (concatenation-document-left document) last base)))
+   document base
+   (evaluate (concatenation-document-left document) last base)))
 
 (defstruct (result (:constructor %result
                        (candidate frontier statistics tainted-p)))
@@ -610,9 +593,11 @@ Expressive and recursive.zig."
   (when (document-consumed-p document)
     (error "PICK cannot reuse an already consumed document"))
   (setf (document-consumed-p document) t)
-  (let ((evaluator (%evaluator cost memoize))
+  (let ((*cost* cost)
+        (*memoize* memoize)
+        (*statistics* (make-statistics))
         (*cost-measure* (or *cost-measure* (cost-measure cost))))
-    (let* ((evaluation (evaluate evaluator document 0 0))
+    (let* ((evaluation (evaluate document 0 0))
            (tainted-p (functionp evaluation))
            (frontier
              (the (vector t)
@@ -620,7 +605,7 @@ Expressive and recursive.zig."
                     (function (vector (force-evaluation evaluation)))
                     (candidate (vector evaluation))
                     (vector (the (vector t) evaluation)))))
-           (statistics (evaluator-statistics evaluator)))
+           (statistics *statistics*))
       (when (zerop (length frontier))
         (error "Document has no layouts"))
       (let ((best (aref frontier 0)))
