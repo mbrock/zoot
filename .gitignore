@@ -1,5 +1,6 @@
 .zig-cache
 zig-out
+_build/
 /rust/target/
 .direnv/
 *.dot
