@@ -1,6 +1,7 @@
-.PHONY: all build test zig-test lisp-test lisp-benchmark lisp-profile profile typst-example
+.PHONY: all build test zig-test lisp-test lisp-benchmark lisp-profile lisp-format profile typst-example
 .NOTPARALLEL:
 
+WIDTH ?= 80
 RUNS ?= 200
 STAT_RUNS ?= 20
 LISP_PROFILE_SAMPLES ?= 1500
@@ -22,6 +23,9 @@ lisp-test:
 
 lisp-benchmark:
 	XDG_CACHE_HOME=/tmp/zoot-asdf-statistics sbcl --script common-lisp/benchmark.lisp $(RUNS)
+
+lisp-format:
+	XDG_CACHE_HOME=/tmp/zoot-asdf-statistics sbcl --script common-lisp/format-file.lisp $(FILE) $(WIDTH)
 
 lisp-profile:
 	XDG_CACHE_HOME=/tmp/zoot-asdf-statistics-$(LISP_PROFILE_STATISTICS) ZOOT_STATISTICS=$(LISP_PROFILE_STATISTICS) sbcl --script common-lisp/profile.lisp $(LISP_PROFILE_SAMPLES) $(LISP_PROFILE_DEPTH)

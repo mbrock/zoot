@@ -2,7 +2,8 @@
   (:use #:cl)
   (:shadow #:concatenate)
   (:export
-   #:text #:+newline+ #:concatenate #:cat #:vcat #:choice #:nest #:align
+   #:text #:verbatim #:+newline+ #:concatenate #:cat #:vcat #:choice
+   #:nest #:align
    #:flatten #:group
    #:make-f1 #:make-f2 #:pick #:render #:format-document
    #:*cost-measure* #:linear-overflow-cost #:squared-overflow-cost
@@ -48,9 +49,22 @@ reference implementation (its PARAM_MEMO_LIMIT is 7, with initial weight 6).")
   (contexts (make-hash-table :test #'eq) :type hash-table :read-only t)
   (child nil :read-only t))
 
+(defstruct (verbatim-document (:constructor %verbatim-document (text)))
+  (text "" :type string :read-only t))
+
 (deftype document ()
   '(or string character cons
-       choice-document nest-document align-document memo-document))
+       choice-document nest-document align-document memo-document
+       verbatim-document))
+
+(defun verbatim (string)
+  "A text block whose newlines are part of its content. Lines after the
+first start at column zero regardless of surrounding indentation, and
+the block cannot be flattened."
+  (check-type string string)
+  (if (find #\Newline string)
+      (%verbatim-document string)
+      string))
 
 (defun memo-weight (document)
   "Structural levels below DOCUMENT until a memo checkpoint. Zero marks a
@@ -126,6 +140,7 @@ document needs no reweighting."
   (etypecase document
     (string document)
     (character " ")
+    (verbatim-document document)
     (cons (cons (flatten (car document)) (flatten (cdr document))))
     (memo-document (%memo-document (flatten (memo-document-child document))))
     (choice-document
@@ -538,6 +553,28 @@ call sites do not re-check child slots on every traversal."
                    (the nonnegative-fixnum (+ last length))
                    (text-overflow (the cost *cost*) last length)
                    0)))
+    (verbatim-document
+     (let ((string (verbatim-document-text document))
+           (cost (the cost *cost*))
+           (overflow 0)
+           (height 0)
+           (column last)
+           (start 0))
+       (declare (type nonnegative-fixnum overflow height column start))
+       (loop
+         (let* ((break (position #\Newline string :start start))
+                (end (or break (length string)))
+                (length (- end start)))
+           (declare (type nonnegative-fixnum end length))
+           (setf overflow
+                 (the nonnegative-fixnum
+                      (+ overflow (text-overflow cost column length))))
+           (when (null break)
+             (return (%candidate document
+                                 (the nonnegative-fixnum (+ column length))
+                                 overflow height)))
+           (incf height)
+           (setf column 0 start (1+ break))))))
     (choice-document
      (merge-evaluations
       (evaluate (choice-document-left document) last base)
@@ -708,6 +745,14 @@ one candidate, as in Pretty Expressive and recursive.zig."
     (string
      (write-string document stream)
      (the nonnegative-fixnum (+ last (length document))))
+    (verbatim-document
+     (let* ((string (verbatim-document-text document))
+            (break (position #\Newline string :from-end t)))
+       (write-string string stream)
+       (the nonnegative-fixnum
+            (if break
+                (- (length string) break 1)
+                (+ last (length string))))))
     (character
      (terpri stream)
      (loop repeat base do (write-char #\Space stream))

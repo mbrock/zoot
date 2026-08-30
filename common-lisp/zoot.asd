@@ -4,6 +4,11 @@
   :serial t
   :components ((:file "zoot")))
 
+(asdf:defsystem "zoot/sexp"
+  :description "A Lisp source pretty-printer built on Zoot"
+  :depends-on ("zoot")
+  :components ((:file "sexp")))
+
 (asdf:defsystem "zoot/tests"
   :depends-on ("zoot")
   :serial t

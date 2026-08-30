@@ -41,6 +41,16 @@
        (result (pick (choice inline multiline) (make-f1 10))))
   (check "foo bar" (render (result-candidate result))))
 
+;;; Verbatim blocks keep their own newlines at column zero, so their
+;;; content survives surrounding indentation.
+
+(let* ((document (cat (text "ab")
+                      (nest 2 (cat +newline+
+                                   (verbatim (format nil "x~%y"))
+                                   (text " z")))))
+       (result (pick document (make-f1 20))))
+  (check (format nil "ab~%  x~%y z") (render (result-candidate result))))
+
 ;;; Memo checkpoints cache per document, so a document can be resolved
 ;;; repeatedly under the cost configuration it was first picked with.
 
