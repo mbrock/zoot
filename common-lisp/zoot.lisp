@@ -403,28 +403,30 @@ whose context lies inside the computation limit."
         (contexts-var (gensym "CONTEXTS"))
         (key-var (gensym "KEY"))
         (value-var (gensym "VALUE"))
-        (present-var (gensym "PRESENT")))
+        (present-var (gensym "PRESENT"))
+        (compute-name (gensym "COMPUTE")))
     `(let* ((,document-var ,document)
             (,last-var ,last)
             (,base-var ,base)
             (,limit-var (cost-limit *cost*)))
-       (if (and (zerop (document-memo-weight ,document-var))
-                (<= ,last-var ,limit-var)
-                (<= ,base-var ,limit-var))
-           (let* ((,contexts-var (document-context-table ,document-var))
-                  (,key-var (memo-context-key
-                             ,last-var ,base-var ,limit-var)))
-             (multiple-value-bind (,value-var ,present-var)
-                 (gethash ,key-var ,contexts-var)
-               (if ,present-var
-                   (progn
-                     (incf (statistics-memo-hits *statistics*))
-                     ,value-var)
-                   (let ((,value-var (progn ,@body)))
-                     (setf (gethash ,key-var ,contexts-var) ,value-var)
-                     (incf (statistics-memo-entries *statistics*))
-                     ,value-var))))
-           (progn ,@body)))))
+       (labels ((,compute-name () ,@body))
+         (if (and (zerop (document-memo-weight ,document-var))
+                  (<= ,last-var ,limit-var)
+                  (<= ,base-var ,limit-var))
+             (let* ((,contexts-var (document-context-table ,document-var))
+                    (,key-var (memo-context-key
+                               ,last-var ,base-var ,limit-var)))
+               (multiple-value-bind (,value-var ,present-var)
+                   (gethash ,key-var ,contexts-var)
+                 (if ,present-var
+                     (progn
+                       (incf (statistics-memo-hits *statistics*))
+                       ,value-var)
+                     (let ((,value-var (,compute-name)))
+                       (setf (gethash ,key-var ,contexts-var) ,value-var)
+                       (incf (statistics-memo-entries *statistics*))
+                       ,value-var))))
+             (,compute-name))))))
 
 (defgeneric exceeds-computation-limit-p (document last base))
 
