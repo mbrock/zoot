@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const log = std.log;
 
 pub const Bank = std.mem.Allocator;
@@ -21,6 +22,7 @@ pub const Loop = struct {
     memoize: bool = true,
     memo_hit_regions: [3]usize = .{ 0, 0, 0 },
     memo_miss_regions: [3]usize = .{ 0, 0, 0 },
+    gc_poll: u8 = 0,
 
     pub fn deinit(this: *@This()) void {
         this.best.deinit(this.heap.bank);
@@ -117,7 +119,10 @@ pub const Loop = struct {
     }
 
     pub fn loop(this: *@This()) !Best {
-        try this.explore();
+        if (build_options.profile_outline)
+            try @call(.never_inline, explore, .{this})
+        else
+            try this.explore();
         try this.fuss();
 
         this.stat.size = this.best.items.len;
@@ -198,23 +203,18 @@ pub const Loop = struct {
             if (!node_count.found_existing) node_count.value_ptr.* = 0;
             node_count.value_ptr.* += 1;
 
-            if (deck.item == Deck.none.item) {
+            if (deck.isEmpty()) {
                 empty += 1;
                 frontier_buckets[0] += 1;
                 continue;
             }
-            if (deck.cope == 1) {
+            if (deck.isCope()) {
                 thunks += 1;
                 continue;
             }
             try frontier_roots.put(deck, {});
 
-            var len: usize = 0;
-            var curr = deck;
-            while (curr.item != Deck.none.item) {
-                len += 1;
-                curr = this.heap.new().duel.list.items[curr.item].next;
-            }
+            const len = deck.duelCount();
             frontier_cells += len;
             frontier_max = @max(frontier_max, len);
             frontier_buckets[distributionBucket(len)] += 1;
@@ -288,16 +288,14 @@ pub const Loop = struct {
             switch (this.exec.tick) {
                 .give => |deck| {
                     if (this.exec.then.kind == .none) {
-                        if (deck.cope == 1) {
+                        if (deck.isCope()) {
                             try this.forceCope(deck);
                             continue;
                         }
 
-                        var curr = deck;
-                        while (curr.item != 0x3FFFFFFF) {
-                            const duel = this.heap.new().duel.list.items[curr.item];
+                        for (0..deck.duelCount()) |i| {
+                            const duel = deck.candidate(i, this.heap);
                             try this.meld(.{ .gist = duel.gist, .node = duel.node });
-                            curr = duel.next;
                         }
                         break;
                     }
@@ -305,20 +303,21 @@ pub const Loop = struct {
                 else => {},
             }
 
-            try this.step();
-            try this.fuss();
+            if (build_options.profile_outline)
+                try @call(.never_inline, step, .{this})
+            else
+                try this.step();
+
+            this.gc_poll +%= 1;
+            if (this.gc_poll == 0) try this.fuss();
         }
     }
 
     /// Frontier manipulation helpers
     /// Create a singleton frontier from one idea
     fn singleton(this: *@This(), node: Node, gist: Gist) !Deck {
-        const idx = try this.heap.new().duel.push(this.heap.bank, .{
-            .node = node,
-            .gist = gist,
-            .next = Deck.none,
-        });
-        return .{ .flip = this.heap.tick, .cope = 0, .item = @intCast(idx) };
+        const idx = try this.heap.new().duel.push(this.heap.bank, .{ .node = node, .gist = gist });
+        return Deck.one(this.heap.tick, @intCast(idx));
     }
 
     fn delay(this: *@This(), node: Node, crux: Crux) !Deck {
@@ -329,12 +328,12 @@ pub const Loop = struct {
             .crux = forced,
         });
         this.stat.cope_deferred += 1;
-        return .{ .flip = this.heap.tick, .cope = 1, .item = @intCast(idx) };
+        return Deck.thunk(this.heap.tick, @intCast(idx));
     }
 
     fn resumeCope(this: *@This(), deck: Deck) void {
-        std.debug.assert(deck.cope == 1);
-        const cope = this.heap.new().cope.list.items[deck.item];
+        std.debug.assert(deck.isCope());
+        const cope = this.heap.new().cope.list.items[deck.copeItem()];
         this.stat.cope_forced += 1;
         this.exec.node = cope.node;
         this.exec.tick = .{ .eval = cope.crux };
@@ -419,53 +418,53 @@ pub const Loop = struct {
         // - Prefer Duel (frontier) over Cope (thunk)
         // - If both Cope, pick either one
 
-        if (a.item == 0x3FFFFFFF) return b;
-        if (b.item == 0x3FFFFFFF) return a;
+        if (a.isEmpty()) return b;
+        if (b.isEmpty()) return a;
 
         // If b is Cope, prefer a (might be Duel or Cope)
-        if (b.cope == 1) return a;
+        if (b.isCope()) return a;
         // If a is Cope (and b is Duel), prefer b
-        if (a.cope == 1) return b;
+        if (a.isCope()) return b;
 
         // Both are Duel frontiers, merge them
 
         var result = Deck.none;
-        var a_curr = a;
-        var b_curr = b;
+        var a_pos: usize = 0;
+        var b_pos: usize = 0;
 
-        while (a_curr.item != 0x3FFFFFFF or b_curr.item != 0x3FFFFFFF) {
-            if (a_curr.item == 0x3FFFFFFF) {
+        while (a_pos < a.duelCount() or b_pos < b.duelCount()) {
+            if (a_pos == a.duelCount()) {
                 // Only b left
-                const b_duel = this.heap.new().duel.list.items[b_curr.item];
+                const b_duel = b.candidate(b_pos, this.heap);
                 result = try this.cons_to_deck_raw(result, b_duel.node, b_duel.gist);
-                b_curr = b_duel.next;
+                b_pos += 1;
                 continue;
             }
-            if (b_curr.item == 0x3FFFFFFF) {
+            if (b_pos == b.duelCount()) {
                 // Only a left
-                const a_duel = this.heap.new().duel.list.items[a_curr.item];
+                const a_duel = a.candidate(a_pos, this.heap);
                 result = try this.cons_to_deck_raw(result, a_duel.node, a_duel.gist);
-                a_curr = a_duel.next;
+                a_pos += 1;
                 continue;
             }
 
-            const a_duel = this.heap.new().duel.list.items[a_curr.item];
-            const b_duel = this.heap.new().duel.list.items[b_curr.item];
+            const a_duel = a.candidate(a_pos, this.heap);
+            const b_duel = b.candidate(b_pos, this.heap);
 
             if (wins(this.cost, a_duel.gist, b_duel.gist)) {
                 // a dominates b, skip b
-                b_curr = b_duel.next;
+                b_pos += 1;
             } else if (wins(this.cost, b_duel.gist, a_duel.gist)) {
                 // b dominates a, skip a
-                a_curr = a_duel.next;
+                a_pos += 1;
             } else if (a_duel.gist.last > b_duel.gist.last) {
                 // Neither dominates, emit a (higher last)
                 result = try this.cons_to_deck_raw(result, a_duel.node, a_duel.gist);
-                a_curr = a_duel.next;
+                a_pos += 1;
             } else {
                 // Neither dominates, emit b (higher or equal last)
                 result = try this.cons_to_deck_raw(result, b_duel.node, b_duel.gist);
-                b_curr = b_duel.next;
+                b_pos += 1;
             }
         }
 
@@ -475,40 +474,33 @@ pub const Loop = struct {
 
     /// Prepend an idea without a dominance check.
     fn cons_to_deck_raw(this: *@This(), deck: Deck, node: Node, gist: Gist) !Deck {
+        if (deck.isCope() or deck.duelCount() >= 2)
+            @panic("Pareto frontier exceeds the two-Duel Deck capacity");
+        if (deck.isEmpty()) return this.singleton(node, gist);
         const idx = try this.heap.new().duel.push(this.heap.bank, .{
             .node = node,
             .gist = gist,
-            .next = deck,
         });
-        return .{ .flip = this.heap.tick, .cope = 0, .item = @intCast(idx) };
+        return Deck.two(this.heap.tick, @intCast(idx), deck.duelItem(0));
     }
 
-    fn reverse_deck(this: *@This(), deck: Deck) !Deck {
-        std.debug.assert(deck.cope == 0);
-        var result = Deck.none;
-        var curr = deck;
-        while (curr.item != 0x3FFFFFFF) {
-            const duel = this.heap.new().duel.list.items[curr.item];
-            result = try this.cons_to_deck_raw(result, duel.node, duel.gist);
-            curr = duel.next;
-        }
-        return result;
+    fn reverse_deck(_: *@This(), deck: Deck) !Deck {
+        std.debug.assert(!deck.isCope());
+        return deck.reversed();
     }
 
     /// Preserve a choice node's local indentation modifier after eliminating
     /// the choice itself from every resolved layout.
     fn wrap_deck(this: *@This(), deck: Deck, frob: Frob) !Deck {
-        if (deck.item == 0x3FFFFFFF or (frob.warp == 0 and frob.nest == 0))
+        if (deck.isEmpty() or (frob.warp == 0 and frob.nest == 0))
             return deck;
 
-        std.debug.assert(deck.cope == 0);
+        std.debug.assert(!deck.isCope());
         var reversed = Deck.none;
-        var curr = deck;
-        while (curr.item != 0x3FFFFFFF) {
-            const duel = this.heap.new().duel.list.items[curr.item];
+        for (0..deck.duelCount()) |i| {
+            const duel = deck.candidate(i, this.heap);
             const node = try this.tree.cons(frob, duel.node, Node.halt);
             reversed = try this.cons_to_deck_raw(reversed, node, duel.gist);
-            curr = duel.next;
         }
         return try this.reverse_deck(reversed);
     }
@@ -538,7 +530,7 @@ pub const Loop = struct {
             depth += 1;
             const loaded = ktx.load(this.heap);
             ktx = switch (loaded) {
-                .none => unreachable,
+                .empty => unreachable,
                 .head => |k| k.then,
                 .tail => |k| k.then,
                 .fork => |k| k.then,
@@ -557,6 +549,7 @@ pub const Loop = struct {
                 var crux = eval;
 
                 if (!crux.icky and this.terminalExceedsLimit(this.exec.node, crux)) {
+                    @branchHint(.unlikely);
                     this.exec.tick = .{ .give = try this.delay(this.exec.node, crux) };
                     return;
                 }
@@ -594,12 +587,14 @@ pub const Loop = struct {
                         const item = crux.item(this.exec.node);
 
                         if (hcat.head == Node.memo_mark) {
+                            @branchHint(.unlikely);
                             const memoize_node = this.memoize and
                                 !crux.icky and
                                 crux.last <= this.limit and
                                 crux.base <= this.limit;
                             if (memoize_node) {
                                 if (this.memo.get(item)) |deck| {
+                                    @branchHint(.unlikely);
                                     this.stat.memo_hits += 1;
                                     this.stat.memo_hits_hcat += 1;
                                     if (this.trace_memo)
@@ -685,7 +680,8 @@ pub const Loop = struct {
                     .head => |cont| {
                         const left_deck = this.exec.tick.give;
 
-                        if (left_deck.cope == 1 and cont.forced) {
+                        if (left_deck.isCope() and cont.forced) {
+                            @branchHint(.unlikely);
                             try this.forceCope(left_deck);
                             return;
                         }
@@ -695,6 +691,7 @@ pub const Loop = struct {
 
                         if (is_fork) {
                             if (cont.forced) {
+                                @branchHint(.unlikely);
                                 const oper = Node.view(Oper, cont.item.node);
                                 const result = try this.wrap_deck(left_deck, oper.frob);
                                 this.exec.tick = .{ .give = result };
@@ -731,7 +728,8 @@ pub const Loop = struct {
                             const head_deck = left_deck;
                             const oper = Node.view(Oper, cont.item.node);
 
-                            if (head_deck.cope == 1) {
+                            if (head_deck.isCope()) {
+                                @branchHint(.unlikely);
                                 this.exec.tick = .{ .give = try this.delay(
                                     cont.item.node,
                                     parentCrux(cont.item, cont.origin_base),
@@ -741,7 +739,7 @@ pub const Loop = struct {
                             }
 
                             // If head has no valid layouts, the whole hcat has none
-                            if (head_deck.item == 0x3FFFFFFF) {
+                            if (head_deck.isEmpty()) {
                                 this.exec.tick = .{ .give = Deck.none };
                                 this.exec.then = cont.then;
                                 return;
@@ -765,14 +763,14 @@ pub const Loop = struct {
                             }, this.heap);
 
                             // Evaluate tail starting at first head's ending position
-                            const first_duel = this.heap.new().duel.list.items[head_deck.item];
+                            const first_duel = head_deck.candidate(0, this.heap);
 
                             this.exec.tick = .{
                                 .eval = .{
                                     .base = cont.base,
                                     .last = first_duel.gist.last,
-                                    .rows = first_duel.gist.rows,
-                                    .icky = cont.forced and first_duel.gist.rows == 0,
+                                    .rows = first_duel.gist.rows(),
+                                    .icky = cont.forced and first_duel.gist.rows() == 0,
                                 },
                             };
 
@@ -784,26 +782,27 @@ pub const Loop = struct {
                         // Combine this (head, tail) pair and continue iteration
                         const tail_deck = this.exec.tick.give;
 
-                        if (tail_deck.cope == 1 and cont.forced) {
+                        if (tail_deck.isCope() and cont.forced) {
+                            @branchHint(.unlikely);
                             try this.forceCope(tail_deck);
                             return;
-                        } else if (tail_deck.cope == 1) {
+                        } else if (tail_deck.isCope()) {
+                            @branchHint(.unlikely);
                             const delayed = try this.delay(
                                 cont.item.node,
                                 parentCrux(cont.item, cont.origin_base),
                             );
                             const merged = try this.merge_decks(cont.result_deck, delayed);
                             this.exec.then.load(this.heap).iter.result_deck = merged;
-                        } else if (tail_deck.item != 0x3FFFFFFF) {
+                        } else if (!tail_deck.isEmpty()) {
                             // If tail has no layouts, skip this head.
                             // Get current head Duel
-                            const head_duel = this.heap.new().duel.list.items[cont.current_head.item];
+                            const head_duel = cont.current_head.candidate(0, this.heap);
                             // Do "running best" scan through tail (like OCaml)
                             var partial_reversed = Deck.none;
                             var current_best: ?struct { gist: Gist, node: Node } = null;
-                            var tail_curr = tail_deck;
-                            while (tail_curr.item != 0x3FFFFFFF) {
-                                const tail_duel = this.heap.new().duel.list.items[tail_curr.item];
+                            for (0..tail_deck.duelCount()) |i| {
+                                const tail_duel = tail_deck.candidate(i, this.heap);
                                 const gist = combineGist(head_duel.gist, tail_duel.gist, this.cost);
                                 const node = try this.tree.cons(cont.frob, head_duel.node, tail_duel.node);
 
@@ -821,8 +820,6 @@ pub const Loop = struct {
                                 } else {
                                     current_best = .{ .gist = gist, .node = node };
                                 }
-
-                                tail_curr = tail_duel.next;
                             }
 
                             // Add final current_best
@@ -841,10 +838,9 @@ pub const Loop = struct {
                         }
 
                         // Move to next head
-                        const head_duel = this.heap.new().duel.list.items[cont.current_head.item];
-                        const next_head = head_duel.next;
+                        const next_head = cont.current_head.dropFirst();
 
-                        if (next_head.item == 0x3FFFFFFF) {
+                        if (next_head.isEmpty()) {
                             // No more heads - iteration complete
                             const result = this.exec.then.load(this.heap).iter.result_deck;
                             this.exec.tick = .{ .give = result };
@@ -855,14 +851,14 @@ pub const Loop = struct {
                             this.exec.then.load(this.heap).iter.current_head = next_head;
                             this.exec.node = cont.tail_node;
 
-                            const next_head_duel = this.heap.new().duel.list.items[next_head.item];
+                            const next_head_duel = next_head.candidate(0, this.heap);
 
                             this.exec.tick = .{
                                 .eval = .{
                                     .base = cont.base,
                                     .last = next_head_duel.gist.last,
-                                    .rows = next_head_duel.gist.rows,
-                                    .icky = cont.forced and next_head_duel.gist.rows == 0,
+                                    .rows = next_head_duel.gist.rows(),
+                                    .icky = cont.forced and next_head_duel.gist.rows() == 0,
                                 },
                             };
 
@@ -871,12 +867,13 @@ pub const Loop = struct {
                     },
                     .tail => |cont| {
                         const forced = this.exec.tick.give;
-                        if (forced.cope == 1) {
+                        if (forced.isCope()) {
+                            @branchHint(.unlikely);
                             this.resumeCope(forced);
                             return;
                         }
-                        std.debug.assert(forced.item != Deck.none.item);
-                        const chosen = this.heap.new().duel.list.items[forced.item];
+                        std.debug.assert(!forced.isEmpty());
+                        const chosen = forced.candidate(0, this.heap);
                         this.exec.tick = .{ .give = try this.singleton(chosen.node, chosen.gist) };
                         this.exec.then = cont.then;
                         return;
@@ -891,7 +888,7 @@ pub const Loop = struct {
                         // Merge the two frontiers
                         const merged = try this.merge_decks(left_deck, right_deck);
                         const oper = Node.view(Oper, cont.item.node);
-                        const result = if (merged.cope == 1)
+                        const result = if (merged.isCope())
                             try this.delay(
                                 cont.item.node,
                                 parentCrux(cont.item, cont.origin_base),
@@ -909,12 +906,12 @@ pub const Loop = struct {
                     },
                     .memo => |cont| {
                         const child = this.exec.tick.give;
-                        if (child.cope == 1 and cont.forced) {
+                        if (child.isCope() and cont.forced) {
                             try this.forceCope(child);
                             return;
                         }
 
-                        const result = if (child.cope == 1)
+                        const result = if (child.isCope())
                             try this.delay(
                                 cont.item.node,
                                 parentCrux(cont.item, cont.origin_base),
@@ -991,7 +988,7 @@ pub const Loop = struct {
         }
         std.debug.print(
             "{s} gist(last={d}, rows={d}, overflow={d}) actual_max_line={d}\n",
-            .{ label, gist.last, gist.rows, gist.rank.o, max_line },
+            .{ label, gist.last, gist.rows(), gist.rank.o, max_line },
         );
         std.debug.print("{s} longest line: {s}\n", .{ label, longest_slice });
         std.debug.print("{s}{s}", .{ label, rendered });
@@ -1000,7 +997,6 @@ pub const Loop = struct {
     fn combineGist(head: Gist, tail: Gist, cost: Cost) Gist {
         return .{
             .last = tail.last,
-            .rows = head.rows + tail.rows,
             .rank = cost.plus(head.rank, tail.rank),
         };
     }
@@ -1064,8 +1060,11 @@ pub const Cope = struct {
 
 pub const Gist = packed struct {
     last: u16 = 0,
-    rows: u32 = 0,
     rank: Rank = .{},
+
+    pub fn rows(gist: Gist) u32 {
+        return gist.rank.h;
+    }
 };
 
 pub const Exec = struct {
@@ -1102,7 +1101,33 @@ pub const Item = packed struct {
     }
 };
 
-pub const Memo = std.AutoHashMap(Item, Deck);
+fn mixHash(word: u64) u64 {
+    const mixed = word *% 0x9e3779b97f4a7c15;
+    return mixed ^ (mixed >> 29);
+}
+
+const ItemHashContext = struct {
+    pub fn hash(_: @This(), item: Item) u64 {
+        return mixHash(@bitCast(item));
+    }
+
+    pub fn eql(_: @This(), a: Item, b: Item) bool {
+        return a == b;
+    }
+};
+
+const NodeHashContext = struct {
+    pub fn hash(_: @This(), node: Node) u64 {
+        return mixHash(node.repr());
+    }
+
+    pub fn eql(_: @This(), a: Node, b: Node) bool {
+        return a == b;
+    }
+};
+
+pub const Memo = std.HashMap(Item, Deck, ItemHashContext, 80);
+const FlatMemo = std.HashMap(Node, Node, NodeHashContext, 80);
 
 pub const Kont = packed struct {
     pub const Kind = enum(u3) { none, head, tail, fork, iter, memo };
@@ -1196,6 +1221,7 @@ pub const Ktx3 = struct {
     forced: bool,
     item: Item,
     then: Kont,
+    _pad: u32 = 0,
 
     pub fn make(k3: Ktx3, heap: *Heap) !Kont {
         const idx = try heap.new().ktx3.push(heap.bank, k3);
@@ -1425,12 +1451,10 @@ pub const Span = packed struct {
 
     pub fn toGist(self: Span, crux: Crux, cost: Cost, tree: *const Tree) Gist {
         var head = crux.last;
-        var rows: u32 = 0;
         var rank: Rank = .{};
 
         if (self.char != 0 and self.side == .lchr) {
             if (self.char == '\n') {
-                rows +|= 1;
                 head = crux.base;
                 rank.bump(cost.line(), cost);
             } else {
@@ -1449,7 +1473,6 @@ pub const Span = packed struct {
 
         if (self.char != 0 and self.side == .rchr) {
             if (self.char == '\n') {
-                rows +|= 1;
                 rank.bump(cost.line(), cost);
                 head = crux.base;
             } else {
@@ -1460,7 +1483,6 @@ pub const Span = packed struct {
 
         return .{
             .last = head,
-            .rows = rows,
             .rank = rank,
         };
     }
@@ -1476,13 +1498,11 @@ pub const Quad = packed struct {
 
     pub fn toGist(self: Quad, crux: Crux, cost: Cost) Gist {
         var head = crux.last;
-        var rows: u32 = 0;
         var rank: Rank = .{};
         const chars = [_]u7{ self.ch0, self.ch1, self.ch2, self.ch3 };
         for (chars) |c| {
             if (c == 0) break;
             if (c == '\n') {
-                rows +|= 1;
                 head = crux.base;
                 rank.bump(cost.line(), cost);
             } else {
@@ -1492,7 +1512,6 @@ pub const Quad = packed struct {
         }
         return .{
             .last = head,
-            .rows = rows,
             .rank = rank,
         };
     }
@@ -1532,7 +1551,6 @@ pub const Trip = packed struct {
 
     pub fn toGist(self: Trip, crux: Crux, cost: Cost) Gist {
         var head = crux.last;
-        var rows: u32 = 0;
         var rank: Rank = .{};
 
         const glyph = self.slice();
@@ -1543,7 +1561,6 @@ pub const Trip = packed struct {
             for (0..repeats) |_| {
                 for (glyph[0..glyph_len]) |char| {
                     if (char == '\n') {
-                        rows +|= 1;
                         head = crux.base;
                         rank.bump(cost.line(), cost);
                     } else {
@@ -1556,7 +1573,6 @@ pub const Trip = packed struct {
 
         return .{
             .last = head,
-            .rows = rows,
             .rank = rank,
         };
     }
@@ -1574,12 +1590,10 @@ pub const Rune = packed struct {
 
     pub fn toGist(self: Rune, crux: Crux, cost: Cost) Gist {
         var last = crux.last;
-        var rows: u32 = 0;
         var rank: Rank = .{};
 
         if (self.reps != 0) {
             if (self.code == '\n') {
-                rows = self.reps;
                 last = crux.base;
                 for (0..self.reps) |_| {
                     const line_cost = cost.line();
@@ -1598,7 +1612,6 @@ pub const Rune = packed struct {
 
         return .{
             .last = last,
-            .rows = rows,
             .rank = rank,
         };
     }
@@ -1629,18 +1642,14 @@ pub const Tree = struct {
     bank: Bank,
     heap: Heap,
     blob: std.ArrayList(u8),
-    flatmemo: std.AutoHashMap(Node, Node),
-    consmemo: std.AutoHashMap(Pair, u22),
-    hcatmemo: std.AutoHashMap(Pair, u22),
+    flatmemo: FlatMemo,
 
-    pub fn init(bank: Bank) Tree {
+    pub fn init(bank: Bank) !Tree {
         return .{
             .bank = bank,
-            .heap = Heap.init(bank),
+            .heap = try Heap.init(bank),
             .blob = .empty,
-            .flatmemo = std.AutoHashMap(Node, Node).init(bank),
-            .consmemo = std.AutoHashMap(Pair, u22).init(bank),
-            .hcatmemo = std.AutoHashMap(Pair, u22).init(bank),
+            .flatmemo = FlatMemo.init(bank),
         };
     }
 
@@ -1648,26 +1657,6 @@ pub const Tree = struct {
         tree.heap.deinit();
         tree.blob.deinit(tree.bank);
         tree.flatmemo.deinit();
-        tree.consmemo.deinit();
-        tree.hcatmemo.deinit();
-    }
-
-    pub fn hashcons(tree: *Tree, frob: Frob, head: Node, tail: Node) !Node {
-        const pair = Pair{ .head = head, .tail = tail };
-
-        if (tree.consmemo.get(pair)) |idx| {
-            return Node.fromOper(.cons, frob, tree.heap.tick, @intCast(idx));
-        }
-
-        const idx = tree.heap.new().cons.items.len;
-        if (idx > std.math.maxInt(u22))
-            return error.OutOfConses;
-
-        const node = Node.fromOper(.cons, frob, tree.heap.tick, @intCast(idx));
-
-        try tree.heap.new().cons.append(tree.bank, pair);
-        try tree.consmemo.put(pair, @intCast(idx));
-        return node;
     }
 
     pub fn pick(tree: *Tree, bank: Bank, cost: Cost, node: Node) !Best {
@@ -1812,19 +1801,23 @@ pub const Tree = struct {
     }
 
     pub fn flat(tree: *Tree, doc: Node) !Node {
+        switch (doc.look()) {
+            .span => |span| {
+                if (span.char != '\n') return doc;
+                return Node.fromSpan(span.side, ' ', span.text);
+            },
+            .quad, .trip => return doc,
+            .rune => |rune| {
+                if (rune.code != '\n' or rune.reps == 0) return doc;
+                return Node.fromRune(rune.reps, ' ');
+            },
+            .hcat, .fork => {},
+            .cons => unreachable,
+        }
+
         if (tree.flatmemo.get(doc)) |entry| return entry;
 
         const result = switch (doc.look()) {
-            .span => |span| blk: {
-                if (span.char != '\n') break :blk doc;
-                break :blk Node.fromSpan(span.side, ' ', span.text);
-            },
-            .quad => doc,
-            .trip => doc,
-            .rune => |rune| blk: {
-                if (rune.code != '\n' or rune.reps == 0) break :blk doc;
-                break :blk Node.fromRune(rune.reps, ' ');
-            },
             .hcat => |oper| blk: {
                 const pair = tree.heap.new().hcat.list.items[oper.item];
                 const tail = try tree.flat(pair.tail);
@@ -1860,7 +1853,7 @@ pub const Tree = struct {
 
                 break :blk try tree.makePair(.fork, oper.frob, head, tail);
             },
-            .cons => unreachable,
+            else => unreachable,
         };
 
         try tree.flatmemo.put(doc, result);
@@ -1870,7 +1863,6 @@ pub const Tree = struct {
     fn combineGist(head: Gist, tail: Gist, cost: Cost) Gist {
         return .{
             .last = tail.last,
-            .rows = head.rows + tail.rows,
             .rank = cost.plus(head.rank, tail.rank),
         };
     }
@@ -1947,13 +1939,13 @@ pub const Tree = struct {
                     calcMemoWeight(tree.memoWeight(pair.tail)),
                 );
             },
-            .fork => |oper| blk: {
-                const pair = tree.heap.new().fork.list.items[oper.item];
-                break :blk @min(
-                    calcMemoWeight(tree.memoWeight(pair.head)),
-                    calcMemoWeight(tree.memoWeight(pair.tail)),
-                );
-            },
+            // .fork => |oper| blk: {
+            //     const pair = tree.heap.new().fork.list.items[oper.item];
+            //     break :blk @min(
+            //         calcMemoWeight(tree.memoWeight(pair.head)),
+            //         calcMemoWeight(tree.memoWeight(pair.tail)),
+            //     );
+            // },
             else => initial_memo_weight,
         };
     }
@@ -1976,47 +1968,21 @@ pub const Tree = struct {
 
     fn makePair(tree: *Tree, tag: Tag, frob: Frob, lhs: Node, rhs: Node) !Node {
         std.debug.assert(tag == .hcat or tag == .fork);
+        const node = switch (tag) {
+            .hcat => try tree.rawHcat(frob, lhs, rhs),
+            .fork => return try tree.rawFork(frob, lhs, rhs),
+            else => unreachable,
+        };
         const weight = @min(
             calcMemoWeight(tree.memoWeight(lhs)),
             calcMemoWeight(tree.memoWeight(rhs)),
         );
-        const node = switch (tag) {
-            .hcat => try tree.rawHcat(frob, lhs, rhs),
-            .fork => try tree.rawFork(frob, lhs, rhs),
-            else => unreachable,
-        };
         if (weight != 0) return node;
         return tree.rawHcat(.{}, Node.memo_mark, node);
     }
 
     pub fn hcat(tree: *Tree, frob: Frob, lhs: Node, rhs: Node) !Node {
         return tree.makePair(.hcat, frob, lhs, rhs);
-    }
-
-    pub fn hashcat(tree: *Tree, frob: Frob, head: Node, tail: Node) !Node {
-        const pair = Pair{ .head = head, .tail = tail };
-
-        const weight = @min(
-            calcMemoWeight(tree.memoWeight(head)),
-            calcMemoWeight(tree.memoWeight(tail)),
-        );
-
-        if (tree.hcatmemo.get(pair)) |idx| {
-            const node = Node.fromOper(.hcat, frob, tree.heap.tick, @intCast(idx));
-            if (weight != 0) return node;
-            return tree.hashcat(.{}, Node.memo_mark, node);
-        }
-
-        const idx = tree.heap.new().hcat.list.items.len;
-        if (idx > std.math.maxInt(u22))
-            return error.OutOfConses;
-
-        const node = Node.fromOper(.hcat, frob, tree.heap.tick, @intCast(idx));
-
-        try tree.heap.new().hcat.list.append(tree.bank, pair);
-        try tree.hcatmemo.put(pair, @intCast(idx));
-        if (weight != 0) return node;
-        return tree.hashcat(.{}, Node.memo_mark, node);
     }
 
     pub fn cons(tree: *Tree, frob: Frob, lhs: Node, rhs: Node) !Node {
@@ -2269,43 +2235,108 @@ pub const Pair = struct {
     }
 };
 
-/// Deck: packed handle to a frontier (linked list of Duels)
+/// A frontier containing at most two Duels, or a deferred Cope thunk.
 pub const Deck = packed struct {
     flip: u1,
-    cope: u1, // 0 = Duel frontier, 1 = Cope thunk
+    cope: u1,
+    len: u2,
     item: u30,
+    item2: u30,
 
-    pub const none: Deck = .{ .flip = 0, .cope = 0, .item = 0x3FFFFFFF };
+    pub const none: Deck = .{ .flip = 0, .cope = 0, .len = 0, .item = 0, .item2 = 0 };
+
+    pub fn one(flip: u1, item: u30) Deck {
+        return .{ .flip = flip, .cope = 0, .len = 1, .item = item, .item2 = 0 };
+    }
+
+    pub fn two(flip: u1, first: u30, second: u30) Deck {
+        return .{ .flip = flip, .cope = 0, .len = 2, .item = first, .item2 = second };
+    }
+
+    pub fn thunk(flip: u1, item: u30) Deck {
+        return .{ .flip = flip, .cope = 1, .len = 0, .item = item, .item2 = 0 };
+    }
+
+    pub fn isEmpty(deck: Deck) bool {
+        return deck.cope == 0 and deck.len == 0;
+    }
+
+    pub fn isCope(deck: Deck) bool {
+        return deck.cope == 1;
+    }
+
+    pub fn copeItem(deck: Deck) u30 {
+        std.debug.assert(deck.isCope());
+        return deck.item;
+    }
+
+    pub fn duelCount(deck: Deck) usize {
+        std.debug.assert(!deck.isCope());
+        return deck.len;
+    }
+
+    pub fn duelItem(deck: Deck, index: usize) u30 {
+        std.debug.assert(!deck.isCope() and index < deck.len);
+        return if (index == 0) deck.item else deck.item2;
+    }
+
+    pub fn candidate(deck: Deck, index: usize, heap: *Heap) Duel {
+        return heap.new().duel.list.items[deck.duelItem(index)];
+    }
+
+    pub fn dropFirst(deck: Deck) Deck {
+        std.debug.assert(!deck.isCope() and deck.len != 0);
+        return if (deck.len == 1) none else one(deck.flip, deck.item2);
+    }
+
+    pub fn reversed(deck: Deck) Deck {
+        return if (deck.len == 2) two(deck.flip, deck.item2, deck.item) else deck;
+    }
 
     pub fn calm(deck: Deck, flap: u1) bool {
-        return deck.item == 0x3FFFFFFF or deck.flip == flap;
+        return deck.isEmpty() or deck.flip == flap;
     }
 
     pub fn warp(deck: Deck, heap: *Heap) !Deck {
         if (deck.calm(heap.tick)) return deck;
-        if (deck.cope == 1) {
+        if (deck.isCope()) {
             const next = try heap.copy(Cope, &heap.old().cope, &heap.new().cope, deck.item);
-            return .{ .flip = heap.tick, .cope = 1, .item = @intCast(next) };
-        } else {
-            const next = try heap.copy(Duel, &heap.old().duel, &heap.new().duel, deck.item);
-            return .{ .flip = heap.tick, .cope = 0, .item = @intCast(next) };
+            return thunk(heap.tick, @intCast(next));
         }
+        const first = try heap.copy(Duel, &heap.old().duel, &heap.new().duel, deck.item);
+        if (deck.len == 1) return one(heap.tick, @intCast(first));
+        const second = try heap.copy(Duel, &heap.old().duel, &heap.new().duel, deck.item2);
+        return two(heap.tick, @intCast(first), @intCast(second));
     }
 };
 
-/// Duel: a cell in the pareto frontier linked list
+/// One concrete candidate in a Pareto frontier.
 pub const Duel = struct {
     node: Node, // The resolved (forkless) layout node
     gist: Gist, // The layout metrics (last column, rows, rank)
-    next: Deck, // Next duel in the frontier, or Deck.none
+    _pad: u32 = 0, // Second 32-bit field used by GC forwarding
 
-    pub const halt: Duel = .{ .node = .halt, .gist = .{}, .next = Deck.none };
+    pub const halt: Duel = .{ .node = .halt, .gist = .{} };
 
     pub fn drag(duel: *Duel, heap: *Heap) !void {
         try heap.move(&duel.node);
-        try heap.move(&duel.next);
     }
 };
+
+test "Deck stores up to two Duel indices" {
+    try std.testing.expectEqual(8, @sizeOf(Deck));
+    try std.testing.expect(Deck.none.isEmpty());
+
+    const one = Deck.one(1, 17);
+    try std.testing.expectEqual(1, one.duelCount());
+    try std.testing.expectEqual(17, one.duelItem(0));
+
+    const two = Deck.two(1, 17, 23);
+    try std.testing.expectEqual(2, two.duelCount());
+    try std.testing.expectEqual(17, two.duelItem(0));
+    try std.testing.expectEqual(23, two.duelItem(1));
+    try std.testing.expectEqual(Deck.one(1, 23), two.dropFirst());
+}
 
 const Hack = struct {
     mark: [:0]const u8,
@@ -2410,6 +2441,19 @@ pub const Half = struct {
     duel: Rack(Duel) = .empty,
     cope: Rack(Cope) = .empty,
 
+    pub fn init(this: *@This(), bank: Bank) !void {
+        try this.hcat.list.ensureTotalCapacity(bank, 4096);
+        try this.fork.list.ensureTotalCapacity(bank, 4096);
+        try this.cons.list.ensureTotalCapacity(bank, 4096);
+        try this.ktx1.list.ensureTotalCapacity(bank, 4096);
+        try this.ktx2.list.ensureTotalCapacity(bank, 4096);
+        try this.ktx3.list.ensureTotalCapacity(bank, 4096);
+        try this.ktx4.list.ensureTotalCapacity(bank, 4096);
+        try this.ktx5.list.ensureTotalCapacity(bank, 4096);
+        try this.duel.list.ensureTotalCapacity(bank, 4096);
+        try this.cope.list.ensureTotalCapacity(bank, 4096);
+    }
+
     pub fn deinit(this: *@This(), bank: Bank) void {
         this.hcat.deinit(bank);
         this.fork.deinit(bank);
@@ -2493,8 +2537,11 @@ pub const Heap = struct {
     tick: u1 = 0,
     bank: Bank,
 
-    pub fn init(bank: Bank) Heap {
-        return .{ .heap = .{ .{}, .{} }, .tick = 0, .bank = bank };
+    pub fn init(bank: Bank) !Heap {
+        var me = Heap{ .heap = .{ .{}, .{} }, .tick = 0, .bank = bank };
+        try me.heap[0].init(bank);
+        try me.heap[1].init(bank);
+        return me;
     }
 
     pub fn deinit(heap: *Heap) void {
@@ -2757,7 +2804,8 @@ fn expectEmitString(tree: *Tree, text: []const u8, node: Node) !void {
 }
 
 test "show tiny" {
-    var tree = Tree.init(std.testing.allocator);
+    var tree = try Tree.init(std.testing.allocator);
+    defer tree.deinit();
 
     try expectEmitString(&tree, "ABCD", try tree.text("ABCD"));
     try expectEmitString(&tree, "ABC", try tree.text("ABC"));
@@ -2767,14 +2815,14 @@ test "show tiny" {
 }
 
 test "show text" {
-    var tree = Tree.init(std.testing.allocator);
+    var tree = try Tree.init(std.testing.allocator);
     defer tree.deinit();
 
     try expectEmitString(&tree, "Hello, world!", try tree.text("Hello, world!"));
 }
 
 test "text dedup" {
-    var tree = Tree.init(std.testing.allocator);
+    var tree = try Tree.init(std.testing.allocator);
     defer tree.deinit();
 
     const n1 = try tree.text("Hello, world!");
@@ -2789,7 +2837,7 @@ test "text dedup" {
 }
 
 test "emit plus node" {
-    var tree = Tree.init(std.testing.allocator);
+    var tree = try Tree.init(std.testing.allocator);
     defer tree.deinit();
 
     const n1 = try tree.text("Hello,");
@@ -2803,7 +2851,7 @@ test "emit plus node" {
 }
 
 test "'a' <> nl <> 'b'" {
-    var t = Tree.init(std.testing.allocator);
+    var t = try Tree.init(std.testing.allocator);
     defer t.deinit();
 
     try expectEmitString(
@@ -2817,7 +2865,7 @@ test "'a' <> nl <> 'b'" {
 }
 
 test "fuse text <> nl" {
-    var t = Tree.init(std.testing.allocator);
+    var t = try Tree.init(std.testing.allocator);
     defer t.deinit();
 
     const text_node = try t.text("Hello, world!");
@@ -2836,7 +2884,7 @@ test "fuse text <> nl" {
 }
 
 test "fuse nl <> text" {
-    var t = Tree.init(std.testing.allocator);
+    var t = try Tree.init(std.testing.allocator);
     defer t.deinit();
 
     const text_node = try t.text("Hello, world!");
@@ -2855,7 +2903,7 @@ test "fuse nl <> text" {
 }
 
 test "maze evaluation chooses best layout" {
-    var tree = Tree.init(std.testing.allocator);
+    var tree = try Tree.init(std.testing.allocator);
     defer tree.deinit();
 
     const inline_doc = try tree.cat(&.{
@@ -2883,7 +2931,7 @@ test "maze evaluation chooses best layout" {
 }
 
 test "concatenation preserves shorter costlier frontier layout" {
-    var tree = Tree.init(std.testing.allocator);
+    var tree = try Tree.init(std.testing.allocator);
     defer tree.deinit();
 
     const cheap_long = try tree.text("12345");
@@ -2899,7 +2947,7 @@ test "concatenation preserves shorter costlier frontier layout" {
 }
 
 test "nest context reaches a right-associated hcat tail" {
-    var tree = Tree.init(std.testing.allocator);
+    var tree = try Tree.init(std.testing.allocator);
     defer tree.deinit();
 
     const tail = try tree.cat(&.{
@@ -2918,7 +2966,7 @@ test "nest context reaches a right-associated hcat tail" {
 }
 
 test "nest modifier survives fork elimination" {
-    var tree = Tree.init(std.testing.allocator);
+    var tree = try Tree.init(std.testing.allocator);
     defer tree.deinit();
 
     const branch_a = try tree.cat(&.{ try tree.text("a"), Node.nl, try tree.text("b") });
@@ -2931,7 +2979,7 @@ test "nest modifier survives fork elimination" {
 }
 
 test "structural memo weight inserts a transparent checkpoint" {
-    var tree = Tree.init(std.testing.allocator);
+    var tree = try Tree.init(std.testing.allocator);
     defer tree.deinit();
 
     var doc = try tree.text("a");
@@ -2948,23 +2996,8 @@ test "structural memo weight inserts a transparent checkpoint" {
     try expectEmitString(&tree, "aaaaaaa", doc);
 }
 
-test "hash-consed hcats share structural memo checkpoints" {
-    var tree = Tree.init(std.testing.allocator);
-    defer tree.deinit();
-
-    var doc = try tree.text("a");
-    for (0..5) |_| doc = try tree.hashcat(.{}, doc, try tree.text("a"));
-    const checkpoint = try tree.hashcat(.{}, doc, try tree.text("a"));
-    const same_checkpoint = try tree.hashcat(.{}, doc, try tree.text("a"));
-
-    try expectEqual(checkpoint, same_checkpoint);
-    const wrapper = tree.heap.new().hcat.list.items[Node.view(Oper, checkpoint).item];
-    try expectEqual(Node.memo_mark, wrapper.head);
-    try expectEmitString(&tree, "aaaaaaa", checkpoint);
-}
-
 test "shared memo checkpoint is reused" {
-    var tree = Tree.init(std.testing.allocator);
+    var tree = try Tree.init(std.testing.allocator);
     defer tree.deinit();
 
     var shared = try tree.text("a");
@@ -2978,7 +3011,7 @@ test "shared memo checkpoint is reused" {
 }
 
 test "flatten preserves memo checkpoints" {
-    var tree = Tree.init(std.testing.allocator);
+    var tree = try Tree.init(std.testing.allocator);
     defer tree.deinit();
 
     var doc = try tree.text("a");
@@ -2992,7 +3025,7 @@ test "flatten preserves memo checkpoints" {
 }
 
 test "computation width delays and forces unavoidable overflow" {
-    var tree = Tree.init(std.testing.allocator);
+    var tree = try Tree.init(std.testing.allocator);
     defer tree.deinit();
 
     const doc = try tree.text("abcdefgh");
@@ -3007,7 +3040,7 @@ test "computation width delays and forces unavoidable overflow" {
 }
 
 test "concatenation propagates a delayed tail" {
-    var tree = Tree.init(std.testing.allocator);
+    var tree = try Tree.init(std.testing.allocator);
     defer tree.deinit();
 
     const doc = try tree.plus(try tree.text("abc"), try tree.text("def"));
@@ -3022,7 +3055,7 @@ test "concatenation propagates a delayed tail" {
 }
 
 test "a bounded choice wins over a delayed choice" {
-    var tree = Tree.init(std.testing.allocator);
+    var tree = try Tree.init(std.testing.allocator);
     defer tree.deinit();
 
     const doc = try tree.fork(try tree.text("abcdefgh"), try tree.text("ok"));
@@ -3037,7 +3070,7 @@ test "a bounded choice wins over a delayed choice" {
 }
 
 test "forced computation becomes bounded again after newline" {
-    var tree = Tree.init(std.testing.allocator);
+    var tree = try Tree.init(std.testing.allocator);
     defer tree.deinit();
 
     const suffix = try tree.fork(try tree.text("abcdefgh"), try tree.text("ok"));
@@ -3051,7 +3084,7 @@ test "forced computation becomes bounded again after newline" {
 }
 
 test "forcing a computation selects one recovered measure" {
-    var tree = Tree.init(std.testing.allocator);
+    var tree = try Tree.init(std.testing.allocator);
     defer tree.deinit();
 
     const short_costly = try tree.plus(Node.nl, try tree.text("x"));
@@ -3066,7 +3099,7 @@ test "forcing a computation selects one recovered measure" {
 }
 
 test "flatten fused text <> nl" {
-    var t = Tree.init(std.testing.allocator);
+    var t = try Tree.init(std.testing.allocator);
     defer t.deinit();
 
     const fused = try t.plus(try t.text("A"), .nl);
@@ -3074,7 +3107,7 @@ test "flatten fused text <> nl" {
 }
 
 test "nest braces emit" {
-    var t = Tree.init(std.testing.allocator);
+    var t = try Tree.init(std.testing.allocator);
     defer t.deinit();
 
     const doc = try t.plus(
@@ -3096,7 +3129,7 @@ test "nest braces emit" {
 }
 
 test "nest braces cost" {
-    var t = Tree.init(std.testing.allocator);
+    var t = try Tree.init(std.testing.allocator);
     defer t.deinit();
 
     const cost = F1.init(32);
@@ -3119,7 +3152,7 @@ test "nest braces cost" {
 }
 
 test "F2 cost matches example" {
-    var t = Tree.init(std.testing.allocator);
+    var t = try Tree.init(std.testing.allocator);
     defer t.deinit();
 
     // See Example 3.5. and Figure 7 in *A Pretty Expressive Printer*.
@@ -3159,7 +3192,7 @@ test "F2 cost matches example" {
 }
 
 test "flatten('a' <> nl <> 'b')" {
-    var t = Tree.init(std.testing.allocator);
+    var t = try Tree.init(std.testing.allocator);
     defer t.deinit();
 
     try expectEmitString(
@@ -3175,7 +3208,7 @@ test "flatten('a' <> nl <> 'b')" {
 }
 
 test "warp aligns after NL; nest adds indent" {
-    var t = Tree.init(std.testing.allocator);
+    var t = try Tree.init(std.testing.allocator);
     defer t.deinit();
 
     // doc = "AAA" <> NL <> "B"
@@ -3194,7 +3227,7 @@ test "warp aligns after NL; nest adds indent" {
 }
 
 test "warp with nest when head is non-zero" {
-    var t = Tree.init(std.testing.allocator);
+    var t = try Tree.init(std.testing.allocator);
     defer t.deinit();
 
     // inner = "X" <> NL <> "Y"

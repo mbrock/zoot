@@ -126,7 +126,7 @@ fn dumpStruct(
         return tree.text(".{}");
     }
 
-    var items = std.ArrayList(Node){};
+    var items: std.ArrayList(Node) = .empty;
     defer items.deinit(tree.bank);
 
     inline for (info.fields) |field| {
@@ -148,7 +148,7 @@ fn dumpTuple(
         return tree.text(".{}");
     }
 
-    var items = std.ArrayList(Node){};
+    var items: std.ArrayList(Node) = .empty;
     defer items.deinit(tree.bank);
 
     inline for (info.fields) |field| {
@@ -164,7 +164,7 @@ fn dumpArray(tree: *Tree, value: anytype) !Node {
         return tree.text(".{}");
     }
 
-    var items = std.ArrayList(Node){};
+    var items: std.ArrayList(Node) = .empty;
     defer items.deinit(tree.bank);
 
     for (value) |elem| {
@@ -179,7 +179,7 @@ fn dumpSlice(tree: *Tree, comptime Child: type, value: []const Child) !Node {
         return tree.text(".{}");
     }
 
-    var items = std.ArrayList(Node){};
+    var items: std.ArrayList(Node) = .empty;
     defer items.deinit(tree.bank);
 
     for (value) |elem| {
@@ -216,7 +216,7 @@ fn dumpTaggedUnion(
 }
 
 fn dumpString(tree: *Tree, slice: []const u8) !Node {
-    var buf = std.ArrayList(u8){};
+    var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(tree.bank);
 
     try buf.append(tree.bank, '"');
@@ -251,7 +251,7 @@ fn container(tree: *Tree, items: []const Node) !Node {
         return tree.text(".{}");
     }
 
-    var with_commas = std.ArrayList(Node){};
+    var with_commas: std.ArrayList(Node) = .empty;
     defer with_commas.deinit(tree.bank);
 
     const comma = try tree.text(",");
@@ -289,7 +289,7 @@ const expect = std.testing.expect;
 const expectEqualStrings = std.testing.expectEqualStrings;
 
 test "dump struct inline by default" {
-    var tree = Tree.init(std.testing.allocator);
+    var tree = try Tree.init(std.testing.allocator);
     defer tree.deinit();
 
     const Data = struct { x: u8, y: u8 };
@@ -306,7 +306,7 @@ test "dump struct inline by default" {
 }
 
 test "dump chooses multiline layout when narrow" {
-    var tree = Tree.init(std.testing.allocator);
+    var tree = try Tree.init(std.testing.allocator);
     defer tree.deinit();
 
     const Data = struct {
@@ -334,7 +334,7 @@ test "dump chooses multiline layout when narrow" {
 }
 
 test "dump escapes strings" {
-    var tree = Tree.init(std.testing.allocator);
+    var tree = try Tree.init(std.testing.allocator);
     defer tree.deinit();
 
     const doc = try dump(&tree, "quote \" and newline\n");
@@ -352,7 +352,7 @@ test "dump renders nested unions with slices" {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var tree = Tree.init(allocator);
+    var tree = try Tree.init(allocator);
     defer tree.deinit();
 
     const Run = struct {
@@ -426,8 +426,6 @@ test "dump renders nested unions with slices" {
     var writer = std.Io.Writer.fixed(buffer[0..]);
     try tree.emit(&writer, best.idea.node);
     const rendered = writer.buffered();
-
-    std.debug.print("rendered:\n{s}\n", .{rendered});
 
     try expect(std.mem.containsAtLeast(u8, rendered, 1, ".parallel"));
     try expect(std.mem.containsAtLeast(u8, rendered, 1, "\"us-west\""));

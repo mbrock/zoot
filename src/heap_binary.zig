@@ -24,7 +24,6 @@ const pretty = @import("pretty.zig");
 ///   [ktx4 array raw bytes]
 ///   [duel array raw bytes]
 ///   [cope array raw bytes]
-
 pub const HEAP_MAGIC = "ZOOTHEAP";
 pub const NO_STEP = 0xffffffffffffffff;
 
@@ -71,7 +70,6 @@ pub fn dumpHeap(writer: *std.Io.Writer, half: *const pretty.Half, step: ?u64) !v
 ///   1: gc_forward (payload: u32 old_node, u32 new_node)
 ///   2: heap_snapshot (payload: full heap dump as above, minus magic/total_size)
 ///   3: gc_end (payload: u32 heap_size)
-
 pub const TRACE_MAGIC = "ZOOTRACE";
 
 pub const EventType = enum(u8) {

@@ -20,7 +20,7 @@ fn stmt(t: *Tree, s: Node) !Node {
 }
 
 pub fn toJson(t1: *Tree, sink: *std.Io.Writer, node: Node) !void {
-    var t2 = Tree.init(t1.bank);
+    var t2 = try Tree.init(t1.bank);
     defer t2.deinit();
 
     const tree_field = try jsonField(&t2, "tree", try jsonNode(&t2, t1, node));
@@ -111,7 +111,7 @@ fn jsonMaze(t2: *Tree, t1: *Tree) !Node {
 }
 
 pub fn graphviz(t1: *Tree, sink: *std.Io.Writer, node: Node) !void {
-    var t2 = Tree.init(t1.bank);
+    var t2 = try Tree.init(t1.bank);
     defer t2.deinit();
 
     const body = try graphvizDoc(&t2, t1, node);
@@ -266,7 +266,7 @@ fn formatTextNode(doc_tree: *Tree, data_tree: *Tree, node: Node) !Node {
 const expect = std.testing.expect;
 
 test "graphviz output" {
-    var t = Tree.init(std.testing.allocator);
+    var t = try Tree.init(std.testing.allocator);
     defer t.deinit();
 
     // Create: warp(nest(2, ("foo" <> nl) <> "bar"))

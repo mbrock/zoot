@@ -3,11 +3,19 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const profile_outline = b.option(
+        bool,
+        "profile-outline",
+        "Keep the main evaluator boundaries visible to profilers",
+    ) orelse false;
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "profile_outline", profile_outline);
 
     const rootpack = b.addModule("zoot", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
     });
+    rootpack.addOptions("build_options", build_options);
 
     const mainpack = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -35,22 +43,6 @@ pub fn build(b: *std.Build) void {
     zootexec.step.dependOn(b.getInstallStep());
     teststep.dependOn(&testexec.step);
 
-    // SWI-Prolog foreign library
-    const prolog_ffi = b.addLibrary(.{
-        .name = "zoot",
-        .linkage = .dynamic,
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/prolog_ffi.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zoot", .module = rootpack },
-            },
-        }),
-    });
-    prolog_ffi.linkLibC();
-
     b.installArtifact(zootprog);
     b.installArtifact(testmod);
-    b.installArtifact(prolog_ffi);
 }

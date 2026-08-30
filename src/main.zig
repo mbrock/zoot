@@ -22,12 +22,10 @@ const Pipeline = struct {
     steps: []const Step,
 };
 
-pub fn main() !void {
-    var gpa = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.arena.allocator();
 
-    var args = try std.process.argsWithAllocator(allocator);
+    var args = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
     defer args.deinit();
     _ = args.skip();
     const gc_tide = if (args.next()) |arg|
@@ -53,12 +51,12 @@ pub fn main() !void {
     }
 
     var buffer: [8192]u8 = undefined;
-    var stdout_file = std.fs.File.stdout();
-    var stdout_writer = stdout_file.writer(&buffer);
+    const stdout_file = std.Io.File.stdout();
+    var stdout_writer = stdout_file.writer(init.io, &buffer);
     const writer = &stdout_writer.interface;
     defer writer.flush() catch {};
 
-    var t = pp.Tree.init(allocator);
+    var t = try pp.Tree.init(allocator);
     defer t.deinit();
 
     const pipeline_tags = &.{ "cli", "zig", "pretty" };
@@ -103,12 +101,14 @@ pub fn main() !void {
         };
     }
 
-    var time = try std.time.Timer.start();
+    var checkpoint = std.Io.Clock.Timestamp.now(init.io, .awake);
     const doc = try dump.dump(&t, pipelines);
     const cost_factory = pp.F2.init(60);
     const effective_computation_width = computation_width orelse cost_factory.defaultComputationWidth();
 
-    const t0 = time.lap();
+    var now = std.Io.Clock.Timestamp.now(init.io, .awake);
+    const t0 = checkpoint.durationTo(now).raw;
+    checkpoint = now;
     const best = try t.pickWithOptions(allocator, cost_factory, doc, .{
         .gc_tide = gc_tide,
         .computation_width = computation_width,
@@ -116,7 +116,9 @@ pub fn main() !void {
         .trace_memo = trace_memo,
         .memoize = memoize,
     });
-    const t1 = time.lap();
+    now = std.Io.Clock.Timestamp.now(init.io, .awake);
+    const t1 = checkpoint.durationTo(now).raw;
+    checkpoint = now;
 
     const idea = best.idea;
     const rank = idea.gist.rank;
@@ -160,10 +162,14 @@ pub fn main() !void {
     );
 
     try t.emit(writer, idea.node);
-    const t3 = time.read();
+    const t3 = checkpoint.durationTo(std.Io.Clock.Timestamp.now(init.io, .awake)).raw;
     try writer.print(
-        "  (dump {D}; best {D}; emit {D})\n\n",
-        .{ t0, t1, t3 },
+        "  (dump {d:.3}ms; best {d:.3}ms; emit {d:.3}ms)\n\n",
+        .{
+            @as(f64, @floatFromInt(t0.nanoseconds)) / std.time.ns_per_ms,
+            @as(f64, @floatFromInt(t1.nanoseconds)) / std.time.ns_per_ms,
+            @as(f64, @floatFromInt(t3.nanoseconds)) / std.time.ns_per_ms,
+        },
     );
     try writer.print("cons: {d} cans: {d}\n", .{
         t.heap.new().hcat.list.items.len,
