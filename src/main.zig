@@ -119,10 +119,11 @@ pub fn main(init: std.process.Init) !void {
         .trace_memo = trace_memo,
         .memoize = memoize,
     };
+    var stat: pp.Stat = .{};
     const best = if (use_recursive)
-        try recursive.pickWithOptions(&t, allocator, cost_factory, doc, options)
+        try recursive.pickWithStatistics(&t, allocator, cost_factory, doc, options, &stat)
     else
-        try t.pickWithOptions(allocator, cost_factory, doc, options);
+        try t.pickWithStatistics(allocator, cost_factory, doc, options, &stat);
     now = std.Io.Clock.Timestamp.now(init.io, .awake);
     const t1 = checkpoint.durationTo(now).raw;
     checkpoint = now;
@@ -132,39 +133,39 @@ pub fn main(init: std.process.Init) !void {
 
     try writer.print(
         "  rank: overflow={d} height={d} tainted={}\n",
-        .{ rank.o, rank.h, best.stat.cope_forced != 0 },
+        .{ rank.o, rank.h, stat.cope_forced != 0 },
     );
     try writer.print(
         "  layouts: completions={d} frontier={d} queue_peak={d}\n",
-        .{ best.stat.completions, best.stat.size, best.stat.peak },
+        .{ stat.completions, stat.size, stat.peak },
     );
     try writer.print(
         "  computation: width={d} deferred={d} forced={d}\n",
-        .{ effective_computation_width, best.stat.cope_deferred, best.stat.cope_forced },
+        .{ effective_computation_width, stat.cope_deferred, stat.cope_forced },
     );
     try writer.print(
         "  memo: enabled={} hits={d} (hcat={d} fork={d}) misses={d} (hcat={d} fork={d}) entries={d}\n\n",
         .{
             memoize,
-            best.stat.memo_hits,
-            best.stat.memo_hits_hcat,
-            best.stat.memo_hits_fork,
-            best.stat.memo_misses,
-            best.stat.memo_misses_hcat,
-            best.stat.memo_misses_fork,
-            best.stat.memo_entries,
+            stat.memo_hits,
+            stat.memo_hits_hcat,
+            stat.memo_hits_fork,
+            stat.memo_misses,
+            stat.memo_misses_hcat,
+            stat.memo_misses_fork,
+            stat.memo_entries,
         },
     );
     try writer.print(
         "  gc: tide={d} collections={d} heap_peak={d} before_peak={d} live_peak={d} live_last={d} copied={d}\n\n",
         .{
             gc_tide,
-            best.stat.gc_count,
-            best.stat.heap_peak,
-            best.stat.gc_before_peak,
-            best.stat.gc_live_peak,
-            best.stat.gc_live_last,
-            best.stat.gc_copied_total,
+            stat.gc_count,
+            stat.heap_peak,
+            stat.gc_before_peak,
+            stat.gc_live_peak,
+            stat.gc_live_last,
+            stat.gc_copied_total,
         },
     );
 

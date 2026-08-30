@@ -32,6 +32,27 @@ pub fn build(b: *std.Build) void {
         .use_llvm = true,
     });
 
+    const recursive_stress_pack = b.createModule(.{
+        .root_source_file = b.path("examples/recursive_stress.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zoot", .module = rootpack },
+        },
+    });
+    const recursive_stress_program = b.addExecutable(.{
+        .name = "zoot-recursive-stress",
+        .root_module = recursive_stress_pack,
+        .use_llvm = true,
+    });
+    const recursive_stress_step = b.step(
+        "stress-recursive",
+        "Stress the recursive evaluator with a large JSON array",
+    );
+    const recursive_stress_exec = b.addRunArtifact(recursive_stress_program);
+    if (b.args) |args| recursive_stress_exec.addArgs(args);
+    recursive_stress_step.dependOn(&recursive_stress_exec.step);
+
     const testmod = b.addTest(.{ .root_module = rootpack });
 
     const zootstep = b.step("run", "Run the zoot suit");

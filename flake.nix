@@ -29,6 +29,10 @@
               ocaml
               dune_3
               (sbcl.withPackages (ps: [ ps.eclector ]))
+              rustc
+              cargo
+              rustfmt
+              clippy
               git
             ] ++ lib.optionals stdenv.hostPlatform.isLinux [ perf ];
           };

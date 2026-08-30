@@ -1,4 +1,4 @@
-.PHONY: all build test zig-test lisp-test lisp-benchmark lisp-profile lisp-format profile typst-example
+.PHONY: all build zig-build rust-build test zig-test lisp-test rust-test lisp-benchmark lisp-profile lisp-format profile typst-example
 .NOTPARALLEL:
 
 WIDTH ?= 80
@@ -11,10 +11,15 @@ LISP_PROFILE_MODE ?= ternary
 
 all: build test profile
 
-build:
+build: zig-build rust-build
+
+zig-build:
 	zig build
 
-test: zig-test lisp-test
+rust-build:
+	cargo build --manifest-path rust/Cargo.toml
+
+test: zig-test lisp-test rust-test
 
 zig-test:
 	zig build test
@@ -22,6 +27,9 @@ zig-test:
 lisp-test:
 	XDG_CACHE_HOME=/tmp/zoot-asdf-statistics sbcl --script common-lisp/tests.lisp
 	XDG_CACHE_HOME=/tmp/zoot-asdf-statistics sbcl --script common-lisp/sexp-tests.lisp
+
+rust-test:
+	cargo test --manifest-path rust/Cargo.toml
 
 lisp-benchmark:
 	XDG_CACHE_HOME=/tmp/zoot-asdf-statistics sbcl --script common-lisp/benchmark.lisp $(RUNS)
