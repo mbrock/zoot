@@ -100,7 +100,6 @@ layout. Both branches contain exactly the same non-whitespace tokens."
   (let ((start (get-internal-real-time))
         (last-result nil))
     (dotimes (run runs)
-      (declare (ignore run))
       (setf last-result
             (pick (benchmark-document benchmark) (benchmark-cost benchmark))))
     (let* ((elapsed (milliseconds (- (get-internal-real-time) start)))

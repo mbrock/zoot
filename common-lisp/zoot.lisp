@@ -17,13 +17,31 @@
 
 ;;; Documents
 
-(defstruct (document (:constructor %document (kind &key text left right child amount)))
+(defconstant +initial-memo-weight+ 6
+  "Number of structural levels between memo checkpoints, as in the OCaml
+reference implementation (its PARAM_MEMO_LIMIT is 7, with initial weight 6).")
+
+(defstruct (document
+            (:constructor %document
+                (kind &key text left right child amount
+                           (memo-weight +initial-memo-weight+))))
   (kind nil :type symbol :read-only t)
   (text nil :type (or null string) :read-only t)
   (left nil :type (or null document) :read-only t)
   (right nil :type (or null document) :read-only t)
   (child nil :type (or null document) :read-only t)
-  (amount 0 :type (integer 0) :read-only t))
+  (amount 0 :type (integer 0) :read-only t)
+  (memo-weight +initial-memo-weight+
+               :type (integer 0 6)
+               :read-only t)
+  ;; Transient evaluator-owned state. The table itself is retained between
+  ;; picks to reuse its allocation, but its entries never cross a pick.
+  (memo-owner nil)
+  (memo-table nil :type (or null hash-table)))
+
+(defun next-memo-weight (document)
+  (let ((weight (document-memo-weight document)))
+    (if (zerop weight) +initial-memo-weight+ (1- weight))))
 
 (defun text (string)
   "A terminal document. STRING must not contain a newline."
@@ -37,22 +55,35 @@
 
 (defun concatenate (left right)
   "Unaligned concatenation: place RIGHT immediately after LEFT."
-  (%document :concatenate :left left :right right))
+  (%document :concatenate
+             :left left
+             :right right
+             :memo-weight (min (next-memo-weight left)
+                               (next-memo-weight right))))
 
 (defun choice (left right)
   "An arbitrary choice between two documents."
-  (%document :choice :left left :right right))
+  (%document :choice
+             :left left
+             :right right
+             :memo-weight (min (next-memo-weight left)
+                               (next-memo-weight right))))
 
 (defun nest (amount document)
   "Indent lines after the first by AMOUNT columns."
   (check-type amount (integer 0))
   (if (zerop amount)
       document
-      (%document :nest :amount amount :child document)))
+      (%document :nest
+                 :amount amount
+                 :child document
+                 :memo-weight (next-memo-weight document))))
 
 (defun align (document)
   "Use the current column as DOCUMENT's indentation base."
-  (%document :align :child document))
+  (%document :align
+             :child document
+             :memo-weight (next-memo-weight document)))
 
 (defun cat (&rest documents)
   (reduce #'concatenate documents :initial-value (text "")))
@@ -222,7 +253,8 @@ region. If both sides are tainted, retain the left promise."
 (defstruct (evaluator (:constructor %evaluator (cost memoize)))
   (cost (make-f2 80) :type cost :read-only t)
   (memoize t :type boolean :read-only t)
-  (memo (make-hash-table :test #'eq) :type hash-table)
+  (memo-token (list nil) :read-only t)
+  (memoized-documents nil :type list)
   (statistics (make-statistics) :type statistics))
 
 (defun note-frontier (evaluator frontier)
@@ -239,20 +271,46 @@ region. If both sides are tainted, retain the left promise."
     (note-frontier evaluator (evaluation-value evaluation)))
   evaluation)
 
+(defun document-context-table (evaluator document)
+  (let ((token (evaluator-memo-token evaluator)))
+    (unless (eq token (document-memo-owner document))
+      (when (document-memo-owner document)
+        (error "Concurrent PICK calls cannot share document nodes yet"))
+      (let ((table (or (document-memo-table document)
+                       (setf (document-memo-table document)
+                             (make-hash-table :test #'eql)))))
+        (clrhash table)
+        (setf (document-memo-owner document) token)
+        (push document (evaluator-memoized-documents evaluator))))
+    (document-memo-table document)))
+
+(defun release-context-tables (evaluator)
+  (dolist (document (evaluator-memoized-documents evaluator))
+    (clrhash (document-memo-table document))
+    (setf (document-memo-owner document) nil))
+  (setf (evaluator-memoized-documents evaluator) nil))
+
+(defun memo-context-key (evaluator last base)
+  ;; LAST and BASE are both at most LIMIT here, so this is a collision-free
+  ;; row-major encoding of the pair, as in the OCaml implementation.
+  (+ last (* base (1+ (cost-limit (evaluator-cost evaluator))))))
+
 (defun memoized (evaluator document last base thunk)
-  (unless (evaluator-memoize evaluator)
+  (unless (and (evaluator-memoize evaluator)
+               (zerop (document-memo-weight document))
+               (<= last (cost-limit (evaluator-cost evaluator)))
+               (<= base (cost-limit (evaluator-cost evaluator))))
     (return-from memoized (funcall thunk)))
-  (let* ((memo (evaluator-memo evaluator))
-         (contexts (or (gethash document memo)
-                       (setf (gethash document memo)
-                             (make-hash-table :test #'equal))))
-         (key (cons last base)))
+  (let* ((contexts (document-context-table evaluator document))
+         (key (memo-context-key evaluator last base)))
     (multiple-value-bind (frontier present-p) (gethash key contexts)
       (if present-p
           (progn
             (incf (statistics-memo-hits (evaluator-statistics evaluator)))
             frontier)
-          (setf (gethash key contexts) (funcall thunk))))))
+          (prog1 (setf (gethash key contexts) (funcall thunk))
+            (incf (statistics-memo-entries
+                   (evaluator-statistics evaluator))))))))
 
 (defun exceeds-computation-limit-p (evaluator document last base)
   (let ((limit (cost-limit (evaluator-cost evaluator))))
@@ -390,24 +448,24 @@ region. If both sides are tainted, retain the left promise."
   "Resolve DOCUMENT with computation-width taint. Ordinary Pareto frontiers
 are exact and unrestricted; forced tainted regions deliberately recover one
 candidate, as in Pretty Expressive and recursive.zig."
-  (let* ((evaluator (%evaluator cost memoize))
-         (evaluation (evaluate evaluator document 0 0))
-         (tainted-p (eq :tainted (evaluation-kind evaluation)))
-         (frontier
-           (if tainted-p
-               (vector (force-evaluation evaluation))
-               (evaluation-value evaluation)))
-         (statistics (evaluator-statistics evaluator)))
-    (when (zerop (length frontier))
-      (error "Document has no layouts"))
-    (let ((best (aref frontier 0)))
-      (loop for candidate across frontier
-            when (rank< (candidate-rank candidate) (candidate-rank best))
-              do (setf best candidate))
-      (setf (statistics-memo-entries statistics)
-            (loop for contexts being the hash-values of (evaluator-memo evaluator)
-                  sum (hash-table-count contexts)))
-      (%result best frontier statistics tainted-p))))
+  (let ((evaluator (%evaluator cost memoize)))
+    (unwind-protect
+         (let* ((evaluation (evaluate evaluator document 0 0))
+                (tainted-p (eq :tainted (evaluation-kind evaluation)))
+                (frontier
+                  (if tainted-p
+                      (vector (force-evaluation evaluation))
+                      (evaluation-value evaluation)))
+                (statistics (evaluator-statistics evaluator)))
+           (when (zerop (length frontier))
+             (error "Document has no layouts"))
+           (let ((best (aref frontier 0)))
+             (loop for candidate across frontier
+                   when (rank< (candidate-rank candidate)
+                               (candidate-rank best))
+                     do (setf best candidate))
+             (%result best frontier statistics tainted-p)))
+      (release-context-tables evaluator))))
 
 ;;; Rendering
 

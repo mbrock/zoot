@@ -88,6 +88,15 @@
   (check (format nil "xxa~%  b")
          (format-document document (make-f1 3))))
 
+;;; OCaml's structural memo weight reaches zero after six constructors, then
+;;; resets at the next parent without inserting a wrapper document.
+
+(let ((document (text "x")))
+  (dolist (expected '(5 4 3 2 1 0 5))
+    (setf document (concatenate document (text "x")))
+    (check expected (zoot::document-memo-weight document)
+           "memo weight differs")))
+
 ;;; Computation-width taint / Cope behavior, corresponding to the regression
 ;;; tests in src/pretty.zig.
 

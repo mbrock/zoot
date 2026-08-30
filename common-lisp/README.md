@@ -12,8 +12,10 @@ Zig's compact representation:
 - Pareto frontiers are unrestricted adjustable vectors;
 - dominance compares final column and lexicographic `(overflow, height)` cost;
 - both linear-overflow F1 and squared-overflow F2 costs are available;
-- recursive evaluation is memoized by document identity, current column, and
-  indentation base;
+- each document node owns a reusable `EQL` context table, keyed by a packed
+  integer containing the current column and indentation base;
+- the OCaml six-level structural weight policy enables those tables only at
+  periodic memo checkpoints, without adding Zig-style wrapper nodes;
 - evaluation uses the paper's computation-width taint: work outside the bounded
   region becomes a thunk for one candidate, ordinary choice branches beat
   tainted branches, and unavoidable taint is forced at the root;
