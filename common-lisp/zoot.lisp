@@ -234,7 +234,9 @@ nonnegative integer. Newline count remains the secondary rank component.")
        (rank<= (candidate-rank left) (candidate-rank right))))
 
 (defun empty-frontier ()
-  (make-array 0 :adjustable t :fill-pointer 0))
+  ;; Most observed frontiers contain one or two candidates. Reserve those
+  ;; slots up front so the first pushes do not immediately reallocate.
+  (make-array 2 :adjustable t :fill-pointer 0))
 
 (defun frontier-add (frontier candidate)
   "Add CANDIDATE destructively, discarding candidates dominated in both
@@ -391,25 +393,38 @@ region. If both sides are tainted, retain the left promise."))
                   (the nonnegative-fixnum
                        (1+ limit)))))))
 
-(defun memoized (document last base thunk)
+(defun %memoized (document last base limit thunk)
   (declare (type document document)
-           (type nonnegative-fixnum last base) (type function thunk))
-  (let* ((cost *cost*)
-         (limit (cost-limit cost)))
-    (unless (and (zerop (document-memo-weight document))
-                 (<= last limit)
-                 (<= base limit))
-      (return-from memoized (funcall thunk)))
-    (let* ((contexts (document-context-table document))
-           (key (memo-context-key last base limit)))
-      (multiple-value-bind (frontier present-p) (gethash key contexts)
-        (if present-p
-            (progn
-              (incf (statistics-memo-hits (the statistics *statistics*)))
-              frontier)
-            (prog1 (setf (gethash key contexts) (funcall thunk))
-              (incf (statistics-memo-entries
-                     (the statistics *statistics*)))))))))
+           (type nonnegative-fixnum last base limit)
+           (type function thunk))
+  (let* ((contexts (document-context-table document))
+         (key (memo-context-key last base limit)))
+    (multiple-value-bind (frontier present-p) (gethash key contexts)
+      (if present-p
+          (progn
+            (incf (statistics-memo-hits (the statistics *statistics*)))
+            frontier)
+          (prog1 (setf (gethash key contexts) (funcall thunk))
+            (incf (statistics-memo-entries
+                   (the statistics *statistics*))))))))
+
+(defmacro memoized ((document last base) &body body)
+  "Evaluate BODY directly for ordinary nodes. Allocate a thunk only at memo
+checkpoints whose context lies inside the computation limit."
+  (let ((document-var (gensym "DOCUMENT"))
+        (last-var (gensym "LAST"))
+        (base-var (gensym "BASE"))
+        (limit-var (gensym "LIMIT")))
+    `(let* ((,document-var ,document)
+            (,last-var ,last)
+            (,base-var ,base)
+            (,limit-var (cost-limit *cost*)))
+       (if (and (zerop (document-memo-weight ,document-var))
+                (<= ,last-var ,limit-var)
+                (<= ,base-var ,limit-var))
+           (%memoized ,document-var ,last-var ,base-var ,limit-var
+                      (lambda () ,@body))
+           (progn ,@body)))))
 
 (defgeneric exceeds-computation-limit-p (document last base))
 
@@ -473,15 +488,13 @@ region. If both sides are tainted, retain the left promise."))
 (defun evaluate (document last base)
   (declare (type document document)
            (type nonnegative-fixnum last base))
-  (memoized
-   document last base
-   (lambda ()
-     (incf (statistics-evaluations (the statistics *statistics*)))
-     (labels ((core ()
-                (note-evaluation (evaluate-document document last base))))
-       (if (exceeds-computation-limit-p document last base)
-           (tainted-evaluation (lambda () (force-evaluation (core))))
-           (core))))))
+  (memoized (document last base)
+    (incf (statistics-evaluations (the statistics *statistics*)))
+    (labels ((core ()
+               (note-evaluation (evaluate-document document last base))))
+      (if (exceeds-computation-limit-p document last base)
+          (tainted-evaluation (lambda () (force-evaluation (core))))
+          (core)))))
 
 (defun wrap-frontier (kind amount frontier)
   (declare (type nonnegative-fixnum amount) (type (vector t) frontier))
