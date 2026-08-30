@@ -42,6 +42,12 @@ Run the small benchmark suite with:
 make lisp-benchmark RUNS=20
 ```
 
+Profile fresh ternary documents with SBCL's statistical profiler:
+
+```sh
+make lisp-profile LISP_PROFILE_SAMPLES=1500 LISP_PROFILE_DEPTH=4
+```
+
 Each iteration constructs and plans a fresh document. The suite reports mean
 build, plan, and end-to-end times along with output size, selected rank, root
 and maximum frontier sizes, evaluator/memo counts, taint activity, and a
