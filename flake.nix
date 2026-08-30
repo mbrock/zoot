@@ -26,6 +26,7 @@
               typst
               ocaml
               dune_3
+              sbcl
               git
             ] ++ lib.optionals stdenv.hostPlatform.isLinux [ perf ];
           };

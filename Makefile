@@ -1,4 +1,4 @@
-.PHONY: all build test profile typst-example
+.PHONY: all build test zig-test lisp-test lisp-benchmark profile typst-example
 .NOTPARALLEL:
 
 RUNS ?= 200
@@ -9,8 +9,16 @@ all: build test profile
 build:
 	zig build
 
-test:
+test: zig-test lisp-test
+
+zig-test:
 	zig build test
+
+lisp-test:
+	sbcl --script common-lisp/tests.lisp
+
+lisp-benchmark:
+	sbcl --script common-lisp/benchmark.lisp $(RUNS)
 
 profile:
 	RUNS=$(RUNS) STAT_RUNS=$(STAT_RUNS) ./etc/profile-linux.sh

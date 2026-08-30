@@ -1,0 +1,445 @@
+(defpackage #:zoot
+  (:use #:cl)
+  (:shadow #:concatenate)
+  (:export
+   #:text #:+newline+ #:concatenate #:cat #:vcat #:choice #:nest #:align
+   #:flatten #:group
+   #:make-f1 #:make-f2 #:pick #:render #:format-document
+   #:result-candidate #:result-frontier #:result-statistics #:result-tainted-p
+   #:candidate-last #:candidate-rank
+   #:rank-overflow #:rank-height
+   #:statistics-evaluations #:statistics-memo-hits
+   #:statistics-memo-entries #:statistics-frontier-maximum
+   #:statistics-frontier-histogram
+   #:statistics-taints-deferred #:statistics-taints-forced))
+
+(in-package #:zoot)
+
+;;; Documents
+
+(defstruct (document (:constructor %document (kind &key text left right child amount)))
+  (kind nil :type symbol :read-only t)
+  (text nil :type (or null string) :read-only t)
+  (left nil :type (or null document) :read-only t)
+  (right nil :type (or null document) :read-only t)
+  (child nil :type (or null document) :read-only t)
+  (amount 0 :type (integer 0) :read-only t))
+
+(defun text (string)
+  "A terminal document. STRING must not contain a newline."
+  (check-type string string)
+  (when (find #\Newline string)
+    (error "TEXT terminals cannot contain newlines: ~S" string))
+  (%document :text :text string))
+
+(defparameter +newline+ (%document :newline)
+  "A hard newline. Its following indentation is determined by NEST and ALIGN.")
+
+(defun concatenate (left right)
+  "Unaligned concatenation: place RIGHT immediately after LEFT."
+  (%document :concatenate :left left :right right))
+
+(defun choice (left right)
+  "An arbitrary choice between two documents."
+  (%document :choice :left left :right right))
+
+(defun nest (amount document)
+  "Indent lines after the first by AMOUNT columns."
+  (check-type amount (integer 0))
+  (if (zerop amount)
+      document
+      (%document :nest :amount amount :child document)))
+
+(defun align (document)
+  "Use the current column as DOCUMENT's indentation base."
+  (%document :align :child document))
+
+(defun cat (&rest documents)
+  (reduce #'concatenate documents :initial-value (text "")))
+
+(defun vcat (&rest documents)
+  (if (null documents)
+      (text "")
+      (reduce (lambda (left right)
+                (concatenate (concatenate left +newline+) right))
+              (rest documents)
+              :initial-value (first documents))))
+
+(defun flatten (document)
+  "Replace newlines with spaces and recursively flatten both choice branches."
+  (case (document-kind document)
+    (:text document)
+    (:newline (text " "))
+    (:concatenate
+     (concatenate (flatten (document-left document))
+                  (flatten (document-right document))))
+    (:choice
+     (choice (flatten (document-left document))
+             (flatten (document-right document))))
+    (:nest (flatten (document-child document)))
+    (:align (align (flatten (document-child document))))
+    (otherwise (error "Unknown document kind ~S" (document-kind document)))))
+
+(defun group (document)
+  "Choose between DOCUMENT and its flattened form."
+  (choice document (flatten document)))
+
+;;; Costs and Pareto measures
+
+(defstruct (cost (:constructor %cost (kind width limit)))
+  (kind :f2 :type (member :f1 :f2) :read-only t)
+  (width 80 :type (integer 0) :read-only t)
+  (limit 96 :type (integer 0) :read-only t))
+
+(defun default-computation-width (page-width)
+  (+ page-width (floor page-width 5)))
+
+(defun make-f1 (page-width &key computation-width)
+  "Minimize linear overflow, then newline count (paper Example 3.4)."
+  (%cost :f1 page-width
+         (or computation-width (default-computation-width page-width))))
+
+(defun make-f2 (page-width &key computation-width)
+  "Minimize squared overflow, then newline count (paper Example 3.5)."
+  (%cost :f2 page-width
+         (or computation-width (default-computation-width page-width))))
+
+(defstruct (rank (:constructor %rank (&optional (overflow 0) (height 0))))
+  (overflow 0 :type (integer 0) :read-only t)
+  (height 0 :type (integer 0) :read-only t))
+
+(defun rank+ (left right)
+  (%rank (+ (rank-overflow left) (rank-overflow right))
+         (+ (rank-height left) (rank-height right))))
+
+(defun rank<= (left right)
+  (or (< (rank-overflow left) (rank-overflow right))
+      (and (= (rank-overflow left) (rank-overflow right))
+           (<= (rank-height left) (rank-height right)))))
+
+(defun rank< (left right)
+  (and (rank<= left right)
+       (not (and (= (rank-overflow left) (rank-overflow right))
+                 (= (rank-height left) (rank-height right))))))
+
+(defun text-rank (cost column length)
+  (let* ((width (cost-width cost))
+         (maximum (max width column))
+         (new-overflow (max 0 (- (+ column length) maximum))))
+    (%rank
+     (ecase (cost-kind cost)
+       (:f1 new-overflow)
+       (:f2 (let ((old-overflow (max 0 (- column width))))
+              (* new-overflow (+ (* 2 old-overflow) new-overflow)))))
+     0)))
+
+(defstruct (candidate (:constructor %candidate (layout last rank)))
+  (layout nil :type document :read-only t)
+  (last 0 :type (integer 0) :read-only t)
+  (rank (%rank) :type rank :read-only t))
+
+(defun dominates-p (left right)
+  (and (<= (candidate-last left) (candidate-last right))
+       (rank<= (candidate-rank left) (candidate-rank right))))
+
+(defun empty-frontier ()
+  (make-array 0 :adjustable t :fill-pointer 0))
+
+(defun frontier-add (frontier candidate)
+  "Add CANDIDATE destructively, discarding candidates dominated in both
+last column and rank. Frontiers are unrestricted adjustable vectors."
+  (when (loop for existing across frontier
+              thereis (dominates-p existing candidate))
+    (return-from frontier-add frontier))
+  (loop with write = 0
+        for existing across frontier
+        unless (dominates-p candidate existing)
+          do (setf (aref frontier write) existing)
+             (incf write)
+        finally (setf (fill-pointer frontier) write))
+  (vector-push-extend candidate frontier)
+  frontier)
+
+(defun frontier-union (&rest frontiers)
+  (let ((result (empty-frontier)))
+    (dolist (frontier frontiers)
+      (loop for candidate across frontier
+            do (frontier-add result candidate)))
+    (sort result #'> :key #'candidate-last)))
+
+(defstruct (evaluation (:constructor %evaluation (kind value)))
+  (kind :frontier :type (member :frontier :tainted) :read-only t)
+  ;; A frontier vector, or a thunk that returns one candidate.
+  (value #() :type (or vector function) :read-only t))
+
+(defun frontier-evaluation (frontier)
+  (%evaluation :frontier frontier))
+
+(defun tainted-evaluation (evaluator thunk)
+  (incf (statistics-taints-deferred (evaluator-statistics evaluator)))
+  (%evaluation
+   :tainted
+   (lambda ()
+     (incf (statistics-taints-forced (evaluator-statistics evaluator)))
+     (funcall thunk))))
+
+(defun evaluation-empty-p (evaluation)
+  (and (eq :frontier (evaluation-kind evaluation))
+       (zerop (length (evaluation-value evaluation)))))
+
+(defun force-evaluation (evaluation)
+  (ecase (evaluation-kind evaluation)
+    (:tainted (funcall (evaluation-value evaluation)))
+    (:frontier
+     (let ((frontier (evaluation-value evaluation)))
+       (when (zerop (length frontier))
+         (error "Cannot choose from an empty frontier"))
+       (aref frontier 0)))))
+
+(defun merge-evaluations (left right)
+  "Merge like Pretty Expressive's measure sets: a normal frontier always
+wins over taint, since taint means that computation has left the bounded
+region. If both sides are tainted, retain the left promise."
+  (cond
+    ((evaluation-empty-p left) right)
+    ((evaluation-empty-p right) left)
+    ((eq :tainted (evaluation-kind right)) left)
+    ((eq :tainted (evaluation-kind left)) right)
+    (t (frontier-evaluation
+        (frontier-union (evaluation-value left) (evaluation-value right))))))
+
+;;; Recursive evaluator
+
+(defstruct statistics
+  (evaluations 0 :type (integer 0))
+  (memo-hits 0 :type (integer 0))
+  (memo-entries 0 :type (integer 0))
+  (taints-deferred 0 :type (integer 0))
+  (taints-forced 0 :type (integer 0))
+  (frontier-maximum 0 :type (integer 0))
+  (frontier-histogram (make-hash-table) :type hash-table))
+
+(defstruct (evaluator (:constructor %evaluator (cost memoize)))
+  (cost (make-f2 80) :type cost :read-only t)
+  (memoize t :type boolean :read-only t)
+  (memo (make-hash-table :test #'eq) :type hash-table)
+  (statistics (make-statistics) :type statistics))
+
+(defun note-frontier (evaluator frontier)
+  (let* ((statistics (evaluator-statistics evaluator))
+         (length (length frontier))
+         (histogram (statistics-frontier-histogram statistics)))
+    (setf (statistics-frontier-maximum statistics)
+          (max length (statistics-frontier-maximum statistics)))
+    (incf (gethash length histogram 0)))
+  frontier)
+
+(defun note-evaluation (evaluator evaluation)
+  (when (eq :frontier (evaluation-kind evaluation))
+    (note-frontier evaluator (evaluation-value evaluation)))
+  evaluation)
+
+(defun memoized (evaluator document last base thunk)
+  (unless (evaluator-memoize evaluator)
+    (return-from memoized (funcall thunk)))
+  (let* ((memo (evaluator-memo evaluator))
+         (contexts (or (gethash document memo)
+                       (setf (gethash document memo)
+                             (make-hash-table :test #'equal))))
+         (key (cons last base)))
+    (multiple-value-bind (frontier present-p) (gethash key contexts)
+      (if present-p
+          (progn
+            (incf (statistics-memo-hits (evaluator-statistics evaluator)))
+            frontier)
+          (setf (gethash key contexts) (funcall thunk))))))
+
+(defun exceeds-computation-limit-p (evaluator document last base)
+  (let ((limit (cost-limit (evaluator-cost evaluator))))
+    (or (> base limit)
+        (if (eq :text (document-kind document))
+            (> (+ last (length (document-text document))) limit)
+            (> last limit)))))
+
+(defun evaluate (evaluator document last base)
+  (memoized
+   evaluator document last base
+   (lambda ()
+     (incf (statistics-evaluations (evaluator-statistics evaluator)))
+     (labels ((core ()
+                (note-evaluation
+                 evaluator
+                 (case (document-kind document)
+                   (:text
+                    (let* ((string (document-text document))
+                           (length (length string)))
+                      (frontier-evaluation
+                       (vector
+                        (%candidate
+                         document (+ last length)
+                         (text-rank (evaluator-cost evaluator) last length))))))
+                   (:newline
+                    (frontier-evaluation
+                     (vector (%candidate document base (%rank 0 1)))))
+                   (:choice
+                    (merge-evaluations
+                     (evaluate evaluator (document-left document) last base)
+                     (evaluate evaluator (document-right document) last base)))
+                   (:nest
+                    (wrap-evaluation
+                     evaluator :nest (document-amount document)
+                     (evaluate evaluator (document-child document) last
+                               (+ base (document-amount document)))))
+                   (:align
+                    (wrap-evaluation
+                     evaluator :align 0
+                     (evaluate evaluator (document-child document) last last)))
+                   (:concatenate
+                    (evaluate-concatenation evaluator document last base))
+                   (otherwise
+                    (error "Unknown document kind ~S"
+                           (document-kind document)))))))
+       (if (exceeds-computation-limit-p evaluator document last base)
+           (tainted-evaluation evaluator
+                               (lambda () (force-evaluation (core))))
+           (core))))))
+
+(defun wrap-frontier (kind amount frontier)
+  (map 'vector
+       (lambda (candidate)
+         (%candidate
+          (ecase kind
+            (:nest (%document :nest :amount amount
+                              :child (candidate-layout candidate)))
+            (:align (%document :align :child (candidate-layout candidate))))
+          (candidate-last candidate)
+          (candidate-rank candidate)))
+       frontier))
+
+(defun wrap-candidate (kind amount candidate)
+  (%candidate
+   (ecase kind
+     (:nest (%document :nest :amount amount :child (candidate-layout candidate)))
+     (:align (%document :align :child (candidate-layout candidate))))
+   (candidate-last candidate)
+   (candidate-rank candidate)))
+
+(defun wrap-evaluation (evaluator kind amount evaluation)
+  (ecase (evaluation-kind evaluation)
+    (:frontier
+     (frontier-evaluation
+      (wrap-frontier kind amount (evaluation-value evaluation))))
+    (:tainted
+     (tainted-evaluation
+      evaluator
+      (lambda ()
+        (wrap-candidate kind amount (force-evaluation evaluation)))))))
+
+(defun concatenate-candidates (left right)
+  (%candidate
+   (%document :concatenate
+              :left (candidate-layout left)
+              :right (candidate-layout right))
+   (candidate-last right)
+   (rank+ (candidate-rank left) (candidate-rank right))))
+
+(defun concatenate-right (evaluator document left base)
+  (let ((right
+          (evaluate evaluator (document-right document)
+                    (candidate-last left) base)))
+    (ecase (evaluation-kind right)
+      (:frontier
+       (let ((result (empty-frontier)))
+         (loop for candidate across (evaluation-value right)
+               do (frontier-add result
+                                (concatenate-candidates left candidate)))
+         (frontier-evaluation (sort result #'> :key #'candidate-last))))
+      (:tainted
+       (tainted-evaluation
+        evaluator
+        (lambda ()
+          (concatenate-candidates left (force-evaluation right))))))))
+
+(defun evaluate-concatenation (evaluator document last base)
+  (let ((left (evaluate evaluator (document-left document) last base)))
+    (ecase (evaluation-kind left)
+      (:tainted
+       (tainted-evaluation
+        evaluator
+        (lambda ()
+          (let* ((left-candidate (force-evaluation left))
+                 (right (concatenate-right evaluator document left-candidate base)))
+            (force-evaluation right)))))
+      (:frontier
+       (let ((result (frontier-evaluation (empty-frontier))))
+         (loop for candidate across (evaluation-value left)
+               do (setf result
+                        (merge-evaluations
+                         result
+                         (concatenate-right evaluator document candidate base))))
+         result)))))
+
+(defstruct (result (:constructor %result
+                       (candidate frontier statistics tainted-p)))
+  (candidate nil :type candidate :read-only t)
+  (frontier #() :type vector :read-only t)
+  (statistics (make-statistics) :type statistics :read-only t)
+  (tainted-p nil :type boolean :read-only t))
+
+(defun pick (document cost &key (memoize t))
+  "Resolve DOCUMENT with computation-width taint. Ordinary Pareto frontiers
+are exact and unrestricted; forced tainted regions deliberately recover one
+candidate, as in Pretty Expressive and recursive.zig."
+  (let* ((evaluator (%evaluator cost memoize))
+         (evaluation (evaluate evaluator document 0 0))
+         (tainted-p (eq :tainted (evaluation-kind evaluation)))
+         (frontier
+           (if tainted-p
+               (vector (force-evaluation evaluation))
+               (evaluation-value evaluation)))
+         (statistics (evaluator-statistics evaluator)))
+    (when (zerop (length frontier))
+      (error "Document has no layouts"))
+    (let ((best (aref frontier 0)))
+      (loop for candidate across frontier
+            when (rank< (candidate-rank candidate) (candidate-rank best))
+              do (setf best candidate))
+      (setf (statistics-memo-entries statistics)
+            (loop for contexts being the hash-values of (evaluator-memo evaluator)
+                  sum (hash-table-count contexts)))
+      (%result best frontier statistics tainted-p))))
+
+;;; Rendering
+
+(defun render-layout (document stream last base)
+  (case (document-kind document)
+    (:text
+     (write-string (document-text document) stream)
+     (+ last (length (document-text document))))
+    (:newline
+     (terpri stream)
+     (dotimes (index base) (declare (ignore index)) (write-char #\Space stream))
+     base)
+    (:concatenate
+     (render-layout
+      (document-right document) stream
+      (render-layout (document-left document) stream last base)
+      base))
+    (:nest
+     (render-layout (document-child document) stream last
+                    (+ base (document-amount document))))
+    (:align
+     (render-layout (document-child document) stream last last))
+    (:choice (error "Cannot render an unresolved choice"))
+    (otherwise (error "Unknown document kind ~S" (document-kind document)))))
+
+(defun render (candidate &optional stream)
+  "Render CANDIDATE. Return a string when STREAM is omitted."
+  (if stream
+      (progn (render-layout (candidate-layout candidate) stream 0 0) nil)
+      (with-output-to-string (output)
+        (render-layout (candidate-layout candidate) output 0 0))))
+
+(defun format-document (document cost &key (memoize t))
+  "Resolve and render DOCUMENT in one call."
+  (render (result-candidate (pick document cost :memoize memoize))))
