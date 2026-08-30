@@ -11,15 +11,25 @@
   builder
   cost)
 
-(defun histogram-string (histogram)
-  (with-output-to-string (stream)
-    (let ((first t))
-      (dolist (key (sort (loop for key being the hash-keys of histogram
-                               collect key)
-                         #'<))
-        (unless first (write-string ", " stream))
-        (setf first nil)
-        (format stream "~D:~D" key (gethash key histogram))))))
+;;; Reports are rendered by Zoot itself: each sample is one record whose
+;;; comma-separated clauses break optimally within the page width.
+
+(defun clause-join (documents)
+  "Comma-separate DOCUMENTS, each comma a potential line break."
+  (reduce (lambda (left right)
+            (cat left "," (choice " " +newline+) right))
+          documents))
+
+(defun spaced-fill (documents)
+  (reduce (lambda (left right) (cat left (choice " " +newline+) right))
+          documents))
+
+(defun histogram-document (histogram)
+  (spaced-fill
+   (loop for key in (sort (loop for key being the hash-keys of histogram
+                                collect key)
+                          #'<)
+         collect (format nil "~D:~D" key (gethash key histogram)))))
 
 (defun milliseconds (ticks)
   (* 1000.0d0 (/ ticks internal-time-units-per-second)))
@@ -72,27 +82,58 @@
   (format t "~&Common Lisp Zoot benchmark (~A ~A)~%"
           (lisp-implementation-type) (lisp-implementation-version)))
 
-(defun print-performance-table (samples)
-  (format t "~%Performance per fresh document~%")
-  (format t "~18A  ~5A  ~9A  ~9A  ~9A  ~8A  ~10A  ~8A  ~7A~%"
-          "case" "runs" "total ms" "build ms" "plan ms" "chars" "overflow"
-          "newlines" "tainted")
-  (format t "~18A  ~5A  ~9A  ~9A  ~9A  ~8A  ~10A  ~8A  ~8A  ~7A~%"
-          "------------------" "-----" "---------" "---------" "---------"
-          "--------" "----------" "--------" "--------" "-------")
-  (dolist (sample samples)
-    (let ((rank (sample-rank sample)))
-      (format t "~18A  ~5D  ~9,3F  ~9,3F  ~9,3F  ~8D  ~10D  ~8D  ~8D  ~7A~%"
-              (sample-name sample)
-              (sample-runs sample)
-              (sample-total-average sample)
-              (sample-build-average sample)
-              (sample-plan-average sample)
-              (sample-bytes sample)
-              (rank-overflow rank)
-              (rank-indentation rank)
-              (rank-height rank)
-              (if (sample-tainted-p sample) "yes" "no")))))
+(defun sample-document (sample)
+  (let ((rank (sample-rank sample))
+        (statistics (sample-statistics sample)))
+    (cat (sample-name sample) ":"
+         (nest 2
+               (cat " "
+                    (clause-join
+                     (append
+                      (list (format nil "~D runs"
+                                    (sample-runs sample))
+                            (format nil "~,3F ms plan"
+                                    (sample-plan-average sample))
+                            (format nil "~,3F ms build"
+                                    (sample-build-average sample))
+                            (format nil "~D chars"
+                                    (sample-bytes sample))
+                            (format nil "rank (~D ~D ~D)"
+                                    (rank-overflow rank)
+                                    (rank-indentation rank)
+                                    (rank-height rank)))
+                      (when (sample-tainted-p sample)
+                        (list "tainted"))
+                      (list (format nil "~D evaluations"
+                                    (statistics-evaluations statistics))
+                            (format nil "~D memo hits (~,2F%)"
+                                    (statistics-memo-hits statistics)
+                                    (memo-hit-rate statistics))
+                            (format nil "~D memo entries"
+                                    (statistics-memo-entries statistics))
+                            (format nil "~D taints deferred"
+                                    (statistics-taints-deferred statistics))
+                            (format nil "~D forced"
+                                    (statistics-taints-forced statistics))
+                            (cat (format nil "frontier ~D wide of ~D ("
+                                         (sample-frontier-size sample)
+                                         (statistics-frontier-maximum
+                                          statistics))
+                                 (align (histogram-document
+                                         (statistics-frontier-histogram
+                                          statistics)))
+                                 ")")))))))))
+
+(defun report-document (document)
+  (render (result-candidate (pick document (make-f2 80)))
+          *standard-output*)
+  (terpri))
+
+(defun report-samples (samples)
+  (terpri)
+  (report-document
+   (reduce (lambda (left right) (cat left +newline+ +newline+ right))
+           (mapcar #'sample-document samples))))
 
 (defun memo-hit-rate (statistics)
   (let ((hits (statistics-memo-hits statistics))
@@ -100,39 +141,6 @@
     (if (zerop (+ hits evaluations))
         0.0d0
         (* 100.0d0 (/ hits (+ hits evaluations))))))
-
-(defun print-search-table (samples)
-  (format t "~%Search and bounded computation~%")
-  (format t "~18A  ~11A  ~10A  ~8A  ~8A  ~9A  ~7A~%"
-          "case" "evaluations" "memo hits" "hit rate" "entries" "deferred"
-          "forced")
-  (format t "~18A  ~11A  ~10A  ~8A  ~8A  ~9A  ~7A~%"
-          "------------------" "-----------" "----------" "--------" "--------"
-          "---------" "-------")
-  (dolist (sample samples)
-    (let ((statistics (sample-statistics sample)))
-      (format t "~18A  ~11D  ~10D  ~7,2F%  ~8D  ~9D  ~7D~%"
-              (sample-name sample)
-              (statistics-evaluations statistics)
-              (statistics-memo-hits statistics)
-              (memo-hit-rate statistics)
-              (statistics-memo-entries statistics)
-              (statistics-taints-deferred statistics)
-              (statistics-taints-forced statistics)))))
-
-(defun print-frontier-table (samples)
-  (format t "~%Pareto frontiers~%")
-  (format t "~18A  ~5A  ~5A  ~A~%" "case" "root" "max" "size:occurrences")
-  (format t "~18A  ~5A  ~5A  ~A~%" "------------------" "-----" "-----"
-          "----------------")
-  (dolist (sample samples)
-    (let ((statistics (sample-statistics sample)))
-      (format t "~18A  ~5D  ~5D  ~A~%"
-              (sample-name sample)
-              (sample-frontier-size sample)
-              (statistics-frontier-maximum statistics)
-              (histogram-string
-               (statistics-frontier-histogram statistics))))))
 
 (defun benchmark-printer (runs)
   "Time end-to-end pretty-printing of the corpus source file."
@@ -147,15 +155,22 @@
           (let ((average (/ (milliseconds (- (get-internal-real-time)
                                              start))
                             runs)))
-            (format t "~%Pretty-printer (~A)~%" (namestring path))
-            (format t "~5A  ~9A  ~9A  ~9A  ~9A~%"
-                    "runs" "ms/run" "in chars" "in lines" "out lines")
-            (format t "~5A  ~9A  ~9A  ~9A  ~9A~%"
-                    "-----" "---------" "---------" "---------" "---------")
-            (format t "~5D  ~9,3F  ~9D  ~9D  ~9D~%"
-                    runs average (length source)
-                    (1+ (count #\Newline source))
-                    (1+ (count #\Newline output))))))
+            (terpri)
+            (report-document
+             (cat "pretty-printer " (file-namestring path) ":"
+                  (nest 2
+                        (cat " "
+                             (clause-join
+                              (list (format nil "~D runs" runs)
+                                    (format nil "~,3F ms/run" average)
+                                    (format nil "~D chars"
+                                            (length source))
+                                    (format nil "~D lines in"
+                                            (1+ (count #\Newline source)))
+                                    (format nil "~D lines out"
+                                            (1+ (count #\Newline output)))
+                                    (format nil "corpus ~A"
+                                            (namestring path)))))))))))
       (format t "~%Pretty-printer benchmark skipped: Eclector unavailable~%")))
 
 (defun command-line-runs ()
@@ -182,10 +197,7 @@
   (unless (plusp runs)
     (error "RUNS must be a positive integer, got ~S" runs))
   (print-heading)
-  (let ((samples (mapcar (lambda (benchmark)
-                           (time-benchmark benchmark runs))
-                         benchmarks)))
-    (print-performance-table samples)
-    (print-search-table samples)
-    (print-frontier-table samples))
+  (report-samples (mapcar (lambda (benchmark)
+                            (time-benchmark benchmark runs))
+                          benchmarks))
   (benchmark-printer (max 1 (ceiling runs 20))))
