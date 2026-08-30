@@ -7,6 +7,7 @@ STAT_RUNS ?= 20
 LISP_PROFILE_SAMPLES ?= 1500
 LISP_PROFILE_DEPTH ?= 4
 LISP_PROFILE_STATISTICS ?= 0
+LISP_PROFILE_MODE ?= ternary
 
 all: build test profile
 
@@ -29,7 +30,7 @@ lisp-format:
 	XDG_CACHE_HOME=/tmp/zoot-asdf-statistics sbcl --script common-lisp/format-file.lisp $(FILE) $(WIDTH) $(FLAGS)
 
 lisp-profile:
-	XDG_CACHE_HOME=/tmp/zoot-asdf-statistics-$(LISP_PROFILE_STATISTICS) ZOOT_STATISTICS=$(LISP_PROFILE_STATISTICS) sbcl --script common-lisp/profile.lisp $(LISP_PROFILE_SAMPLES) $(LISP_PROFILE_DEPTH)
+	XDG_CACHE_HOME=/tmp/zoot-asdf-statistics-$(LISP_PROFILE_STATISTICS) ZOOT_STATISTICS=$(LISP_PROFILE_STATISTICS) sbcl --script common-lisp/profile.lisp $(LISP_PROFILE_SAMPLES) $(LISP_PROFILE_DEPTH) $(LISP_PROFILE_MODE)
 
 profile:
 	RUNS=$(RUNS) STAT_RUNS=$(STAT_RUNS) ./etc/profile-linux.sh

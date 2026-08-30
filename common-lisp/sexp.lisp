@@ -150,7 +150,22 @@ region is re-read after the enclosing read completes."
   t)
 
 (defun node-children (children)
-  (remove-if-not (lambda (child) (typep child 'node)) children))
+  (prune-contained
+   (remove-if-not (lambda (child) (typep child 'node)) children)))
+
+(defun prune-contained (children)
+  "Drop parse results whose source lies inside a sibling's, such as the
+inner object of a labeled #N= expression, which Eclector reports both
+alone and wrapped."
+  (remove-if (lambda (child)
+               (some (lambda (other)
+                       (and (not (eq child other))
+                            (<= (node-start other) (node-start child))
+                            (>= (node-end other) (node-end child))
+                            (or (< (node-start other) (node-start child))
+                                (> (node-end other) (node-end child)))))
+                     children))
+             children))
 
 (defun guard-prefix-at (text start)
   (and (< (1+ start) (length text))
@@ -158,10 +173,6 @@ region is re-read after the enclosing read completes."
        (member (char text (1+ start)) '(#\+ #\-))
        (subseq text start (+ start 2))))
 
-(defun dotted-tail-p (result)
-  (and (consp result)
-       (loop for tail = result then (cdr tail)
-             when (atom tail) return (not (null tail)))))
 
 (defmethod eclector.parse-result:make-expression-result
     ((client client) result children source)
@@ -178,23 +189,33 @@ region is re-read after the enclosing read completes."
        (guard (guard-prefix-at text start)
               (first forms) (second forms) start end))
       ((char= (char slice 0) #\()
-       (paren "(" (place-list-dot result children text) start end))
+       (paren "(" (place-list-dot children text) start end))
       ((and (>= (length slice) 2) (string= slice "#(" :end1 2))
        (paren "#(" children start end))
       (t (raw slice start end)))))
 
-(defun place-list-dot (result children text)
-  "Insert a dot atom into a dotted list's children."
-  (if (and (dotted-tail-p result) (>= (length children) 2))
-      (let* ((tail (last children 2))
-             (dot (position #\. text
-                            :start (node-end (first tail))
-                            :end (node-start (second tail)))))
-        (if dot
-            (append (butlast children 1)
-                    (list (raw "." dot (1+ dot)) (first tail)))
-            children))
-      children))
+(defun place-list-dot (children text)
+  "Restore a dotted list's consing dot from the source text. The gap
+between the last two child nodes can contain only whitespace, since
+comments are nodes themselves, so a lone dot found there is the dot;
+this also never walks the read result, which may be circular under
+#N= labels."
+  (let ((tail (last children 2)))
+    (if (rest tail)
+        (let* ((gap-start (node-end (first tail)))
+               (gap-end (node-start (second tail)))
+               (dot (when (< gap-start gap-end)
+                      (position #\. text :start gap-start :end gap-end))))
+          (if (and dot
+                   (loop for index from gap-start below gap-end
+                         always (or (= index dot)
+                                    (member (char text index)
+                                            '(#\Space #\Tab #\Newline
+                                              #\Return #\Page)))))
+              (append (butlast children)
+                      (list (raw "." dot (1+ dot)) (second tail)))
+              children))
+        children)))
 
 (defmethod eclector.parse-result:make-skipped-input-result
     ((client client) stream reason children source)
@@ -258,27 +279,71 @@ region is re-read after the enclosing read completes."
      node)
     ((or raw remark) node)))
 
-(defun arrange (nodes text)
-  "Insert blank-line gaps between nodes and mark trailing remarks,
-recursively, using source positions."
+(defun scan-label (text position kind)
+  "Match a labeled-object marker after whitespace at POSITION: #N# when
+KIND is :REFERENCE, #N= when KIND is :DEFINITION. Returns the marker
+text with its start and end, or NIL."
+  (let ((index position)
+        (length (length text)))
+    (loop while (and (< index length)
+                     (member (char text index)
+                             '(#\Space #\Tab #\Newline #\Return #\Page)))
+          do (incf index))
+    (when (and (< index length) (char= (char text index) #\#))
+      (let ((digits-end (1+ index)))
+        (loop while (and (< digits-end length)
+                         (digit-char-p (char text digits-end)))
+              do (incf digits-end))
+        (when (and (> digits-end (1+ index))
+                   (< digits-end length)
+                   (char= (char text digits-end)
+                          (ecase kind (:reference #\#) (:definition #\=))))
+          (values (subseq text index (1+ digits-end))
+                  index (1+ digits-end)))))))
+
+(defun recover-labels (node cursor text)
+  "Labeled objects leave no node of their own: a #N# reference reuses
+the definition's parse result, and a #N= marker lies in the whitespace
+gap before the labeled node. Both are recovered from the source text."
+  (if (< (node-start node) cursor)
+      (multiple-value-bind (label start end)
+          (scan-label text cursor :reference)
+        (unless label
+          (error "Cannot recover labeled-object reference at ~D" cursor))
+        (raw label start end))
+      (multiple-value-bind (label start end)
+          (scan-label text cursor :definition)
+        (if (and label (<= end (node-start node)))
+            (wrap label node start (node-end node))
+            node))))
+
+(defun arrange (nodes text region-start)
+  "Insert blank-line gaps between nodes, mark trailing remarks, and
+recover labeled-object syntax, recursively, using source positions."
   (let ((result '())
-        (previous nil))
+        (previous nil)
+        (cursor region-start))
     (dolist (node nodes)
-      (arrange-children node text)
-      (when previous
-        (let ((newlines (count #\Newline text
-                               :start (node-end previous)
-                               :end (node-start node))))
-          (cond ((>= newlines 2) (push (gap) result))
-                ((and (remark-p node) (zerop newlines))
-                 (setf (remark-trailing-p node) t)))))
-      (push node result)
-      (setf previous node))
+      (let ((node (recover-labels node cursor text)))
+        (arrange-children node text)
+        (when previous
+          (let ((newlines (count #\Newline text
+                                 :start (node-end previous)
+                                 :end (node-start node))))
+            (cond ((>= newlines 2) (push (gap) result))
+                  ((and (remark-p node) (zerop newlines))
+                   (setf (remark-trailing-p node) t)))))
+        (push node result)
+        (setf previous node
+              cursor (node-end node))))
     (nreverse result)))
 
 (defun arrange-children (node text)
   (etypecase node
-    (paren (setf (paren-items node) (arrange (paren-items node) text)))
+    (paren (setf (paren-items node)
+                 (arrange (paren-items node) text
+                          (+ (paren-start node)
+                             (length (paren-open node))))))
     (wrap (arrange-children (wrap-child node) text))
     (guard (arrange-children (guard-condition node) text)
            (arrange-children (guard-form node) text))
@@ -289,7 +354,7 @@ recursively, using source positions."
          (stream (make-string-input-stream source)))
     (arrange (mapcar (lambda (node) (resolve node client))
                      (read-nodes client stream))
-             source)))
+             source 0)))
 
 ;;; Token equivalence, for checking that formatting reorders nothing.
 

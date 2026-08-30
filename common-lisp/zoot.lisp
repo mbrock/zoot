@@ -73,6 +73,9 @@ the block cannot be flattened."
       (%verbatim-document string)
       string))
 
+(declaim (ftype (function (t) (integer 0 #.+initial-memo-weight+))
+                memo-weight next-memo-weight))
+
 (defun memo-weight (document)
   "Structural levels below DOCUMENT until a memo checkpoint. Zero marks a
 checkpoint. The countdown flows through every composite node, choices

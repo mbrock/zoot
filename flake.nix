@@ -20,6 +20,8 @@
         in
         {
           default = pkgs.mkShell {
+            # A long, dense Lisp source file for pretty-printer benchmarks.
+            ZOOT_LISP_CORPUS = "${pkgs.sbclPackages.eclector.src}/code/reader/macro-functions.lisp";
             packages = with pkgs; [
               zig_0_16
               zls

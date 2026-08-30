@@ -59,3 +59,38 @@ layout. Both branches contain exactly the same non-whitespace tokens."
                             +newline+
                             (choice (text "also-far-too-wide")
                                     (text "ok"))))))
+
+;;; The pretty-printer workload formats a real Lisp source file.
+
+(defparameter *corpus-fallback*
+  (merge-pathnames "zoot.lisp" (or *load-truename* *default-pathname-defaults*)))
+
+(defun corpus-path ()
+  "The Lisp source file for pretty-printer workloads: ZOOT_LISP_CORPUS,
+which the Nix dev shell points at Eclector's largest source file, with
+this project's own zoot.lisp as the fallback."
+  (or (let ((path (sb-ext:posix-getenv "ZOOT_LISP_CORPUS")))
+        (and path (plusp (length path)) (probe-file path)))
+      (probe-file *corpus-fallback*)))
+
+(defun read-corpus (path)
+  (with-open-file (stream path)
+    (let ((source (make-string (file-length stream))))
+      (subseq source 0 (read-sequence source stream)))))
+
+(defun load-pretty-printer ()
+  "Load zoot/sexp and its Eclector dependency, from the ASDF registry or
+Quicklisp; NIL when neither can provide Eclector."
+  (handler-case
+      (progn
+        (handler-case (asdf:load-system "eclector")
+          (error ()
+            (load (merge-pathnames "quicklisp/setup.lisp"
+                                   (user-homedir-pathname)))
+            (asdf:load-system "eclector")))
+        (asdf:load-system "zoot/sexp")
+        t)
+    (error () nil)))
+
+(defun format-corpus (source)
+  (uiop:symbol-call '#:zoot-sexp '#:format-source source))

@@ -134,6 +134,30 @@
               (histogram-string
                (statistics-frontier-histogram statistics))))))
 
+(defun benchmark-printer (runs)
+  "Time end-to-end pretty-printing of the corpus source file."
+  (if (load-pretty-printer)
+      (let* ((path (corpus-path))
+             (source (read-corpus path))
+             (output (format-corpus source)))
+        (let ((start (get-internal-real-time)))
+          (dotimes (run runs)
+            (declare (ignore run))
+            (setf output (format-corpus source)))
+          (let ((average (/ (milliseconds (- (get-internal-real-time)
+                                             start))
+                            runs)))
+            (format t "~%Pretty-printer (~A)~%" (namestring path))
+            (format t "~5A  ~9A  ~9A  ~9A  ~9A~%"
+                    "runs" "ms/run" "in chars" "in lines" "out lines")
+            (format t "~5A  ~9A  ~9A  ~9A  ~9A~%"
+                    "-----" "---------" "---------" "---------" "---------")
+            (format t "~5D  ~9,3F  ~9D  ~9D  ~9D~%"
+                    runs average (length source)
+                    (1+ (count #\Newline source))
+                    (1+ (count #\Newline output))))))
+      (format t "~%Pretty-printer benchmark skipped: Eclector unavailable~%")))
+
 (defun command-line-runs ()
   (let ((argument (second sb-ext:*posix-argv*)))
     (if argument
@@ -163,4 +187,5 @@
                          benchmarks)))
     (print-performance-table samples)
     (print-search-table samples)
-    (print-frontier-table samples)))
+    (print-frontier-table samples))
+  (benchmark-printer (max 1 (ceiling runs 20))))
