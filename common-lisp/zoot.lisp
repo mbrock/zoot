@@ -219,13 +219,15 @@ nonnegative integer. Newline count remains the secondary rank component.")
   (frontier-maximum 0 :type nonnegative-fixnum)
   (frontier-histogram (make-hash-table) :type hash-table))
 
-(defvar *cost* nil "Cost configuration dynamically bound by PICK.")
-(defvar *memoize* t "Whether the current PICK uses node-local memo tables.")
-(defvar *statistics* nil "Statistics dynamically accumulated by PICK.")
+(defvar *cost* (make-f2 80) "Cost configuration dynamically bound by PICK.")
+(defvar *statistics* (make-statistics)
+  "Statistics dynamically accumulated by PICK.")
 
-(declaim (type (or null cost) *cost*)
-         (type boolean *memoize*)
-         (type (or null statistics) *statistics*))
+(declaim (type cost *cost*)
+         (type statistics *statistics*))
+
+#+sbcl
+(declaim (sb-ext:always-bound *cost* *cost-measure* *statistics*))
 
 (defun dominates-p (left right)
   (and (<= (candidate-last left) (candidate-last right))
@@ -250,12 +252,13 @@ last column and rank. Frontiers are unrestricted adjustable vectors."
   (vector-push-extend candidate frontier)
   frontier)
 
-(defun frontier-union (&rest frontiers)
+(defun frontier-union (left right)
+  (declare (type (vector t) left right))
   (let ((result (empty-frontier)))
-    (dolist (frontier frontiers)
-      (declare (type (vector t) frontier))
-      (loop for candidate across frontier
-            do (frontier-add result candidate)))
+    (loop for candidate across left
+          do (frontier-add result candidate))
+    (loop for candidate across right
+          do (frontier-add result candidate))
     (sort result #'> :key #'candidate-last)))
 
 (defun canonicalize-frontier (frontier)
@@ -374,10 +377,10 @@ region. If both sides are tainted, retain the left promise."))
       (setf (document-memo-table document)
             (make-hash-table :test #'eql))))
 
-(defun memo-context-key (last base)
+(defun memo-context-key (last base limit)
   ;; LAST and BASE are both at most LIMIT here, so this is a collision-free
   ;; row-major encoding of the pair, as in the OCaml implementation.
-  (declare (type nonnegative-fixnum last base))
+  (declare (type nonnegative-fixnum last base limit))
   ;; Contexts are deliberately a fixnum domain. As with ranks, callers that
   ;; construct impractically large layouts are outside this implementation's
   ;; numeric contract.
@@ -386,26 +389,27 @@ region. If both sides are tainted, retain the left promise."))
           (the nonnegative-fixnum
                (* base
                   (the nonnegative-fixnum
-                       (1+ (cost-limit (the cost *cost*)))))))))
+                       (1+ limit)))))))
 
 (defun memoized (document last base thunk)
   (declare (type document document)
            (type nonnegative-fixnum last base) (type function thunk))
-  (unless (and *memoize*
-               (zerop (document-memo-weight document))
-               (<= last (cost-limit (the cost *cost*)))
-               (<= base (cost-limit (the cost *cost*))))
-    (return-from memoized (funcall thunk)))
-  (let* ((contexts (document-context-table document))
-         (key (memo-context-key last base)))
-    (multiple-value-bind (frontier present-p) (gethash key contexts)
-      (if present-p
-          (progn
-            (incf (statistics-memo-hits (the statistics *statistics*)))
-            frontier)
-          (prog1 (setf (gethash key contexts) (funcall thunk))
-            (incf (statistics-memo-entries
-                   (the statistics *statistics*))))))))
+  (let* ((cost *cost*)
+         (limit (cost-limit cost)))
+    (unless (and (zerop (document-memo-weight document))
+                 (<= last limit)
+                 (<= base limit))
+      (return-from memoized (funcall thunk)))
+    (let* ((contexts (document-context-table document))
+           (key (memo-context-key last base limit)))
+      (multiple-value-bind (frontier present-p) (gethash key contexts)
+        (if present-p
+            (progn
+              (incf (statistics-memo-hits (the statistics *statistics*)))
+              frontier)
+            (prog1 (setf (gethash key contexts) (funcall thunk))
+              (incf (statistics-memo-entries
+                     (the statistics *statistics*)))))))))
 
 (defgeneric exceeds-computation-limit-p (document last base))
 
@@ -585,7 +589,7 @@ region. If both sides are tainted, retain the left promise."))
   (statistics (make-statistics) :type statistics :read-only t)
   (tainted-p nil :type boolean :read-only t))
 
-(defun pick (document cost &key (memoize t))
+(defun pick (document cost)
   "Consume and resolve DOCUMENT with computation-width taint. Documents are
 single-use search spaces. Ordinary Pareto frontiers are exact and unrestricted;
 forced tainted regions deliberately recover one candidate, as in Pretty
@@ -594,7 +598,6 @@ Expressive and recursive.zig."
     (error "PICK cannot reuse an already consumed document"))
   (setf (document-consumed-p document) t)
   (let ((*cost* cost)
-        (*memoize* memoize)
         (*statistics* (make-statistics))
         (*cost-measure* (or *cost-measure* (cost-measure cost))))
     (let* ((evaluation (evaluate document 0 0))
@@ -660,6 +663,6 @@ Expressive and recursive.zig."
       (with-output-to-string (output)
         (render-layout (candidate-layout candidate) output 0 0))))
 
-(defun format-document (document cost &key (memoize t))
+(defun format-document (document cost)
   "Resolve and render DOCUMENT in one call."
-  (render (result-candidate (pick document cost :memoize memoize))))
+  (render (result-candidate (pick document cost))))
