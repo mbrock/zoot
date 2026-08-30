@@ -1,7 +1,10 @@
 (require :sb-sprof)
 (require "asdf")
+(if (string= (or (sb-ext:posix-getenv "ZOOT_STATISTICS") "0") "1")
+    (pushnew :zoot-statistics *features*)
+    (setf *features* (remove :zoot-statistics *features*)))
 (asdf:load-asd (merge-pathnames "zoot.asd" *load-truename*))
-(asdf:load-system "zoot")
+(asdf:load-system "zoot" :force t)
 (load (merge-pathnames "benchmark-workloads.lisp" *load-truename*))
 
 (in-package #:zoot-benchmark)
@@ -22,8 +25,8 @@
   ;; Warm compilation, caches unrelated to document memoization, and profiler
   ;; machinery before resetting the sample buffer.
   (pick (ternary-document depth) cost)
-  (format t "~&Common Lisp Zoot profile: ternary depth ~D, ~D CPU samples~%"
-          depth samples)
+  (format t "~&Common Lisp Zoot profile: ternary depth ~D, ~D CPU samples, statistics ~:[off~;on~]~%"
+          depth samples (member :zoot-statistics *features*))
   (sb-sprof:with-profiling
       (:mode :cpu
        :sample-interval 0.001d0

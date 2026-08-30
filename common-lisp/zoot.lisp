@@ -229,6 +229,11 @@ nonnegative integer. Newline count remains the secondary rank component.")
 #+sbcl
 (declaim (sb-ext:always-bound *cost* *cost-measure* *statistics*))
 
+(defmacro note-statistic (place)
+  #+zoot-statistics `(incf ,place)
+  #-zoot-statistics (declare (ignore place))
+  #-zoot-statistics nil)
+
 (defun dominates-p (left right)
   (and (<= (candidate-last left) (candidate-last right))
        (rank<= (candidate-rank left) (candidate-rank right))))
@@ -271,9 +276,11 @@ last column and rank. Frontiers are unrestricted adjustable vectors."
 
 (defun tainted-evaluation (thunk)
   (declare (type function thunk))
-  (incf (statistics-taints-deferred (the statistics *statistics*)))
+  (note-statistic
+   (statistics-taints-deferred (the statistics *statistics*)))
   (lambda ()
-    (incf (statistics-taints-forced (the statistics *statistics*)))
+    (note-statistic
+     (statistics-taints-forced (the statistics *statistics*)))
     (funcall thunk)))
 
 (defun evaluation-empty-p (evaluation)
@@ -343,6 +350,7 @@ region. If both sides are tainted, retain the left promise."))
 
 ;;; Recursive evaluator
 
+#+zoot-statistics
 (defun note-frontier (frontier)
   (declare (type (vector t) frontier))
   (let* ((statistics (the statistics *statistics*))
@@ -356,11 +364,14 @@ region. If both sides are tainted, retain the left promise."))
                          (gethash length histogram 0))))))
   frontier)
 
+#+zoot-statistics
 (defgeneric note-evaluation (evaluation))
 
+#+zoot-statistics
 (defmethod note-evaluation ((evaluation vector))
   (note-frontier evaluation))
 
+#+zoot-statistics
 (defmethod note-evaluation ((evaluation candidate))
   (let* ((statistics (the statistics *statistics*))
          (histogram (statistics-frontier-histogram statistics)))
@@ -371,7 +382,12 @@ region. If both sides are tainted, retain the left promise."))
                (1+ (the nonnegative-fixnum (gethash 1 histogram 0))))))
   evaluation)
 
+#+zoot-statistics
 (defmethod note-evaluation ((evaluation function))
+  evaluation)
+
+#-zoot-statistics
+(defmacro note-evaluation (evaluation)
   evaluation)
 
 (defun document-context-table (document)
@@ -421,11 +437,13 @@ whose context lies inside the computation limit."
                          (gethash ,key-var ,contexts-var)
                        (if ,present-var
                            (progn
-                             (incf (statistics-memo-hits *statistics*))
+                             (note-statistic
+                              (statistics-memo-hits *statistics*))
                              ,value-var)
                            (let ((,value-var (,compute-name)))
                              (setf (gethash ,key-var ,contexts-var) ,value-var)
-                             (incf (statistics-memo-entries *statistics*))
+                             (note-statistic
+                              (statistics-memo-entries *statistics*))
                              ,value-var))))
                    (,compute-name)))
              (,compute-name))))))
@@ -493,7 +511,8 @@ whose context lies inside the computation limit."
   (declare (type document document)
            (type nonnegative-fixnum last base))
   (memoized (document last base)
-    (incf (statistics-evaluations (the statistics *statistics*)))
+    (note-statistic
+     (statistics-evaluations (the statistics *statistics*)))
     (labels ((core ()
                (note-evaluation (evaluate-document document last base))))
       (if (exceeds-computation-limit-p document last base)
@@ -615,6 +634,7 @@ Expressive and recursive.zig."
     (error "PICK cannot reuse an already consumed document"))
   (setf (document-consumed-p document) t)
   (let ((*cost* cost)
+        #+zoot-statistics
         (*statistics* (make-statistics))
         (*cost-measure* (or *cost-measure* (cost-measure cost))))
     (let* ((evaluation (evaluate document 0 0))

@@ -48,6 +48,15 @@ Profile fresh ternary documents with SBCL's statistical profiler:
 make lisp-profile LISP_PROFILE_SAMPLES=1500 LISP_PROFILE_DEPTH=4
 ```
 
+Statistics collection is selected when the system is compiled with the
+`:zoot-statistics` feature. Tests and benchmarks enable it; ordinary builds and
+profiling omit all counter updates and frontier-note dispatch by default. Enable
+it for a profile when studying the counters themselves:
+
+```sh
+make lisp-profile LISP_PROFILE_STATISTICS=1
+```
+
 Each iteration constructs and plans a fresh document. The suite reports mean
 build, plan, and end-to-end times along with output size, selected rank, root
 and maximum frontier sizes, evaluator/memo counts, taint activity, and a

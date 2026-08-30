@@ -1,6 +1,7 @@
 (require "asdf")
+(pushnew :zoot-statistics *features*)
 (asdf:load-asd (merge-pathnames "zoot.asd" *load-truename*))
-(asdf:load-system "zoot")
+(asdf:load-system "zoot" :force t)
 
 (defpackage #:zoot-tests
   (:use #:cl #:zoot)
