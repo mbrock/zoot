@@ -63,12 +63,12 @@ layout. Both branches contain exactly the same non-whitespace tokens."
 ;;; The pretty-printer workload formats a real Lisp source file.
 
 (defparameter *corpus-fallback*
-  (merge-pathnames "zoot.lisp" (or *load-truename* *default-pathname-defaults*)))
+  (merge-pathnames "evaluator.lisp" (or *load-truename* *default-pathname-defaults*)))
 
 (defun corpus-path ()
   "The Lisp source file for pretty-printer workloads: ZOOT_LISP_CORPUS,
 which the Nix dev shell points at Eclector's largest source file, with
-this project's own zoot.lisp as the fallback."
+this project's own evaluator.lisp as the fallback."
   (or (let ((path (sb-ext:posix-getenv "ZOOT_LISP_CORPUS")))
         (and path (plusp (length path)) (probe-file path)))
       (probe-file *corpus-fallback*)))

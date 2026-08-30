@@ -2,7 +2,11 @@
   :description "A direct Common Lisp implementation of Zoot's recursive evaluator"
   :license "MIT"
   :serial t
-  :components ((:file "zoot")))
+  :components ((:file "package")
+               (:file "documents")
+               (:file "costs-frontiers")
+               (:file "evaluator")
+               (:file "render")))
 
 (asdf:defsystem "zoot/sexp"
   :description "A Lisp source pretty-printer built on Zoot"
