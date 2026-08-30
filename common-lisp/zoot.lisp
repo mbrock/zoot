@@ -234,6 +234,10 @@ nonnegative integer. Newline count remains the secondary rank component.")
   #-zoot-statistics (declare (ignore place))
   #-zoot-statistics nil)
 
+#-zoot-statistics
+(defmacro note-evaluation (evaluation)
+  evaluation)
+
 (defun dominates-p (left right)
   (and (<= (candidate-last left) (candidate-last right))
        (rank<= (candidate-rank left) (candidate-rank right))))
@@ -272,24 +276,75 @@ last column and rank. Frontiers are unrestricted adjustable vectors."
   (declare (type (vector t) frontier))
   (if (= 1 (length frontier)) (aref frontier 0) frontier))
 
-(deftype evaluation () '(or candidate vector function))
+(defstruct (tainted-context (:constructor nil)))
 
-(defun tainted-evaluation (thunk)
-  (declare (type function thunk))
+(defstruct (tainted-document-context
+            (:include tainted-context)
+            (:constructor %tainted-document-context (document last base)))
+  (document nil :type document :read-only t)
+  (last 0 :type nonnegative-fixnum :read-only t)
+  (base 0 :type nonnegative-fixnum :read-only t))
+
+(defstruct (tainted-wrap-context
+            (:include tainted-context)
+            (:constructor %tainted-wrap-context (kind amount evaluation)))
+  (kind :nest :type (member :nest :align) :read-only t)
+  (amount 0 :type nonnegative-fixnum :read-only t)
+  (evaluation nil :type t :read-only t))
+
+(defstruct (tainted-right-context
+            (:include tainted-context)
+            (:constructor %tainted-right-context (left evaluation)))
+  (left nil :type candidate :read-only t)
+  (evaluation nil :type t :read-only t))
+
+(defstruct (tainted-left-context
+            (:include tainted-context)
+            (:constructor %tainted-left-context (document base evaluation)))
+  (document nil :type concatenation-document :read-only t)
+  (base 0 :type nonnegative-fixnum :read-only t)
+  (evaluation nil :type t :read-only t))
+
+(deftype evaluation () '(or candidate vector tainted-context))
+
+(defun tainted-evaluation (context)
+  (declare (type tainted-context context))
   (note-statistic
    (statistics-taints-deferred (the statistics *statistics*)))
-  (lambda ()
-    (note-statistic
-     (statistics-taints-forced (the statistics *statistics*)))
-    (funcall thunk)))
+  context)
 
 (defun evaluation-empty-p (evaluation)
   (and (vectorp evaluation) (zerop (length evaluation))))
 
 (defgeneric force-evaluation (evaluation))
 
-(defmethod force-evaluation ((evaluation function))
-  (funcall evaluation))
+(defmethod force-evaluation ((evaluation tainted-context))
+  (note-statistic
+   (statistics-taints-forced (the statistics *statistics*)))
+  (typecase evaluation
+    (tainted-document-context
+     (force-evaluation
+      (note-evaluation
+       (evaluate-document
+        (tainted-document-context-document evaluation)
+        (tainted-document-context-last evaluation)
+        (tainted-document-context-base evaluation)))))
+    (tainted-wrap-context
+     (wrap-candidate
+      (tainted-wrap-context-kind evaluation)
+      (tainted-wrap-context-amount evaluation)
+      (force-evaluation (tainted-wrap-context-evaluation evaluation))))
+    (tainted-right-context
+     (concatenate-candidates
+      (tainted-right-context-left evaluation)
+      (force-evaluation (tainted-right-context-evaluation evaluation))))
+    (tainted-left-context
+     (let* ((left (force-evaluation
+                   (tainted-left-context-evaluation evaluation)))
+            (right (concatenate-right
+                    (tainted-left-context-document evaluation) left
+                    (tainted-left-context-base evaluation))))
+       (force-evaluation right)))))
 
 (defmethod force-evaluation ((evaluation candidate)) evaluation)
 
@@ -330,17 +385,17 @@ region. If both sides are tainted, retain the left promise."
                 ((evaluation-empty-p right) left)
                 (t (canonicalize-frontier (frontier-union left right)))))
          (candidate (merge-candidate-frontier right left))
-         (function (if (evaluation-empty-p left) right left))))
+         (tainted-context (if (evaluation-empty-p left) right left))))
       (candidate
        (typecase right
          (vector (merge-candidate-frontier left right))
          (candidate (merge-candidates left right))
-         (function left)))
-      (function
+         (tainted-context left)))
+      (tainted-context
        (typecase right
          (vector (if (evaluation-empty-p right) left right))
          (candidate right)
-         (function left))))))
+         (tainted-context left))))))
 
 ;;; Recursive evaluator
 
@@ -377,11 +432,7 @@ region. If both sides are tainted, retain the left promise."
   evaluation)
 
 #+zoot-statistics
-(defmethod note-evaluation ((evaluation function))
-  evaluation)
-
-#-zoot-statistics
-(defmacro note-evaluation (evaluation)
+(defmethod note-evaluation ((evaluation tainted-context))
   evaluation)
 
 (defun document-context-table (document)
@@ -510,7 +561,8 @@ whose context lies inside the computation limit."
     (labels ((core ()
                (note-evaluation (evaluate-document document last base))))
       (if (exceeds-computation-limit-p document last base)
-          (tainted-evaluation (lambda () (force-evaluation (core))))
+          (tainted-evaluation
+           (%tainted-document-context document last base))
           (core)))))
 
 (defun wrap-frontier (kind amount frontier)
@@ -541,10 +593,9 @@ whose context lies inside the computation limit."
 (defmethod wrap-evaluation (kind amount (evaluation candidate))
   (wrap-candidate kind amount evaluation))
 
-(defmethod wrap-evaluation (kind amount (evaluation function))
+(defmethod wrap-evaluation (kind amount (evaluation tainted-context))
   (tainted-evaluation
-   (lambda ()
-     (wrap-candidate kind amount (force-evaluation evaluation)))))
+   (%tainted-wrap-context kind amount evaluation)))
 
 (defun concatenate-candidates (left right)
   (%candidate
@@ -567,10 +618,9 @@ whose context lies inside the computation limit."
   (concatenate-candidates left right))
 
 (defmethod concatenate-right-evaluation
-    (left (right function))
+    (left (right tainted-context))
   (tainted-evaluation
-   (lambda ()
-     (concatenate-candidates left (force-evaluation right)))))
+   (%tainted-right-context left right)))
 
 (defun concatenate-right (document left base)
   (concatenate-right-evaluation
@@ -582,12 +632,9 @@ whose context lies inside the computation limit."
     (document base left))
 
 (defmethod concatenate-left-evaluation
-    (document base (left function))
+    (document base (left tainted-context))
   (tainted-evaluation
-   (lambda ()
-     (let* ((left-candidate (force-evaluation left))
-            (right (concatenate-right document left-candidate base)))
-       (force-evaluation right)))))
+   (%tainted-left-context document base left)))
 
 (defmethod concatenate-left-evaluation
     (document base (left vector))
@@ -632,11 +679,12 @@ Expressive and recursive.zig."
         (*statistics* (make-statistics))
         (*cost-measure* (or *cost-measure* (cost-measure cost))))
     (let* ((evaluation (evaluate document 0 0))
-           (tainted-p (functionp evaluation))
+           (tainted-p (tainted-context-p evaluation))
            (frontier
              (the (vector t)
                   (etypecase evaluation
-                    (function (vector (force-evaluation evaluation)))
+                    (tainted-context
+                     (vector (force-evaluation evaluation)))
                     (candidate (vector evaluation))
                     (vector (the (vector t) evaluation)))))
            (statistics *statistics*))
