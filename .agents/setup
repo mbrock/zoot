@@ -42,8 +42,7 @@ sudo rm -rf /nix/store/.links
 sudo systemctl start nix-daemon.socket
 
 profile_line='. /etc/profile.d/nix.sh'
-if ! grep -Fqx "$profile_line" ~/.bash_profile; then
-  echo "$profile_line" >> ~/.bash_profile
-fi
+sed -i '/nix\.sh/d' ~/.bash_profile
+echo "$profile_line" >> ~/.bash_profile
 
 "$nix" develop "path:$repo/nix" --command true
