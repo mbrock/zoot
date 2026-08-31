@@ -215,7 +215,7 @@ fn delimited_doc(group: &Group) -> Doc {
         sequence_doc(&group.items, SequenceMode::Flat),
         Doc::text(group.closing.clone().unwrap_or_default()),
     ]);
-    if !can_flatten(&group.items) || !contains_comma(&group.items) {
+    if can_flatten(&group.items) && !contains_comma(&group.items) {
         return flat;
     }
 
@@ -228,6 +228,9 @@ fn delimited_doc(group: &Group) -> Doc {
         Doc::newline(),
         Doc::text(group.closing.clone().unwrap_or_default()),
     ]);
+    if !can_flatten(&group.items) {
+        return broken;
+    }
     Doc::choice(flat, broken)
 }
 
@@ -603,6 +606,12 @@ mod tests {
     }
 
     #[test]
+    fn keeps_delimiters_after_line_comments_active() {
+        let source = "fn f(){match x{Some(Binary(A|// note\nB))=>true,_=>false,}}";
+        assert_round_trip("line comment before delimiters", source, 80);
+    }
+
+    #[test]
     fn keeps_attributes_and_generic_arguments_tight() {
         let source = "#[inline]fn identity<T>(value:Option<T>)->Option<T>{value}";
         assert_eq!(
@@ -693,6 +702,24 @@ mod tests {
                 assert_round_trip(name, source, width);
             }
         }
+    }
+
+    #[test]
+    fn rustc_parser_sample_round_trips() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                let source = include_str!("../samples/rustc_parse_expr.rs");
+                let input_errors = SourceFile::parse(source, Edition::CURRENT).errors();
+                assert!(
+                    input_errors.is_empty(),
+                    "rustc parser sample is not valid: {input_errors:#?}"
+                );
+                assert_round_trip("rustc parser sample", source, 100);
+            })
+            .expect("failed to spawn large-stack formatter test")
+            .join()
+            .expect("large-stack formatter test panicked");
     }
 
     #[test]

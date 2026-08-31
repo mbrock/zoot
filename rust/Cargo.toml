@@ -8,6 +8,10 @@ description = "A Pareto-optimal pretty printer"
 [lib]
 path = "src/lib.rs"
 
+[[example]]
+name = "format_source"
+required-features = ["rust-format"]
+
 [features]
 rust-format = ["dep:ra_ap_syntax"]
 
