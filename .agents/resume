@@ -1,37 +1,8 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -xeuo pipefail
 
-repo_root="$(cd "$(dirname "$0")/.." && pwd)"
-nix_profile="/nix/var/nix/profiles/default"
-store_image="/var/lib/zoot/nix-store.ext4"
-store_volume="/mnt/zoot-nix-store"
-store_mount="/nix/store"
-
-if [[ -f "$store_image" ]]; then
-  if ! mountpoint -q "$store_volume"; then
-    sudo mount "$store_volume"
-  fi
-  if ! mountpoint -q "$store_mount"; then
-    sudo mount "$store_mount"
-  fi
+if ! mountpoint -q /nix; then
+  sudo mount /nix
 fi
 
-if [[ ! -x "$nix_profile/bin/nix" ]]; then
-  echo "Nix is missing; rerun .agents/setup" >&2
-  exit 1
-fi
-
-if ! systemctl is-active --quiet nix-daemon.socket; then
-  sudo systemctl start nix-daemon.socket
-fi
-
-cd "$repo_root"
-# shellcheck disable=SC1091
-source "$HOME/.config/zoot/nix-profile.sh"
-
-for tool in nix zig sbcl dune; do
-  if ! command -v "$tool" >/dev/null 2>&1; then
-    echo "$tool is missing from the flake environment; rerun .agents/setup" >&2
-    exit 1
-  fi
-done
+sudo systemctl start nix-daemon.socket

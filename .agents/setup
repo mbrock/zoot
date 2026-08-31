@@ -1,105 +1,49 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -xeuo pipefail
 
-started_at=$SECONDS
-repo_root="$(cd "$(dirname "$0")/.." && pwd)"
-flake="path:$repo_root/nix"
-nix_profile="/nix/var/nix/profiles/default"
-store_image="/var/lib/zoot/nix-store.ext4"
-store_volume="/mnt/zoot-nix-store"
-store_mount="/nix/store"
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+nix=/nix/var/nix/profiles/default/bin/nix
 
-printf '[orb setup] Ensuring filesystem tools are installed\n'
-missing_packages=()
-command -v curl >/dev/null 2>&1 || missing_packages+=(curl ca-certificates)
-[[ -x /sbin/mkfs.ext4 ]] || missing_packages+=(e2fsprogs)
-
-if ((${#missing_packages[@]})); then
-  sudo apt-get update
-  sudo apt-get install -y "${missing_packages[@]}"
-fi
-
-printf '[orb setup] Ensuring the Nix store uses indexed ext4\n'
-if ! mountpoint -q "$store_mount" && [[ -d "$store_mount" ]] &&
-  find "$store_mount" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
-  echo 'Existing unindexed Nix store cannot be migrated; recreate the orb snapshot' >&2
+if ! mountpoint -q /nix && [[ -d /nix/store ]]; then
+  echo expected /nix to be a mountpoint >&2
   exit 1
 fi
 
-sudo mkdir -p "$(dirname "$store_image")" "$store_volume" /nix
-if [[ ! -f "$store_image" ]]; then
-  sudo truncate -s 32G "$store_image"
+if [[ ! -f /nix.img ]]; then
+  sudo rm -f /nix.img.tmp
+  sudo truncate -s 32G /nix.img.tmp
   sudo /sbin/mkfs.ext4 -q -F -m 0 -i 8192 \
     -O dir_index,extent,64bit,dir_nlink,metadata_csum \
     -E lazy_itable_init=0,lazy_journal_init=0 \
-    "$store_image"
+    /nix.img.tmp
+  sudo mv /nix.img.tmp /nix.img
 fi
 
-if ! mountpoint -q "$store_volume"; then
-  sudo mount -o loop,noatime "$store_image" "$store_volume"
-fi
-sudo mkdir -p "$store_volume/store" "$store_mount"
+sudo mkdir -p /nix
 
-if ! mountpoint -q "$store_mount"; then
-  sudo mount --bind "$store_volume/store" "$store_mount"
+fstab_entry='/nix.img /nix ext4 loop,noatime,nofail 0 0'
+if ! grep -Fqx "$fstab_entry" /etc/fstab; then
+  echo "$fstab_entry" | sudo tee -a /etc/fstab >/dev/null
 fi
 
-fstab_marker='# zoot indexed Nix store'
-if ! grep -Fqx "$fstab_marker" /etc/fstab; then
-  printf '%s\n%s %s ext4 loop,noatime,nofail 0 2\n%s/store %s none bind,nofail,x-systemd.requires-mounts-for=%s 0 0\n' \
-    "$fstab_marker" "$store_image" "$store_volume" "$store_volume" "$store_mount" \
-    "$store_volume" \
-    | sudo tee -a /etc/fstab >/dev/null
+if ! mountpoint -q /nix; then
+  sudo mount /nix
 fi
 
-printf '[orb setup] Ensuring Nix is installed\n'
-if [[ ! -x "$nix_profile/bin/nix" ]]; then
-  curl --proto '=https' --tlsv1.2 --fail --location --silent --show-error \
-    https://artifacts.nixos.org/nix-installer \
+if [[ ! -x "$nix" ]]; then
+  curl -sSfL https://artifacts.nixos.org/nix-installer \
     | sh -s -- install --enable-flakes --no-confirm
 fi
 
-printf '[orb setup] Disabling automatic Nix store optimisation\n'
-sudo sed -i 's/^auto-optimise-store[[:space:]]*=.*/auto-optimise-store = false/' /etc/nix/nix.conf
-if ! grep -Eq '^auto-optimise-store[[:space:]]*=' /etc/nix/nix.conf; then
-  printf '\nauto-optimise-store = false\n' | sudo tee -a /etc/nix/nix.conf >/dev/null
-fi
-sudo systemctl stop nix-daemon.service 2>/dev/null || true
-sudo rm -rf "$store_mount/.links"
+sudo sed -i '/^auto-optimise-store[[:space:]]*=/d' /etc/nix/nix.conf
+echo 'auto-optimise-store = false' | sudo tee -a /etc/nix/nix.conf >/dev/null
+sudo systemctl stop nix-daemon.service
+sudo rm -rf /nix/store/.links
 sudo systemctl start nix-daemon.socket
 
-# The installer cannot update this running process's environment.
-# shellcheck disable=SC1091
-source "$nix_profile/etc/profile.d/nix-daemon.sh"
-mkdir -p "$HOME/.local/bin"
-ln -sfn "$nix_profile/bin/nix" "$HOME/.local/bin/nix"
-
-printf '[orb setup] Configuring the repository development shell\n'
-hook_directory="$HOME/.config/zoot"
-hook="$hook_directory/nix-profile.sh"
-mkdir -p "$hook_directory"
-cat > "$hook" <<EOF
-if [[ -z "\${IN_NIX_SHELL:-}" && "\${PWD}" == "$repo_root" ]]; then
-  eval "\$("$nix_profile/bin/nix" print-dev-env "$flake")"
-  export PATH="$nix_profile/bin:\$PATH"
-fi
-EOF
-
-# Migrate the inline hook written by the previous setup implementation.
-touch "$HOME/.bash_profile"
-sed -i '/^# zoot Nix development shell$/,/^fi$/d' "$HOME/.bash_profile"
-
-profile_marker="# zoot Nix development shell hook"
-if ! grep -Fqx "$profile_marker" "$HOME/.bash_profile" 2>/dev/null; then
-  cat >> "$HOME/.bash_profile" <<EOF
-
-$profile_marker
-source "$hook"
-EOF
+profile_line='. /etc/profile.d/nix.sh'
+if ! grep -Fqx "$profile_line" ~/.bash_profile; then
+  echo "$profile_line" >> ~/.bash_profile
 fi
 
-printf '[orb setup] Building and testing in the flake environment\n'
-cd "$repo_root"
-"$nix_profile/bin/nix" develop "$flake" --command make test
-
-printf '[orb setup] Complete in %ss\n' "$((SECONDS - started_at))"
+"$nix" develop "path:$repo/nix" --command true
