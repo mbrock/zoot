@@ -34,6 +34,13 @@ From the repository root, run:
 make rust-test
 ```
 
+Format a Rust file to standard output, optionally with ANSI syntax colors:
+
+```sh
+cargo run --release --manifest-path rust/Cargo.toml --features rust-format \
+  --example format_source -- rust/samples/rustc_parse_expr.rs 80 --ansi
+```
+
 The crate can also be tested directly:
 
 ```sh
