@@ -15,7 +15,20 @@ evaluator. It provides:
 Use `Doc` for ordinary documents. `Document<A>` carries custom span metadata
 of type `A` when annotation-aware rendering is needed.
 
-The implementation is dependency-free. From the repository root, run:
+The core implementation is dependency-free. The optional `rust-format`
+feature adds a Rust source formatter backed by rust-analyzer's lossless Rowan
+syntax tree:
+
+```rust
+use zoot::source::format_source;
+
+assert_eq!(
+    format_source("fn answer(){return 42;}", 80),
+    "fn answer() {\n    return 42;\n}\n",
+);
+```
+
+From the repository root, run:
 
 ```sh
 make rust-test
@@ -24,7 +37,7 @@ make rust-test
 The crate can also be tested directly:
 
 ```sh
-cargo test --manifest-path rust/Cargo.toml
+cargo test --all-features --manifest-path rust/Cargo.toml
 ```
 
 The `large_array` example builds, plans, renders, and drops a JSON-like array

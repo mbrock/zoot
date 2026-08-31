@@ -22,6 +22,8 @@ mod cost;
 mod document;
 mod evaluator;
 mod render;
+#[cfg(feature = "rust-format")]
+pub mod source;
 
 pub use cost::{linear_overflow_cost, squared_overflow_cost, Cost, Rank};
 pub use document::Document;

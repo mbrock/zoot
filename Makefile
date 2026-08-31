@@ -29,7 +29,7 @@ lisp-test:
 	XDG_CACHE_HOME=/tmp/zoot-asdf-statistics sbcl --script common-lisp/sexp-tests.lisp
 
 rust-test:
-	cargo test --manifest-path rust/Cargo.toml
+	cargo test --all-features --manifest-path rust/Cargo.toml
 
 lisp-benchmark:
 	XDG_CACHE_HOME=/tmp/zoot-asdf-statistics sbcl --script common-lisp/benchmark.lisp $(RUNS)

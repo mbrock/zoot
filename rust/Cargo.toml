@@ -8,6 +8,12 @@ description = "A Pareto-optimal pretty printer"
 [lib]
 path = "src/lib.rs"
 
+[features]
+rust-format = ["dep:ra_ap_syntax"]
+
+[dependencies]
+ra_ap_syntax = { version = "=0.0.349", optional = true }
+
 [lints.rust]
 missing_docs = "warn"
 
